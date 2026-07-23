@@ -10,7 +10,8 @@
     "start": "node server.js",
     "electron": "electron .",
     "check": "node --check server.js && node --check public/app.js && node --check electron/main.cjs",
-    "build:win": "electron-builder --win portable"
+    "build:win": "electron-builder --win portable",
+    "build:win:installer": "electron-builder --win nsis"
   },
   "build": {
     "appId": "com.worship.playbackappv2",
@@ -35,6 +36,13 @@
     },
     "portable": {
       "artifactName": "Playback-App-V2-${version}-Windows.exe"
+    },
+    "nsis": {
+      "artifactName": "Playback-App-V2-${version}-Windows-Setup.exe",
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true
     }
   },
   "devDependencies": {
