@@ -112,6 +112,10 @@ createServer(async (req, res) => {
       return json(res, await loadAudioDevices());
     }
 
+    if (req.method === "GET" && url.pathname === "/api/audio/diagnostics") {
+      return json(res, await audioDeviceDiagnostics());
+    }
+
     if (req.method === "PUT" && url.pathname === "/api/settings") {
       const settings = normalizeSettings(await readJsonBody(req));
       await saveSettings(settings);
@@ -403,6 +407,49 @@ async function loadAudioDevices() {
   };
 }
 
+async function audioDeviceDiagnostics() {
+  const settings = await loadSettings();
+  const helper = await runEngineCommand({ type: "listDevices", requestId: "diagnostic-list-devices" }, { timeoutMs: 10000 });
+  const asioRegistry = await listRegistryAsioDevices();
+  const windowsSoundDevices = await listWindowsSoundDevices();
+  const merged = await loadAudioDevices();
+  const danteMatches = [
+    ...(merged.devices || []),
+    ...asioRegistry,
+    ...windowsSoundDevices
+  ].filter((device) => /dante/i.test(`${device.id || ""} ${device.name || ""} ${device.driver || ""} ${device.description || ""}`));
+
+  return {
+    generatedAt: new Date().toISOString(),
+    selectedDeviceName: settings.audioEngine?.selectedDeviceName || "",
+    helper: {
+      ok: helper.ok,
+      helperPath: helper.helperPath,
+      error: helper.error || "",
+      rawResponseType: helper.response?.type || "",
+      rawDeviceCount: Array.isArray(helper.response?.devices) ? helper.response.devices.length : 0,
+      rawDevices: Array.isArray(helper.response?.devices) ? helper.response.devices : []
+    },
+    mergedDeviceCount: merged.devices?.length || 0,
+    mergedDevices: merged.devices || [],
+    asioRegistryCount: asioRegistry.length,
+    asioRegistry,
+    windowsSoundDeviceCount: windowsSoundDevices.length,
+    windowsSoundDevices,
+    danteMatches,
+    conclusion: diagnosticConclusion({ helper, merged, asioRegistry, windowsSoundDevices, danteMatches })
+  };
+}
+
+function diagnosticConclusion({ helper, merged, asioRegistry, windowsSoundDevices, danteMatches }) {
+  if (danteMatches.length) return "Dante-like device is visible to the app. Select it in Settings and save.";
+  if (asioRegistry.length) return "ASIO drivers are registered, but none contain Dante in the name. Check Dante Virtual Soundcard installation/license/name.";
+  if (windowsSoundDevices.length && !(merged.devices || []).length) return "Windows sees sound devices, but JUCE/native app discovery is empty.";
+  if (!helper.ok) return `JUCE helper failed: ${helper.error || "unknown error"}`;
+  if (!(merged.devices || []).length) return "No output devices were reported by JUCE, ASIO registry, or Windows sound-device scan.";
+  return "Audio devices are visible, but no Dante-like device was found.";
+}
+
 function mergeAudioDevices(primaryDevices, secondaryDevices) {
   const devices = [];
   const seen = new Set();
@@ -417,8 +464,8 @@ function mergeAudioDevices(primaryDevices, secondaryDevices) {
 
 async function listRegistryAsioDevices() {
   const registryRoots = [
-    "HKLM\\SOFTWARE\\ASIO",
-    "HKLM\\SOFTWARE\\WOW6432Node\\ASIO"
+    "HKEY_LOCAL_MACHINE\\SOFTWARE\\ASIO",
+    "HKEY_LOCAL_MACHINE\\SOFTWARE\\WOW6432Node\\ASIO"
   ];
   const devices = [];
   const seen = new Set();
@@ -469,6 +516,31 @@ function queryRegistryValues(key) {
         if (match) values[match[1].trim()] = match[2].trim();
       }
       resolveValues(values);
+    });
+  });
+}
+
+function listWindowsSoundDevices() {
+  return new Promise((resolveDevices) => {
+    const command = "Get-CimInstance Win32_SoundDevice | Select-Object Name,Manufacturer,Status,PNPDeviceID | ConvertTo-Json -Depth 3";
+    execFile("powershell.exe", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command], { windowsHide: true, timeout: 10000 }, (error, stdout) => {
+      if (error) return resolveDevices([]);
+      try {
+        const parsed = JSON.parse(stdout.trim() || "[]");
+        const rows = Array.isArray(parsed) ? parsed : [parsed];
+        resolveDevices(rows
+          .filter((row) => stringValue(row?.Name))
+          .map((row) => ({
+            id: stringValue(row.PNPDeviceID || row.Name),
+            name: stringValue(row.Name),
+            driver: "Windows SoundDevice",
+            manufacturer: stringValue(row.Manufacturer),
+            status: stringValue(row.Status),
+            available: stringValue(row.Status).toUpperCase() === "OK"
+          })));
+      } catch {
+        resolveDevices([]);
+      }
     });
   });
 }

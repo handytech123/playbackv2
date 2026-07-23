@@ -166,6 +166,8 @@ const els = {
   selectedDeviceName: document.querySelector("#selectedDeviceNameInput"),
   audioDeviceSelect: document.querySelector("#audioDeviceSelect"),
   refreshAudioDevices: document.querySelector("#refreshAudioDevicesButton"),
+  audioDiagnostics: document.querySelector("#audioDiagnosticsButton"),
+  audioDiagnosticsReport: document.querySelector("#audioDiagnosticsReport"),
   libraryRootPath: document.querySelector("#libraryRootPath"),
   libraryRootInput: document.querySelector("#libraryRootInput"),
   libraryVendorFolders: document.querySelector("#libraryVendorFolders"),
@@ -249,6 +251,7 @@ function wireEvents() {
     if (els.audioDeviceSelect.value) els.selectedDeviceName.value = els.audioDeviceSelect.value;
   });
   els.refreshAudioDevices.addEventListener("click", refreshAudioDevices);
+  els.audioDiagnostics?.addEventListener("click", runAudioDiagnostics);
   els.routingPreset.addEventListener("change", () => {
     if (!state.settings) return;
     state.settings.routing.activePresetId = els.routingPreset.value;
@@ -492,6 +495,59 @@ async function refreshAudioDevices() {
     els.refreshAudioDevices.disabled = false;
     els.refreshAudioDevices.textContent = "Refresh Audio Devices";
   }
+}
+
+async function runAudioDiagnostics() {
+  if (!els.audioDiagnostics || !els.audioDiagnosticsReport) return;
+  els.audioDiagnostics.disabled = true;
+  els.audioDiagnostics.textContent = "Checking...";
+  els.audioDiagnosticsReport.classList.remove("hidden");
+  els.audioDiagnosticsReport.textContent = "Checking audio devices...";
+  try {
+    const report = await api("/api/audio/diagnostics");
+    els.audioDiagnosticsReport.textContent = formatAudioDiagnosticReport(report);
+    els.settingsStatus.textContent = report.conclusion || "Audio diagnostic complete.";
+  } catch (error) {
+    els.audioDiagnosticsReport.textContent = `Audio diagnostic failed: ${error.message}`;
+    els.settingsStatus.textContent = `Audio diagnostic failed: ${error.message}`;
+  } finally {
+    els.audioDiagnostics.disabled = false;
+    els.audioDiagnostics.textContent = "Device Diagnostic Report";
+  }
+}
+
+function formatAudioDiagnosticReport(report) {
+  const lines = [];
+  lines.push(`Generated: ${report.generatedAt || "--"}`);
+  lines.push(`Saved device: ${report.selectedDeviceName || "(none)"}`);
+  lines.push(`Conclusion: ${report.conclusion || "--"}`);
+  lines.push("");
+  lines.push(`Merged app devices (${report.mergedDeviceCount || 0})`);
+  for (const device of report.mergedDevices || []) {
+    lines.push(`- ${device.name || device.id || "--"} [${device.driver || "--"}]${device.source ? ` ${device.source}` : ""}`);
+  }
+  lines.push("");
+  lines.push(`JUCE raw devices (${report.helper?.rawDeviceCount || 0})`);
+  lines.push(`JUCE helper: ${report.helper?.ok ? "ok" : "failed"} ${report.helper?.error || ""}`);
+  for (const device of report.helper?.rawDevices || []) {
+    lines.push(`- ${device.name || device.id || "--"} [${device.type || "--"}]`);
+  }
+  lines.push("");
+  lines.push(`ASIO registry (${report.asioRegistryCount || 0})`);
+  for (const device of report.asioRegistry || []) {
+    lines.push(`- ${device.name || device.registryName || "--"} CLSID=${device.clsid || "--"}`);
+  }
+  lines.push("");
+  lines.push(`Windows sound devices (${report.windowsSoundDeviceCount || 0})`);
+  for (const device of report.windowsSoundDevices || []) {
+    lines.push(`- ${device.name || "--"} [${device.status || "--"}] ${device.manufacturer || ""}`);
+  }
+  lines.push("");
+  lines.push(`Dante matches (${report.danteMatches?.length || 0})`);
+  for (const device of report.danteMatches || []) {
+    lines.push(`- ${device.name || device.id || "--"} [${device.driver || device.type || "--"}]`);
+  }
+  return lines.join("\n");
 }
 
 async function loadCacheReport() {
@@ -956,7 +1012,8 @@ function emptyState(message) {
 }
 
 async function loadPlaybackState() {
-  state.playbackState = await api("/api/playback/state");
+  const playback = await api("/api/playback/state");
+  state.playbackState = playback && typeof playback === "object" ? playback : { mode: "edit", transport: "stopped" };
   renderPlaybackState();
 }
 

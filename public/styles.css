@@ -1850,6 +1850,21 @@ body.mixer-collapsed .meter-track {
   border-color: #f97066;
 }
 
+.settings-report {
+  grid-column: 1 / -1;
+  max-height: 320px;
+  overflow: auto;
+  margin: 0;
+  padding: 12px;
+  border: 1px solid #2c3339;
+  border-radius: 6px;
+  background: #090d10;
+  color: #f4f0e8;
+  white-space: pre-wrap;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
 .settings-tabs {
   display: grid;
   grid-template-columns: repeat(5, minmax(0, 1fr));

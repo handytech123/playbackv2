@@ -314,10 +314,12 @@
               <select id="audioDeviceSelect"></select>
             </label>
             <button id="refreshAudioDevicesButton" type="button">Refresh Audio Devices</button>
+            <button id="audioDiagnosticsButton" type="button">Device Diagnostic Report</button>
             <div class="settings-readout">
               <span>Device List</span>
               <strong id="deviceListPreview">No default device saved</strong>
             </div>
+            <pre id="audioDiagnosticsReport" class="settings-report hidden"></pre>
             <label>Sample Rate
               <select id="sampleRateSelect">
                 <option value="48000">48 kHz</option>
