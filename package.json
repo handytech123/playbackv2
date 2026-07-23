@@ -1,0 +1,44 @@
+{
+  "name": "playback-app-v2",
+  "version": "0.1.0",
+  "description": "Playback App V2 desktop build.",
+  "author": "Luis",
+  "private": true,
+  "main": "electron/main.cjs",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js",
+    "electron": "electron .",
+    "check": "node --check server.js && node --check public/app.js && node --check electron/main.cjs",
+    "build:win": "electron-builder --win portable"
+  },
+  "build": {
+    "appId": "com.worship.playbackappv2",
+    "productName": "Playback App V2",
+    "asar": false,
+    "files": [
+      "electron/**/*",
+      "server.js",
+      "package.json",
+      "public/**/*",
+      "docs/**/*",
+      "pads/**/*",
+      "native/juce-audio-engine/bin/**/*",
+      "native/juce-audio-engine/README.md",
+      "native/juce-audio-engine/CMakeLists.txt",
+      "native/juce-audio-engine/src/**/*"
+    ],
+    "win": {
+      "target": [
+        "portable"
+      ]
+    },
+    "portable": {
+      "artifactName": "Playback-App-V2-${version}-Windows.exe"
+    }
+  },
+  "devDependencies": {
+    "electron": "^43.1.1",
+    "electron-builder": "^26.15.3"
+  }
+}

@@ -1,0 +1,393 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Playback App V2</title>
+    <link rel="stylesheet" href="/styles.css">
+  </head>
+  <body>
+    <header class="app-nav">
+      <div>
+        <h1>Playback App V2</h1>
+        <p id="appModeStatus">Edit mode</p>
+      </div>
+      <nav class="nav-buttons" aria-label="Main sections">
+        <button class="nav-button active" type="button" data-view="setlistView">Playback</button>
+        <button id="reloadDataButton" class="nav-button" type="button">Reload</button>
+        <button id="settingsMenuButton" class="icon-button menu-button" type="button" aria-label="Open settings">&#9776;</button>
+      </nav>
+    </header>
+
+    <main id="setlistView" class="app view active">
+      <section class="live-surface">
+        <header class="setlist-command-bar">
+          <div class="setlist-readout">
+            <span id="setlistCount">0/10 songs</span>
+            <strong>Current Set</strong>
+            <span id="libraryStatus">Loading library...</span>
+            <span id="engineStatus" class="engine-status">JUCE offline</span>
+          </div>
+          <section class="transport-panel compact-transport" aria-label="Playback controls">
+            <div class="operator-metric"><span>Key</span><strong id="playbackKeyReadout">--</strong></div>
+            <div class="operator-metric"><span>BPM</span><strong id="playbackTempoReadout">--</strong></div>
+            <div class="operator-metric"><span>Time</span><strong id="playbackTimeReadout">--</strong></div>
+            <div class="operator-song"><span id="transportStateLabel">Stopped</span><strong id="transportSongTitle">No song selected</strong></div>
+            <button class="transport-icon" data-command="previousSong" type="button" aria-label="Return to song start" title="Return to song start">&#9198;</button>
+            <button class="transport-icon" data-command="restart" type="button" aria-label="Restart song" title="Restart song">&#8635;</button>
+            <button class="transport-icon primary-command" data-command="play" type="button" aria-label="Play" title="Play">&#9654;</button>
+            <button class="transport-icon" data-command="pause" type="button" aria-label="Pause" title="Pause">&#9208;</button>
+            <button class="transport-icon" data-command="stop" type="button" aria-label="Stop" title="Stop">&#9209;</button>
+            <button class="transport-icon" data-command="fadeOut" type="button" aria-label="Fade out" title="Fade out">&#9706;</button>
+            <button class="transport-icon danger-command panic-command hidden" data-command="panic" type="button" aria-label="Panic" title="Panic">!</button>
+            <button id="exitPanicButton" class="transport-icon panic-exit-command hidden" type="button" aria-label="Exit panic" title="Exit panic at next measure">OK</button>
+            <button class="transport-icon" data-command="nextSong" type="button" aria-label="Next song" title="Next song">&#9197;</button>
+          </section>
+          <div class="setlist-toolbar">
+            <button id="quickConfirmSetButton" class="quick-confirm-button" type="button">Confirm Set</button>
+            <button id="modeToggleButton" type="button">Performance</button>
+            <button id="clearSetlistButton" type="button">Clear</button>
+          </div>
+        </header>
+
+        <div class="setlist-row-shell">
+          <div id="setlistSlots" class="setlist-slots" aria-label="Setlist slots"></div>
+        </div>
+
+        <section class="selected-song-surface">
+          <div class="song-header">
+            <div>
+              <p class="eyebrow">Selected Song</p>
+              <h2 id="songTitle">None</h2>
+              <p id="songMeta">Choose a song from the setlist.</p>
+              <div id="songDetails" class="song-detail-grid hidden"></div>
+            </div>
+            <div class="playback-mode-status">
+              <strong id="playbackModeTitle">Edit Mode</strong>
+              <span id="playbackStatus">Confirm the set before Performance.</span>
+            </div>
+          </div>
+
+          <div id="alertBox" class="alert hidden"></div>
+          <div id="panicRecoveryPanel" class="panic-recovery-panel hidden">
+            <strong>Panic Active</strong>
+            <span id="panicRecoveryStatus">Tracks Down / Click Alive</span>
+          </div>
+          <section id="timelinePanel" class="timeline-panel hidden">
+            <div class="timeline-toolbar">
+              <div class="timeline-status-line">
+                <span id="timelineStatus">Select a setlist song to edit regions and cues.</span>
+              </div>
+              <div id="editorTransport" class="editor-transport" aria-label="Editor transport">
+                <button id="editorPlayButton" class="primary-command" type="button" aria-label="Play editor song" title="Play editor song">&#9654;</button>
+                <button id="editorRepeatButton" type="button" aria-label="Repeat selected area once" title="Repeat selected area once">1x</button>
+                <button id="editorLoopButton" type="button" aria-label="Loop selected area" title="Loop selected area">&#10227;</button>
+                <button id="editorPauseButton" type="button" aria-label="Pause editor playback" title="Pause editor playback">&#9208;</button>
+                <button id="editorStopButton" type="button" aria-label="Stop editor playback" title="Stop editor playback">&#9209;</button>
+                <span id="editorTransportStatus">Editor --</span>
+              </div>
+              <div class="waveform-stats" aria-label="Timeline section readout">
+                <span>Current <b id="waveformCurrentSection">--</b></span>
+                <span>Selected <b id="waveformSelectedSection">--</b></span>
+                <span>Next <b id="waveformNextSection">--</b></span>
+              </div>
+              <div class="timeline-zoom-controls" aria-label="Waveform zoom">
+                <button id="zoomOutButton" type="button" aria-label="Zoom out">-</button>
+                <span id="zoomReadout">100%</span>
+                <button id="zoomInButton" type="button" aria-label="Zoom in">+</button>
+              </div>
+              <button id="createRegionFromSelectionButton" type="button" disabled>Create Region</button>
+              <button id="undoCueMoveButton" type="button" disabled>Undo Edit</button>
+              <label class="timeline-snap-control">Snap
+                <select id="timelineSnapSelect" aria-label="Timeline snap">
+                  <option value="beat">Beats</option>
+                  <option value="measure" selected>Measures</option>
+                </select>
+              </label>
+              <select id="metadataSlotSelect" aria-label="Edit setlist song"></select>
+            </div>
+            <div id="timelineSurface" class="timeline-surface">
+              <div id="timelineRuler" class="timeline-ruler" aria-label="Timeline ruler"></div>
+              <div class="timeline-grid" aria-hidden="true"></div>
+              <div id="fakeWaveform" class="fake-waveform" aria-hidden="true"></div>
+              <div id="sectionLane" class="section-lane" aria-hidden="true"></div>
+              <div id="cueLane" class="cue-lane"></div>
+              <div id="regionLane" class="region-lane"></div>
+              <div id="regionSketchSelection" class="region-sketch-selection hidden" aria-hidden="true"></div>
+              <div id="waveformPlayhead" class="waveform-playhead" aria-hidden="true"></div>
+              <div id="regionMenu" class="region-menu hidden">
+                <label>Region Name
+                  <input id="regionNameSelect" list="regionNameSuggestions" type="text" autocomplete="off">
+                  <datalist id="regionNameSuggestions">
+                    <option value="Intro"></option>
+                    <option value="Verse 1"></option>
+                    <option value="Verse 2"></option>
+                    <option value="Chorus"></option>
+                    <option value="Bridge"></option>
+                    <option value="Tag"></option>
+                    <option value="Outro"></option>
+                    <option value="Count Off"></option>
+                    <option value="Click Section"></option>
+                  </datalist>
+                </label>
+                <button id="regionRenameButton" type="button">Rename</button>
+                <button id="regionTrimButton" type="button">Trim</button>
+                <button id="regionRemoveGapButton" type="button">Remove + Close Gap</button>
+                <button id="regionDeleteButton" type="button">Delete</button>
+              </div>
+            </div>
+          </section>
+
+          <section id="editorPanel" class="editor-panel hidden">
+            <div class="editor-card">
+              <div class="panel-title">
+                <strong>Tempo Map</strong>
+                <span>Draft edits preview in Edit mode and are saved on Confirm Set.</span>
+              </div>
+              <div class="inline-form">
+                <label>Key <input id="tempoKeyInput" type="text" placeholder="G"></label>
+                <label>BPM <input id="tempoBpmInput" type="number" min="1" step="0.01"></label>
+                <label>Time Sig <input id="tempoTimeSignatureInput" type="text" placeholder="4/4"></label>
+                <button id="saveMetadataButton" type="button">Save Draft</button>
+              </div>
+              <div class="inline-form audio-align-form">
+                <button id="alignAudioStartButton" type="button">Move Audio Start Here</button>
+                <button id="resetAudioAlignmentButton" type="button">Reset Audio Shift</button>
+                <span id="audioAlignmentStatus">Audio shift: 0.000s</span>
+              </div>
+            </div>
+
+            <div class="editor-split">
+              <div class="editor-card">
+                <div class="panel-title">
+                  <strong>Regions</strong>
+                  <div class="panel-actions">
+                    <button id="reorderRegionsButton" type="button">Reorder</button>
+                    <button id="removeRegionButton" type="button">Remove Region</button>
+                    <button id="addRegionButton" type="button">Add Region</button>
+                  </div>
+                </div>
+                <label class="selected-name-editor">Selected Region
+                  <input id="selectedRegionNameInput" type="text" autocomplete="off" placeholder="Select a region">
+                </label>
+                <div class="arrangement-actions" aria-label="Arrangement controls">
+                  <label class="arrangement-toggle">
+                    <input id="arrangementEnabledToggle" type="checkbox" checked>
+                    <span id="arrangementEnabledLabel">Arrangement On</span>
+                  </label>
+                  <button id="undoArrangementButton" type="button" disabled>Undo Arrangement</button>
+                  <button id="saveArrangementButton" type="button">Save Arrangement Now</button>
+                  <button id="clearArrangementButton" type="button">Clear Arrangement</button>
+                </div>
+                <div id="regionEditorList" class="editor-list"></div>
+              </div>
+
+              <div class="editor-card">
+                <div class="panel-title">
+                  <strong>Cue Markers</strong>
+                  <div class="panel-actions">
+                    <button id="reorderCuesButton" type="button">Reorder</button>
+                    <button id="addCueButton" type="button">Add Cue</button>
+                  </div>
+                </div>
+                <label class="selected-name-editor">Selected Cue
+                  <input id="selectedCueNameInput" type="text" autocomplete="off" placeholder="Select a cue marker">
+                </label>
+                <div id="cueEditorList" class="editor-list"></div>
+              </div>
+            </div>
+          </section>
+
+          <section class="operator-lower-panel mixer-first" id="mixerLowerPanel">
+            <div id="mixerResizeHandle" class="mixer-resize-handle" role="separator" aria-orientation="horizontal" aria-label="Resize mixer"></div>
+            <div class="operator-tabbar">
+              <button class="operator-tab active" type="button" data-operator-panel="mixerPanel">Tracks</button>
+              <button class="operator-tab" type="button" data-operator-panel="regionsPanel">Buses</button>
+              <button class="operator-tab" type="button" data-operator-panel="readinessPanel">Pads</button>
+              <button id="mixerCollapseButton" class="mixer-collapse-button" type="button">Collapse</button>
+            </div>
+            <div id="mixerPanel" class="operator-panel active">
+              <div id="mixerStrip" class="mixer-strip" aria-label="Mixer channels"></div>
+            </div>
+            <div id="regionsPanel" class="operator-panel">
+              <div id="busLayer" class="bus-layer" aria-label="Bus routing"></div>
+            </div>
+            <div id="readinessPanel" class="operator-panel">
+              <div id="padLayer" class="pad-layer" aria-label="Pad player"></div>
+            </div>
+          </section>
+        </section>
+      </section>
+
+      <section id="addSongModal" class="modal hidden" aria-modal="true" aria-labelledby="addSongTitle" role="dialog">
+        <div class="modal-backdrop" data-close-add-song></div>
+        <div class="modal-panel">
+          <header class="modal-header">
+            <div>
+              <p class="eyebrow">Add Song</p>
+              <h2 id="addSongTitle">Choose From Library</h2>
+            </div>
+            <button id="closeAddSongButton" class="icon-button" type="button" aria-label="Close">x</button>
+          </header>
+
+          <div class="tabs" role="tablist" aria-label="Library filters">
+            <button class="tab active" type="button" data-vendor="All">All</button>
+            <button class="tab" type="button" data-vendor="Loop Community">Loop Community</button>
+            <button class="tab" type="button" data-vendor="Multitracks">Multitracks</button>
+          </div>
+
+          <label class="search-label" for="songSearch">Search songs</label>
+          <input id="songSearch" type="search" placeholder="Type a song name">
+
+          <label class="search-label" for="songSelect">Song library</label>
+          <select id="songSelect" size="12"></select>
+
+          <footer class="modal-actions">
+            <details class="skipped">
+              <summary id="skippedSummary">Skipped Folders</summary>
+              <div id="skippedFolders" class="skipped-list"></div>
+            </details>
+            <button id="addSelectedSongButton" class="primary-command" type="button">Add To Set</button>
+          </footer>
+        </div>
+      </section>
+    </main>
+
+    <main id="settingsView" class="view settings-view" aria-label="Settings drawer">
+      <div class="settings-backdrop" data-close-settings></div>
+      <section class="settings-panel">
+        <header class="playback-header">
+          <div>
+            <p class="eyebrow">Settings</p>
+            <h2>Audio & Routing</h2>
+            <p id="settingsStatus">Global settings for the JUCE audio engine.</p>
+          </div>
+          <div class="settings-actions">
+            <button id="saveSettingsButton" type="button">Save Settings</button>
+            <button id="closeSettingsButton" class="icon-button" type="button" aria-label="Close settings">x</button>
+          </div>
+        </header>
+
+        <div class="settings-tabs" role="tablist" aria-label="Settings sections">
+          <button class="settings-tab active" type="button" data-settings-tab="librarySettings">Library</button>
+          <button class="settings-tab" type="button" data-settings-tab="audioSettings">Audio</button>
+          <button class="settings-tab" type="button" data-settings-tab="routingSettings">Routing</button>
+          <button class="settings-tab" type="button" data-settings-tab="playbackSettings">Playback</button>
+          <button class="settings-tab" type="button" data-settings-tab="advancedSettings">Advanced</button>
+        </div>
+
+        <section id="librarySettings" class="settings-section active">
+          <div class="settings-grid">
+            <div class="settings-readout">
+              <span>Library Scan Folder</span>
+              <strong id="libraryRootPath">--</strong>
+            </div>
+            <label>Choose Library Folder
+              <span class="path-picker">
+                <input id="libraryRootInput" type="text" placeholder="Backing Tracks, vendor folder, or one song folder">
+                <button type="button" data-folder-picker="libraryRootInput">Browse</button>
+              </span>
+            </label>
+            <div class="settings-readout">
+              <span>Vendor Folders</span>
+              <strong id="libraryVendorFolders">--</strong>
+            </div>
+            <div class="settings-readout">
+              <span>App Data</span>
+              <strong id="appDataPath">--</strong>
+            </div>
+            <button id="refreshButton" type="button">Refresh Library</button>
+          </div>
+        </section>
+
+        <section id="audioSettings" class="settings-section">
+          <div class="settings-grid">
+            <div class="settings-readout">
+              <span>Engine Readiness</span>
+              <strong id="audioReadiness">JUCE offline</strong>
+            </div>
+            <div id="readinessSummary" class="readiness-summary"></div>
+            <label>Audio Device Name
+              <input id="selectedDeviceNameInput" type="text" placeholder="Focusrite Scarlett USB">
+            </label>
+            <label>Audio Device List
+              <select id="audioDeviceSelect"></select>
+            </label>
+            <button id="refreshAudioDevicesButton" type="button">Refresh Audio Devices</button>
+            <div class="settings-readout">
+              <span>Device List</span>
+              <strong id="deviceListPreview">No default device saved</strong>
+            </div>
+            <label>Sample Rate
+              <select id="sampleRateSelect">
+                <option value="48000">48 kHz</option>
+                <option value="44100">44.1 kHz</option>
+              </select>
+            </label>
+            <label>Dynamic Cue Folder
+              <span class="path-picker">
+                <input id="dynamicCueFolderInput" type="text" placeholder="Folder with cue WAV files">
+                <button type="button" data-folder-picker="dynamicCueFolderInput">Browse</button>
+              </span>
+            </label>
+            <label>Pads Folder
+              <span class="path-picker">
+                <input id="padsFolderInput" type="text" placeholder="Folder with pad WAV files">
+                <button type="button" data-folder-picker="padsFolderInput">Browse</button>
+              </span>
+            </label>
+            <label>Dynamic Click WAV
+              <span class="path-picker">
+                <input id="dynamicClickSoundInput" type="text" placeholder="Path to normal click WAV">
+                <button type="button" data-wav-picker="dynamicClickSoundInput">Browse</button>
+              </span>
+            </label>
+            <label>Dynamic Click Accent WAV
+              <span class="path-picker">
+                <input id="dynamicClickAccentInput" type="text" placeholder="Path to accent click WAV">
+                <button type="button" data-wav-picker="dynamicClickAccentInput">Browse</button>
+              </span>
+            </label>
+          </div>
+        </section>
+
+        <section id="routingSettings" class="settings-section">
+          <div class="settings-grid">
+            <label>Routing Preset
+              <select id="routingPresetSelect"></select>
+            </label>
+            <div id="routingStructure" class="routing-structure"></div>
+          </div>
+        </section>
+
+        <section id="playbackSettings" class="settings-section">
+          <div class="settings-grid">
+            <button id="confirmSetButton" type="button">Confirm Set</button>
+            <div id="cacheReport" class="cache-report"></div>
+            <div id="cueAnalyzerStatus" class="settings-readout">
+              <span>Cue Recognizer</span>
+              <strong>Checking...</strong>
+            </div>
+            <div id="cueRecognitionReport" class="cue-recognition-report"></div>
+          </div>
+        </section>
+
+        <section id="advancedSettings" class="settings-section">
+          <div class="settings-grid">
+            <button id="runSystemCheckButton" type="button">Run Error Check</button>
+            <div id="systemCheckResult" class="settings-readout">
+              <span>Error Check</span>
+              <strong>Not run</strong>
+            </div>
+            <details class="engine-manifest">
+              <summary>Engine Snapshot</summary>
+              <pre id="engineManifestPreview">Confirm Set to create the engine snapshot.</pre>
+            </details>
+          </div>
+        </section>
+      </section>
+    </main>
+
+    <script src="/app.js" type="module"></script>
+  </body>
+</html>

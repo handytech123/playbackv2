@@ -1,0 +1,14 @@
+node_modules/
+dist/
+*.log
+__pycache__/
+*.pyc
+data/
+userData/
+_c-drive-archive/
+third_party/asio-sdk/
+native/juce-audio-engine/build/
+native/juce-audio-engine/build-d/
+native/juce-audio-engine/bin/**/*.bak-*
+pads/*.wav
+!pads/README.txt
