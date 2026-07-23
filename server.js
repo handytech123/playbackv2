@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { spawn } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { createReadStream } from "node:fs";
 import { copyFile, mkdir, open, readFile, readdir, rename, rm, stat, unlink, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
@@ -361,7 +361,7 @@ async function loadAudioDevices() {
   const settings = await loadSettings();
   let selectedName = settings.audioEngine.selectedDeviceName;
   const helper = await runEngineCommand({ type: "listDevices", requestId: "list-devices" });
-  const devices = Array.isArray(helper.response?.devices)
+  const juceDevices = Array.isArray(helper.response?.devices)
     ? helper.response.devices.map((device) => ({
       id: stringValue(device.id),
       name: stringValue(device.name),
@@ -370,6 +370,7 @@ async function loadAudioDevices() {
       available: true
     }))
     : [];
+  const devices = mergeAudioDevices(juceDevices, await listRegistryAsioDevices());
   let selectedDevice = selectEngineDevice(devices, selectedName);
   if (!selectedName && devices.length) {
     selectedDevice = chooseDefaultAudioDevice(devices);
@@ -398,6 +399,76 @@ async function loadAudioDevices() {
       selected: selectedDevice ? device.id === selectedDevice.id : false
     }))
   };
+}
+
+function mergeAudioDevices(primaryDevices, secondaryDevices) {
+  const devices = [];
+  const seen = new Set();
+  for (const device of [...primaryDevices, ...secondaryDevices]) {
+    const key = `${stringValue(device.driver).toLowerCase()}:${stringValue(device.name).toLowerCase()}`;
+    if (!stringValue(device.name) || seen.has(key)) continue;
+    seen.add(key);
+    devices.push(device);
+  }
+  return devices;
+}
+
+async function listRegistryAsioDevices() {
+  const registryRoots = [
+    "HKLM\\SOFTWARE\\ASIO",
+    "HKLM\\SOFTWARE\\WOW6432Node\\ASIO"
+  ];
+  const devices = [];
+  const seen = new Set();
+  for (const root of registryRoots) {
+    const keys = await queryRegistryKeys(root);
+    for (const key of keys) {
+      const name = basename(key);
+      const detail = await queryRegistryValues(key);
+      const deviceName = stringValue(detail.Description || name);
+      const id = `ASIO:${deviceName}`;
+      const dedupeKey = deviceName.toLowerCase();
+      if (!deviceName || seen.has(dedupeKey)) continue;
+      seen.add(dedupeKey);
+      devices.push({
+        id,
+        name: deviceName,
+        driver: "ASIO",
+        channels: null,
+        available: true,
+        source: "asio-registry",
+        registryName: name,
+        clsid: stringValue(detail.CLSID)
+      });
+    }
+  }
+  return devices;
+}
+
+function queryRegistryKeys(root) {
+  return new Promise((resolveKeys) => {
+    execFile("reg.exe", ["query", root], { windowsHide: true }, (error, stdout) => {
+      if (error) return resolveKeys([]);
+      resolveKeys(stdout
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .filter((line) => line.toUpperCase().startsWith(`${root}\\`.toUpperCase())));
+    });
+  });
+}
+
+function queryRegistryValues(key) {
+  return new Promise((resolveValues) => {
+    execFile("reg.exe", ["query", key], { windowsHide: true }, (error, stdout) => {
+      if (error) return resolveValues({});
+      const values = {};
+      for (const line of stdout.split(/\r?\n/)) {
+        const match = line.trim().match(/^(.+?)\s+REG_\w+\s+(.+)$/);
+        if (match) values[match[1].trim()] = match[2].trim();
+      }
+      resolveValues(values);
+    });
+  });
 }
 
 async function loadCurrentSetlist() {
