@@ -291,6 +291,8 @@ async function saveSettings(settings) {
 
 function normalizeSettings(value = {}) {
   value = value || {};
+  const selectedDeviceName = stringValue(value.audioEngine?.selectedDeviceName);
+  const activeRoutingPresetId = stringValue(value.routing?.activePresetId || (isDanteDeviceName(selectedDeviceName) ? "dante-32" : "tracks-click-cue"));
   return {
     library: {
       rootPath: stringValue(value.library?.rootPath || ROOT)
@@ -299,13 +301,13 @@ function normalizeSettings(value = {}) {
       helper: ENGINE_HELPER,
       target: "cross-platform",
       selectedDeviceId: stringValue(value.audioEngine?.selectedDeviceId),
-      selectedDeviceName: stringValue(value.audioEngine?.selectedDeviceName),
+      selectedDeviceName,
       missingDevicePolicy: "warn-and-wait",
       protocolVersion: ENGINE_PROTOCOL_VERSION,
       sampleRate: [44100, 48000].includes(Number(value.audioEngine?.sampleRate)) ? Number(value.audioEngine.sampleRate) : 48000
     },
     routing: {
-      activePresetId: stringValue(value.routing?.activePresetId || "tracks-click-cue"),
+      activePresetId: activeRoutingPresetId,
       presets: normalizeRoutingPresets(value.routing?.presets)
     },
     dynamicCue: {
@@ -324,6 +326,10 @@ function normalizeSettings(value = {}) {
       editableInPerformance: false
     }
   };
+}
+
+function isDanteDeviceName(value) {
+  return /dante/i.test(stringValue(value));
 }
 
 function normalizeRoutingPresets(presets) {

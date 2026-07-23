@@ -248,7 +248,10 @@ function wireEvents() {
     button.addEventListener("click", () => selectFolderPath(button));
   }
   els.audioDeviceSelect.addEventListener("change", () => {
-    if (els.audioDeviceSelect.value) els.selectedDeviceName.value = els.audioDeviceSelect.value;
+    if (els.audioDeviceSelect.value) {
+      els.selectedDeviceName.value = els.audioDeviceSelect.value;
+      applyRoutingPresetForSelectedDevice();
+    }
   });
   els.refreshAudioDevices.addEventListener("click", refreshAudioDevices);
   els.audioDiagnostics?.addEventListener("click", runAudioDiagnostics);
@@ -873,17 +876,20 @@ function renderCueRecognitionReport(slot) {
 function renderRoutingStructure() {
   if (!els.routingStructure || !state.settings) return;
   const preset = activeRoutingPreset();
+  const outputCount = routingMatrixOutputCount();
+  const selectedDevice = selectedAudioDevice();
   els.routingStructure.replaceChildren();
   const header = document.createElement("div");
   header.className = "section-header-line";
-  header.innerHTML = `<strong>Dante / ASIO Matrix</strong><span>${escapeHtml(preset?.name || "No preset")}</span>`;
+  header.innerHTML = `<strong>Dante / ASIO Matrix</strong><span>${escapeHtml(selectedDevice?.name || state.settings.audioEngine?.selectedDeviceName || "No device")} | ${escapeHtml(preset?.name || "No preset")} | ${outputCount} outputs</span>`;
   els.routingStructure.append(header);
   const matrix = document.createElement("div");
   matrix.className = "dante-matrix";
-  const headers = Array.from({ length: 32 }, (_, index) => `<div class="dante-matrix-header">${index + 1}</div>`).join("");
+  const headers = Array.from({ length: outputCount }, (_, index) => `<div class="dante-matrix-header">${index + 1}</div>`).join("");
   const rows = DANTE_ROUTING_ROWS.map((row) => {
-    const selected = new Set(Array.isArray(preset?.routes?.[row.key]) ? preset.routes[row.key].map(Number) : []);
-    const cells = Array.from({ length: 32 }, (_, index) => {
+    const selected = new Set((Array.isArray(preset?.routes?.[row.key]) ? preset.routes[row.key].map(Number) : [])
+      .filter((channel) => channel <= outputCount));
+    const cells = Array.from({ length: outputCount }, (_, index) => {
       const channel = index + 1;
       const active = selected.has(channel);
       return `<button class="dante-matrix-cell${active ? " active" : ""}${channel % 8 === 0 ? " channel-boundary" : ""}" type="button" data-route-channel="${channel}" aria-label="${escapeAttr(row.label)} output ${channel}" aria-pressed="${active ? "true" : "false"}"></button>`;
@@ -906,10 +912,42 @@ function renderRoutingStructure() {
       </div>
     </div>
   `;
+  const grid = matrix.querySelector(".dante-matrix-grid");
+  if (grid) grid.style.gridTemplateColumns = `minmax(180px, 230px) repeat(${outputCount}, 30px) minmax(64px, 82px)`;
   matrix.querySelectorAll("[data-route-channel]").forEach((cell) => {
     cell.addEventListener("click", () => toggleDanteMatrixCell(cell));
   });
   els.routingStructure.append(matrix);
+}
+
+function applyRoutingPresetForSelectedDevice() {
+  if (!state.settings || !els.routingPreset) return;
+  const deviceName = els.selectedDeviceName.value || "";
+  const nextPresetId = isDanteDeviceName(deviceName) ? "dante-32" : state.settings.routing?.activePresetId;
+  if (nextPresetId && [...els.routingPreset.options].some((option) => option.value === nextPresetId)) {
+    els.routingPreset.value = nextPresetId;
+    state.settings.routing.activePresetId = nextPresetId;
+  }
+  renderRoutingStructure();
+  renderBusLayer();
+}
+
+function selectedAudioDevice() {
+  const selected = els.selectedDeviceName?.value || state.audioDevices?.selectedDeviceName || state.settings?.audioEngine?.selectedDeviceName || "";
+  const devices = state.audioDevices?.devices || [];
+  return devices.find((device) => device.id === selected || device.name === selected) || state.audioDevices?.selectedDevice || null;
+}
+
+function routingMatrixOutputCount() {
+  const device = selectedAudioDevice();
+  const deviceName = `${device?.id || ""} ${device?.name || ""} ${state.settings?.audioEngine?.selectedDeviceName || ""}`;
+  if (isDanteDeviceName(deviceName)) return 32;
+  const channels = Number(device?.channels || state.audioDevices?.selectedDevice?.channels || 0);
+  return Math.max(2, Math.min(32, Number.isFinite(channels) && channels > 0 ? channels : 32));
+}
+
+function isDanteDeviceName(value) {
+  return /dante/i.test(String(value || ""));
 }
 
 function toggleDanteMatrixCell(cell) {
