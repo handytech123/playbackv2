@@ -34,6 +34,10 @@ target_include_directories(juce-audio-engine
     ${CMAKE_CURRENT_LIST_DIR}/../../third_party/asio-sdk/common
 )
 
+if(MSVC)
+  target_compile_options(juce-audio-engine PRIVATE /EHsc)
+endif()
+
 target_link_libraries(juce-audio-engine
   PRIVATE
     juce::juce_audio_devices
@@ -41,3 +45,7 @@ target_link_libraries(juce-audio-engine
     juce::juce_audio_utils
     juce::juce_core
 )
+
+if(WIN32)
+  target_link_libraries(juce-audio-engine PRIVATE winmm)
+endif()

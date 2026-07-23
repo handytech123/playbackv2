@@ -10,6 +10,11 @@
 #include <utility>
 #include <vector>
 
+#if JUCE_WINDOWS
+ #include <windows.h>
+ #include <mmsystem.h>
+#endif
+
 namespace
 {
 constexpr int protocolVersion = 1;
@@ -225,6 +230,37 @@ void sendDevices(const juce::String& requestId)
             devices.add(juce::var(device.get()));
         }
     }
+
+#if JUCE_WINDOWS
+    juce::DynamicObject::Ptr defaultDevice = new juce::DynamicObject();
+    defaultDevice->setProperty("id", "WaveOut:Default Windows Output");
+    defaultDevice->setProperty("name", "Default Windows Output");
+    defaultDevice->setProperty("type", "WaveOut");
+    defaultDevice->setProperty("isOutput", true);
+    defaultDevice->setProperty("isDefault", true);
+    defaultDevice->setProperty("channelCount", 2);
+    defaultDevice->setProperty("available", true);
+    devices.add(juce::var(defaultDevice.get()));
+
+    const auto waveOutCount = waveOutGetNumDevs();
+    for (UINT index = 0; index < waveOutCount; ++index)
+    {
+        WAVEOUTCAPSW caps = {};
+        if (waveOutGetDevCapsW(index, &caps, sizeof(caps)) != MMSYSERR_NOERROR)
+            continue;
+
+        const juce::String name(caps.szPname);
+        juce::DynamicObject::Ptr device = new juce::DynamicObject();
+        device->setProperty("id", "WaveOut:" + juce::String(index) + ":" + name);
+        device->setProperty("name", name);
+        device->setProperty("type", "WaveOut");
+        device->setProperty("isOutput", true);
+        device->setProperty("isDefault", false);
+        device->setProperty("channelCount", static_cast<int>(caps.wChannels));
+        device->setProperty("available", true);
+        devices.add(juce::var(device.get()));
+    }
+#endif
 
     response->setProperty("nativeAudioActive", true);
     response->setProperty("devices", devices);

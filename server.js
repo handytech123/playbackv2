@@ -366,8 +366,10 @@ async function loadAudioDevices() {
       id: stringValue(device.id),
       name: stringValue(device.name),
       driver: stringValue(device.type),
-      channels: null,
-      available: true
+      channels: positiveNumber(device.channelCount),
+      available: device.available !== false,
+      isDefault: Boolean(device.isDefault),
+      source: "juce-helper"
     }))
     : [];
   const devices = mergeAudioDevices(juceDevices, await listRegistryAsioDevices());
