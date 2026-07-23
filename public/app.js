@@ -529,6 +529,10 @@ function formatAudioDiagnosticReport(report) {
   lines.push("");
   lines.push(`JUCE raw devices (${report.helper?.rawDeviceCount || 0})`);
   lines.push(`JUCE helper: ${report.helper?.ok ? "ok" : "failed"} ${report.helper?.error || ""}`);
+  lines.push(`JUCE helper path: ${report.helper?.helperPath || "--"}`);
+  lines.push(`JUCE exit code: ${report.helper?.exitCode ?? "--"}${report.helper?.signal ? ` signal=${report.helper.signal}` : ""}`);
+  if (report.helper?.stderr) lines.push(`JUCE stderr: ${report.helper.stderr}`);
+  if (report.helper?.stdout && !report.helper?.rawDeviceCount) lines.push(`JUCE stdout: ${report.helper.stdout}`);
   for (const device of report.helper?.rawDevices || []) {
     lines.push(`- ${device.name || device.id || "--"} [${device.type || "--"}]`);
   }

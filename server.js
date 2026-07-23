@@ -426,6 +426,10 @@ async function audioDeviceDiagnostics() {
       ok: helper.ok,
       helperPath: helper.helperPath,
       error: helper.error || "",
+      exitCode: helper.exitCode ?? null,
+      signal: helper.signal || "",
+      stdout: helper.stdout || "",
+      stderr: helper.stderr || "",
       rawResponseType: helper.response?.type || "",
       rawDeviceCount: Array.isArray(helper.response?.devices) ? helper.response.devices.length : 0,
       rawDevices: Array.isArray(helper.response?.devices) ? helper.response.devices : []
@@ -751,11 +755,14 @@ async function runEngineCommand(command, options = {}) {
         ok: false,
         helperPath,
         response: null,
+        stdout,
+        stderr,
+        exitCode: null,
         error: error.message
       });
     });
 
-    child.on("close", () => {
+    child.on("close", (code, signal) => {
       const lines = stdout
         .split(/\r?\n/)
         .map((line) => line.trim())
@@ -773,7 +780,11 @@ async function runEngineCommand(command, options = {}) {
         ok: Boolean(response) && response.type !== "commandRejected",
         helperPath,
         response,
-        error: response?.reason || stderr.trim() || (!response ? "JUCE helper returned no JSON response." : "")
+        stdout,
+        stderr,
+        exitCode: code,
+        signal,
+        error: response?.reason || stderr.trim() || (!response ? `JUCE helper returned no JSON response. Exit code: ${code ?? "unknown"}${signal ? `, signal: ${signal}` : ""}.` : "")
       });
     });
 
