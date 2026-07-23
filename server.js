@@ -1424,8 +1424,13 @@ async function resolveEngineDevice(selectedDeviceName) {
   const devices = await loadAudioDevices();
   const match = selectEngineDevice(devices.devices || [], selectedDeviceName);
   return {
-    name: match?.name || selectedDeviceName,
-    driver: match?.driver || ""
+    name: match?.driver === "ASIO" && match?.registryName ? match.registryName : match?.name || selectedDeviceName,
+    label: match?.name || selectedDeviceName,
+    driver: match?.driver || "",
+    id: match?.id || selectedDeviceName,
+    source: match?.source || "",
+    channels: positiveNumber(match?.channels),
+    isDefault: Boolean(match?.isDefault)
   };
 }
 
@@ -1502,6 +1507,25 @@ async function probeEngineReadiness(settings, manifestPath) {
   }
 
   const device = await resolveEngineDevice(selectedDeviceName);
+  if (device.driver === "WaveOut") {
+    const status = normalizeEngineStatus({
+      state: "ready",
+      simulated: false,
+      selectedDeviceName: device.id || selectedDeviceName,
+      deviceType: "WaveOut",
+      requestedOutputChannels: 2,
+      outputChannels: device.channels || 2,
+      sampleRate: settings.audioEngine?.sampleRate || 48000,
+      bufferSize: 512,
+      manifestPath,
+      message: `Windows WaveOut detected on ${device.label || device.name || selectedDeviceName}. Use a JUCE Windows Audio or ASIO device for production playback.`,
+      lastHeartbeatAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString()
+    });
+    await saveEngineStatus(status);
+    return status;
+  }
+
   const probe = await runEngineCommand({
     type: "probeDevice",
     requestId: "engine-probe",

@@ -10,6 +10,7 @@ third_party/asio-sdk/
 native/juce-audio-engine/build/
 native/juce-audio-engine/build-d/
 native/juce-audio-engine/build-v2-current/
+native/juce-audio-engine/build-v2-release/
 native/juce-audio-engine/*-build.bat
 native/juce-audio-engine/bin/**/*.bak-*
 pads/*.wav
