@@ -477,10 +477,13 @@ async function refreshAudioDevices() {
   els.settingsStatus.textContent = "Looking for audio device changes...";
   try {
     await loadAudioDevices();
+    await loadSettings();
     await loadPlaybackState();
     const count = state.audioDevices?.devices?.length || 0;
     const selected = state.audioDevices?.selectedDeviceName || state.settings?.audioEngine?.selectedDeviceName || "";
-    els.settingsStatus.textContent = selected
+    els.settingsStatus.textContent = state.audioDevices?.selectedMissing
+      ? `Saved audio device is missing on this PC. ${count} device${count === 1 ? "" : "s"} found; choose the playback PC device.`
+      : selected
       ? `Audio devices refreshed. Saved default: ${selected}.`
       : `Audio devices refreshed. ${count} device${count === 1 ? "" : "s"} found.`;
   } catch (error) {
@@ -690,7 +693,9 @@ function renderAudioDevices() {
     els.audioDeviceSelect.append(option);
   }
   const selected = state.audioDevices?.selectedDeviceName || state.settings?.audioEngine?.selectedDeviceName || "";
-  els.deviceListPreview.textContent = selected
+  els.deviceListPreview.textContent = state.audioDevices?.selectedMissing
+    ? `Saved default not found on this PC: ${selected}`
+    : selected
     ? `Saved default: ${selected}`
     : "No default device saved";
 }

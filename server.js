@@ -359,7 +359,7 @@ function systemInfo() {
 
 async function loadAudioDevices() {
   const settings = await loadSettings();
-  const selectedName = settings.audioEngine.selectedDeviceName;
+  let selectedName = settings.audioEngine.selectedDeviceName;
   const helper = await runEngineCommand({ type: "listDevices", requestId: "list-devices" });
   const devices = Array.isArray(helper.response?.devices)
     ? helper.response.devices.map((device) => ({
@@ -370,10 +370,27 @@ async function loadAudioDevices() {
       available: true
     }))
     : [];
-  const selectedDevice = selectEngineDevice(devices, selectedName);
+  let selectedDevice = selectEngineDevice(devices, selectedName);
+  if (!selectedName && devices.length) {
+    selectedDevice = chooseDefaultAudioDevice(devices);
+    selectedName = selectedDevice?.id || selectedDevice?.name || "";
+    if (selectedName) {
+      await saveSettings({
+        ...settings,
+        audioEngine: {
+          ...settings.audioEngine,
+          selectedDeviceId: selectedDevice.id || selectedName,
+          selectedDeviceName: selectedName
+        }
+      });
+    }
+  }
+  const selectedMissing = Boolean(selectedName && devices.length && !selectedDevice);
   return {
     source: helper.ok ? "juce-helper" : "juce-helper-unavailable",
     selectedDeviceName: selectedName,
+    selectedDevice: selectedDevice || null,
+    selectedMissing,
     helperPath: helper.helperPath,
     error: helper.ok ? "" : helper.error,
     devices: devices.map((device) => ({
@@ -1276,6 +1293,29 @@ function selectEngineDevice(devices, selectedDeviceName) {
     .map((device) => ({ device, score: deviceMatchScore(device, selectedDeviceName) }))
     .filter((entry) => entry.score > 0)
     .sort((a, b) => b.score - a.score)[0]?.device || null;
+}
+
+function chooseDefaultAudioDevice(devices) {
+  return [...devices]
+    .filter((device) => stringValue(device.name))
+    .sort((a, b) => audioDevicePreferenceScore(b) - audioDevicePreferenceScore(a))[0] || null;
+}
+
+function audioDevicePreferenceScore(device) {
+  const id = stringValue(device.id).toLowerCase();
+  const name = stringValue(device.name).toLowerCase();
+  const driver = stringValue(device.driver);
+  const haystack = `${id} ${name}`;
+  let score = 0;
+  if (haystack.includes("dante")) score += 1000;
+  if (driver === "ASIO") score += 800;
+  if (driver.includes("Low Latency")) score += 500;
+  if (driver === "Windows Audio") score += 300;
+  if (driver.includes("Exclusive")) score += 200;
+  if (driver === "DirectSound") score += 50;
+  if (haystack.includes("primary sound driver")) score -= 100;
+  if (haystack.includes("steam")) score -= 200;
+  return score;
 }
 
 function deviceMatchesSelectedName(device, selectedDeviceName) {
