@@ -141,6 +141,10 @@ createServer(async (req, res) => {
       return json(res, await playbackStateSnapshot());
     }
 
+    if (req.method === "GET" && url.pathname === "/api/playback/state-stream") {
+      return openPlaybackStateStream(req, res);
+    }
+
     if (req.method === "GET" && url.pathname === "/api/playback/meters") {
       return json(res, await playbackMeterSnapshot());
     }
@@ -1890,6 +1894,35 @@ async function playbackStateSnapshot() {
     currentFingerprint: fingerprint,
     readiness
   };
+}
+
+function openPlaybackStateStream(req, res) {
+  res.writeHead(200, {
+    "Content-Type": "text/event-stream",
+    "Cache-Control": "no-cache, no-transform",
+    Connection: "keep-alive",
+    "X-Accel-Buffering": "no"
+  });
+  let closed = false;
+  let inFlight = false;
+  const send = async () => {
+    if (closed || inFlight) return;
+    inFlight = true;
+    try {
+      const snapshot = await playbackStateSnapshot();
+      res.write(`event: state\ndata: ${JSON.stringify(snapshot)}\n\n`);
+    } catch (error) {
+      res.write(`event: error\ndata: ${JSON.stringify({ error: error.message })}\n\n`);
+    } finally {
+      inFlight = false;
+    }
+  };
+  send();
+  const timer = setInterval(send, 200);
+  req.on("close", () => {
+    closed = true;
+    clearInterval(timer);
+  });
 }
 
 function computedPlaybackTimeSeconds(state) {
@@ -4705,6 +4738,7 @@ function setFingerprint(setlist) {
 }
 
 function normalizeSetlist(value = {}) {
+  value = value && typeof value === "object" ? value : {};
   const slots = Array.isArray(value.slots) ? value.slots : [];
   const slotCount = Math.max(10, slots.length);
   return {
@@ -5902,7 +5936,7 @@ function assertInsideArrangementCache(filePath) {
 }
 
 async function serveStatic(pathname, res) {
-  const requested = pathname === "/" ? "/index.html" : pathname;
+  const requested = pathname === "/" ? "/index.html" : pathname === "/remote" ? "/remote.html" : pathname;
   const filePath = resolve(PUBLIC_DIR, `.${decodeURIComponent(requested)}`);
   if (!filePath.toLowerCase().startsWith(PUBLIC_DIR.toLowerCase())) {
     return json(res, { error: "Forbidden." }, 403);

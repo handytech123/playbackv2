@@ -9,7 +9,7 @@
   "scripts": {
     "start": "node server.js",
     "electron": "electron .",
-    "check": "node --check server.js && node --check public/app.js && node --check electron/main.cjs",
+    "check": "node --check server.js && node --check public/app.js && node --check public/remote.js && node --check electron/main.cjs",
     "build:win": "electron-builder --win portable",
     "build:win:installer": "electron-builder --win nsis"
   },

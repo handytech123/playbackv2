@@ -1,0 +1,254 @@
+:root {
+  color-scheme: dark;
+  --bg: #080b0d;
+  --panel: #12181d;
+  --panel-strong: #172029;
+  --line: #2d3942;
+  --text: #f4f0e8;
+  --muted: #9daab3;
+  --green: #35d07f;
+  --yellow: #e0aa32;
+  --red: #ef4e4e;
+  --blue: #42b7ff;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: Arial, Helvetica, sans-serif;
+  -webkit-tap-highlight-color: transparent;
+  touch-action: manipulation;
+}
+
+button {
+  font: inherit;
+}
+
+.remote-shell {
+  min-height: 100vh;
+  display: grid;
+  gap: 12px;
+  padding: 14px;
+  grid-template-rows: auto auto auto auto 1fr auto;
+}
+
+.remote-header,
+.panic-panel,
+.now-card,
+.sections-panel,
+.remote-footer {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+}
+
+.remote-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 14px;
+}
+
+.eyebrow,
+.now-card span,
+.panel-title span,
+.remote-footer {
+  color: var(--muted);
+  font-size: 12px;
+  text-transform: uppercase;
+}
+
+h1 {
+  margin: 4px 0;
+  font-size: clamp(24px, 5vw, 46px);
+  line-height: 1;
+}
+
+p {
+  margin: 0;
+  color: var(--muted);
+}
+
+.status-pill {
+  min-width: 92px;
+  padding: 10px 12px;
+  border-radius: 999px;
+  text-align: center;
+  border: 1px solid var(--line);
+  color: var(--muted);
+  font-weight: 800;
+}
+
+.status-pill.online {
+  color: #04100a;
+  background: var(--green);
+  border-color: var(--green);
+}
+
+.status-pill.pending {
+  color: #140d00;
+  background: var(--yellow);
+  border-color: var(--yellow);
+}
+
+.panic-panel {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 14px;
+  border-color: var(--red);
+  background: #2a1010;
+  color: #fff4f4;
+}
+
+.hidden {
+  display: none !important;
+}
+
+.now-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.now-card {
+  min-height: 82px;
+  display: grid;
+  align-content: center;
+  gap: 8px;
+  padding: 14px;
+}
+
+.now-card strong {
+  font-size: clamp(20px, 4vw, 34px);
+  line-height: 1;
+}
+
+.command-grid {
+  display: grid;
+  gap: 10px;
+}
+
+.command-grid.primary {
+  grid-template-columns: 2fr 1fr 1.2fr 1.2fr;
+}
+
+.command-grid.live {
+  grid-template-columns: repeat(4, 1fr);
+}
+
+.command {
+  min-height: 76px;
+  border: 1px solid #40505a;
+  border-radius: 8px;
+  background: var(--panel-strong);
+  color: var(--text);
+  font-size: clamp(18px, 3vw, 30px);
+  font-weight: 900;
+  cursor: pointer;
+}
+
+.command:active,
+.command.active {
+  transform: translateY(1px);
+  border-color: var(--green);
+  box-shadow: 0 0 0 2px rgba(53, 208, 127, 0.22) inset;
+}
+
+.command.play {
+  background: var(--green);
+  color: #031009;
+  border-color: var(--green);
+}
+
+.command.danger {
+  background: var(--red);
+  color: #180202;
+  border-color: var(--red);
+}
+
+.command.recover {
+  border-color: var(--blue);
+}
+
+.command.warn {
+  border-color: var(--yellow);
+}
+
+.command:disabled {
+  opacity: 0.42;
+  cursor: not-allowed;
+}
+
+.sections-panel {
+  min-height: 180px;
+  padding: 12px;
+  overflow: auto;
+}
+
+.panel-title {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 10px;
+}
+
+.region-buttons {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 10px;
+}
+
+.region-button {
+  min-height: 64px;
+  border: 1px solid #35505f;
+  border-radius: 8px;
+  background: #10202a;
+  color: var(--text);
+  font-weight: 900;
+  text-align: left;
+  padding: 10px;
+}
+
+.region-button.current {
+  border-color: var(--green);
+  box-shadow: 0 0 0 2px rgba(53, 208, 127, 0.22) inset;
+}
+
+.remote-footer {
+  min-height: 42px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 12px;
+}
+
+@media (max-width: 760px) {
+  .remote-shell {
+    padding: 10px;
+  }
+
+  .remote-header {
+    align-items: flex-start;
+  }
+
+  .now-grid {
+    grid-template-columns: repeat(2, 1fr);
+  }
+
+  .command-grid.primary,
+  .command-grid.live {
+    grid-template-columns: repeat(2, 1fr);
+  }
+
+  .command {
+    min-height: 72px;
+  }
+}

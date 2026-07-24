@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Playback Remote</title>
+  <link rel="stylesheet" href="/remote.css">
+</head>
+<body>
+  <main class="remote-shell">
+    <header class="remote-header">
+      <div>
+        <span class="eyebrow">Stage Remote</span>
+        <h1 id="songTitle">No song selected</h1>
+        <p id="songMeta">Waiting for playback computer</p>
+      </div>
+      <div id="connectionStatus" class="status-pill offline">Offline</div>
+    </header>
+
+    <section id="panicPanel" class="panic-panel hidden">
+      <strong>Panic Active</strong>
+      <span>Tracks Down / Click Alive</span>
+    </section>
+
+    <section class="now-grid">
+      <div class="now-card">
+        <span>Transport</span>
+        <strong id="transportState">--</strong>
+      </div>
+      <div class="now-card">
+        <span>Time</span>
+        <strong id="transportTime">0:00.00</strong>
+      </div>
+      <div class="now-card">
+        <span>Current</span>
+        <strong id="currentRegion">--</strong>
+      </div>
+      <div class="now-card">
+        <span>Next</span>
+        <strong id="nextRegion">--</strong>
+      </div>
+    </section>
+
+    <section class="command-grid primary">
+      <button id="playPauseButton" class="command play" type="button" data-command="play">Play</button>
+      <button class="command" type="button" data-command="stop">Stop</button>
+      <button class="command danger" type="button" data-command="panic">Panic</button>
+      <button id="exitPanicButton" class="command recover" type="button" data-command="exitPanic">Exit Panic</button>
+    </section>
+
+    <section class="command-grid live">
+      <button class="command warn" type="button" data-region-command="repeatRegion">Repeat 1</button>
+      <button class="command warn" type="button" data-region-command="loopRegion">Loop</button>
+      <button class="command" type="button" data-command="goOnRegion">Go On</button>
+      <button class="command" type="button" data-command="nextSong">Next Song</button>
+    </section>
+
+    <section class="sections-panel">
+      <div class="panel-title">
+        <strong>Jump To Section</strong>
+        <span id="sectionHint">safe-boundary commands</span>
+      </div>
+      <div id="regionButtons" class="region-buttons"></div>
+    </section>
+
+    <footer class="remote-footer">
+      <span id="modeStatus">Mode --</span>
+      <span id="lastMessage">Ready</span>
+    </footer>
+  </main>
+  <script src="/remote.js"></script>
+</body>
+</html>
