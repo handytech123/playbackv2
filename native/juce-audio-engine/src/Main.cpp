@@ -1068,11 +1068,15 @@ juce::Array<int> readRouteOutputChannels(juce::DynamicObject* object, const juce
         auto* outputChannels = routing != nullptr ? routing->getProperty("outputChannels").getArray() : nullptr;
 
         if (outputChannels != nullptr)
+        {
             for (auto& channel : *outputChannels)
                 channels.addIfNotAlreadyThere(static_cast<int>(channel));
+
+            return channels;
+        }
     }
 
-    return channels.isEmpty() ? fallback : channels;
+    return fallback;
 }
 
 juce::Array<int> readOutputChannels(juce::DynamicObject* object, const juce::Array<int>& fallback)
@@ -1106,10 +1110,14 @@ juce::Array<int> readPresetRouteChannels(juce::DynamicObject* manifest, const ju
     juce::Array<int> channels;
 
     if (route != nullptr)
+    {
         for (auto& channel : *route)
             channels.addIfNotAlreadyThere(static_cast<int>(channel));
 
-    return channels.isEmpty() ? fallback : channels;
+        return channels;
+    }
+
+    return fallback;
 }
 
 int maxChannelInRoute(const juce::Array<int>& channels)

@@ -117,11 +117,10 @@ createServer(async (req, res) => {
     }
 
     if (req.method === "PUT" && url.pathname === "/api/settings") {
-      const settings = normalizeSettings(await readJsonBody(req));
-      await saveSettings(settings);
-      await refreshEngineManifestForMixer();
-      await probeEngineReadiness(settings, ENGINE_MANIFEST_FILE);
-      return json(res, settings);
+      const body = await readJsonBody(req);
+      const update = playbackCommandQueue.then(() => updateSettingsTransaction(body));
+      playbackCommandQueue = update.catch(() => {});
+      return json(res, await update);
     }
 
     if (req.method === "GET" && url.pathname === "/api/setlist/current") {
@@ -286,7 +285,161 @@ async function loadSettings() {
 
 async function saveSettings(settings) {
   await mkdir(DATA_DIR, { recursive: true });
-  await writeFile(SETTINGS_FILE, `${JSON.stringify(settings, null, 2)}\n`, "utf8");
+  const temporaryPath = `${SETTINGS_FILE}.${process.pid}.${Date.now()}.tmp`;
+  await writeFile(temporaryPath, `${JSON.stringify(settings, null, 2)}\n`, "utf8");
+  await rename(temporaryPath, SETTINGS_FILE);
+}
+
+async function updateSettingsTransaction(input) {
+  const previous = await loadSettings();
+  const settings = mergeSettingsUpdate(previous, input);
+  await validateConfiguredAudioAssets(settings);
+
+  const playback = await loadPlaybackState();
+  const activeSlot = activePlaybackProcess?.slot || null;
+  if (activeSlot && playback.mode === "performance") {
+    throw new Error("Stop playback or leave Performance Mode before changing audio settings.");
+  }
+
+  const resumeAtSeconds = activeSlot ? computedPlaybackTimeSeconds(playback) : 0;
+  const resumePaused = activeSlot && playback.transport === "paused";
+  const restartRequired = activeSlot && settingsRequireJuceRestart(previous, settings);
+  let liveUpdateApplied = false;
+  await saveSettings(settings);
+
+  try {
+    if (activeSlot && restartRequired) {
+      await stopNativePlayback({ fade: true, durationMs: 120 });
+      const prepared = await ensureEditPlaybackManifest(activeSlot);
+      if (!prepared.ok) throw new Error(prepared.error || "Could not rebuild the JUCE playback manifest.");
+      const restarted = await startNativeSlotPlayback(activeSlot, { startSeconds: resumeAtSeconds });
+      if (!restarted.ok) throw new Error(restarted.error || "JUCE rejected the updated audio settings.");
+      if (resumePaused) await sendNativePlaybackCommand("pause");
+      await savePlaybackState({
+        ...playback,
+        transport: resumePaused ? "paused" : "playing",
+        currentTimeSeconds: resumeAtSeconds,
+        transportAnchorSeconds: resumeAtSeconds,
+        transportStartedAt: resumePaused ? "" : new Date().toISOString(),
+        lastMessage: "Audio settings applied and JUCE reconfigured.",
+        updatedAt: new Date().toISOString()
+      });
+    } else if (activeSlot) {
+      const prepared = await ensureEditPlaybackManifest(activeSlot);
+      if (!prepared.ok) throw new Error(prepared.error || "Could not rebuild the JUCE playback manifest.");
+      const song = prepared.manifest?.songs?.find((item) => Number(item.slot) === Number(activeSlot));
+      if (!song) throw new Error("The active slot is missing from the updated JUCE manifest.");
+      const mixerUpdate = await requestNativePlaybackCommand("updateMixer", {
+        stems: song.stems || []
+      }, { timeoutMs: 2500 });
+      if (!mixerUpdate.ok) throw new Error(mixerUpdate.error || "JUCE rejected the updated stem routing.");
+      const dynamicUpdate = await requestNativePlaybackCommand("updateDynamicMixer", {
+        dynamicClick: song.dynamicClick || null,
+        dynamicCue: song.dynamicCue || null,
+        dynamicPad: song.dynamicPad || null
+      }, { timeoutMs: 2500 });
+      if (!dynamicUpdate.ok) throw new Error(dynamicUpdate.error || "JUCE rejected the updated dynamic routing.");
+      liveUpdateApplied = true;
+    } else {
+      await refreshEngineManifestForMixer();
+      const readiness = await probeEngineReadiness(settings, ENGINE_MANIFEST_FILE);
+      if (!["ready", "device-missing"].includes(readiness.state)) {
+        throw new Error(readiness.message || "JUCE rejected the updated audio settings.");
+      }
+    }
+  } catch (error) {
+    await saveSettings(previous);
+    if (activeSlot) {
+      await ensureEditPlaybackManifest(activeSlot);
+      const rollback = await startNativeSlotPlayback(activeSlot, { startSeconds: resumeAtSeconds });
+      if (rollback.ok) {
+        if (resumePaused) await sendNativePlaybackCommand("pause");
+        await savePlaybackState({
+          ...playback,
+          transport: resumePaused ? "paused" : "playing",
+          currentTimeSeconds: resumeAtSeconds,
+          transportAnchorSeconds: resumeAtSeconds,
+          transportStartedAt: resumePaused ? "" : new Date().toISOString(),
+          lastMessage: "Previous audio settings restored.",
+          updatedAt: new Date().toISOString()
+        });
+      }
+    } else {
+      await refreshEngineManifestForMixer();
+      await probeEngineReadiness(previous, ENGINE_MANIFEST_FILE);
+    }
+    throw new Error(`Settings were not applied; the previous configuration was restored. ${error.message}`);
+  }
+
+  return {
+    ...settings,
+    runtimeUpdate: {
+      applied: true,
+      juceReconfigured: Boolean(activeSlot),
+      mode: restartRequired ? "restart-and-resume" : (liveUpdateApplied ? "live" : "readiness-probe"),
+      resumedAtSeconds: restartRequired ? resumeAtSeconds : null
+    }
+  };
+}
+
+function settingsRequireJuceRestart(previous, next) {
+  if (!sameText(previous.audioEngine.selectedDeviceName, next.audioEngine.selectedDeviceName)) return true;
+  if (Number(previous.audioEngine.sampleRate) !== Number(next.audioEngine.sampleRate)) return true;
+  if (!sameText(previous.dynamicClick.clickSoundPath, next.dynamicClick.clickSoundPath)) return true;
+  if (!sameText(previous.dynamicClick.accentSoundPath, next.dynamicClick.accentSoundPath)) return true;
+  if (!sameText(previous.dynamicCue.folderPath, next.dynamicCue.folderPath)) return true;
+  if (!sameText(previous.pads.folderPath, next.pads.folderPath)) return true;
+  return requiredOutputsForSettings(next) > requiredOutputsForSettings(previous);
+}
+
+function mergeSettingsUpdate(current, input = {}) {
+  input = input || {};
+  const merged = {
+    ...current,
+    ...input,
+    library: { ...current.library, ...(input.library || {}) },
+    audioEngine: { ...current.audioEngine, ...(input.audioEngine || {}) },
+    routing: input.routing ? { ...current.routing, ...input.routing } : current.routing,
+    dynamicCue: { ...current.dynamicCue, ...(input.dynamicCue || {}) },
+    pads: { ...current.pads, ...(input.pads || {}) },
+    dynamicClick: { ...current.dynamicClick, ...(input.dynamicClick || {}) }
+  };
+
+  merged.library.rootPath = configuredPath(input.library?.rootPath, current.library.rootPath);
+  merged.audioEngine.selectedDeviceId = configuredPath(input.audioEngine?.selectedDeviceId, current.audioEngine.selectedDeviceId);
+  merged.audioEngine.selectedDeviceName = configuredPath(input.audioEngine?.selectedDeviceName, current.audioEngine.selectedDeviceName);
+  merged.dynamicCue.folderPath = configuredPath(input.dynamicCue?.folderPath, current.dynamicCue.folderPath);
+  merged.pads.folderPath = configuredPath(input.pads?.folderPath, current.pads.folderPath);
+  merged.dynamicClick.soundFolderPath = configuredPath(input.dynamicClick?.soundFolderPath, current.dynamicClick.soundFolderPath);
+  merged.dynamicClick.clickSoundPath = configuredPath(input.dynamicClick?.clickSoundPath, current.dynamicClick.clickSoundPath);
+  merged.dynamicClick.accentSoundPath = configuredPath(input.dynamicClick?.accentSoundPath, current.dynamicClick.accentSoundPath);
+  return normalizeSettings(merged);
+}
+
+function configuredPath(nextValue, currentValue) {
+  const next = stringValue(nextValue);
+  return next || stringValue(currentValue);
+}
+
+async function validateConfiguredAudioAssets(settings) {
+  const files = [
+    ["Normal click WAV", settings.dynamicClick.clickSoundPath],
+    ["Accent click WAV", settings.dynamicClick.accentSoundPath]
+  ];
+  const folders = [
+    ["Dynamic cue folder", settings.dynamicCue.folderPath],
+    ["Pad folder", settings.pads.folderPath]
+  ];
+  for (const [label, filePath] of files) {
+    if (!filePath) continue;
+    const info = await stat(filePath).catch(() => null);
+    if (!info?.isFile()) throw new Error(`${label} is missing: ${filePath}`);
+  }
+  for (const [label, folderPath] of folders) {
+    if (!folderPath) continue;
+    const info = await stat(folderPath).catch(() => null);
+    if (!info?.isDirectory()) throw new Error(`${label} is missing: ${folderPath}`);
+  }
 }
 
 function normalizeSettings(value = {}) {
@@ -419,6 +572,7 @@ async function audioDeviceDiagnostics() {
   const asioRegistry = await listRegistryAsioDevices();
   const windowsSoundDevices = await listWindowsSoundDevices();
   const merged = await loadAudioDevices();
+  const outputSignals = await liveOutputSignalDiagnostics();
   const danteMatches = [
     ...(merged.devices || []),
     ...asioRegistry,
@@ -446,8 +600,53 @@ async function audioDeviceDiagnostics() {
     asioRegistry,
     windowsSoundDeviceCount: windowsSoundDevices.length,
     windowsSoundDevices,
+    outputSignals,
     danteMatches,
     conclusion: diagnosticConclusion({ helper, merged, asioRegistry, windowsSoundDevices, danteMatches })
+  };
+}
+
+async function liveOutputSignalDiagnostics() {
+  const meters = await playbackMeterSnapshot();
+  const manifest = await readJsonFile(ENGINE_MANIFEST_FILE, null);
+  const song = manifest?.songs?.find((item) => Number(item.slot) === Number(meters.slot)) || null;
+  if (!meters.active || !song) {
+    return {
+      active: false,
+      slot: null,
+      measurementPoint: "JUCE source meters before ASIO output summing",
+      outputs: []
+    };
+  }
+
+  const routes = new Map();
+  for (const stem of song.stems || []) {
+    routes.set(stringValue(stem.id), Array.isArray(stem.routing?.outputChannels) ? stem.routing.outputChannels : []);
+  }
+  routes.set("dynamic-click", Array.isArray(song.dynamicClick?.routing?.outputChannels) ? song.dynamicClick.routing.outputChannels : []);
+  routes.set("dynamic-cue", Array.isArray(song.dynamicCue?.routing?.outputChannels) ? song.dynamicCue.routing.outputChannels : []);
+  routes.set("dynamic-pad", Array.isArray(song.dynamicPad?.routing?.outputChannels) ? song.dynamicPad.routing.outputChannels : []);
+
+  const outputs = new Map();
+  for (const meter of meters.stems || []) {
+    for (const channel of routes.get(stringValue(meter.id)) || []) {
+      const output = outputs.get(channel) || { channel, peak: 0, sources: [] };
+      output.peak = Math.max(output.peak, clampNumber(meter.level, 0, 1, 0));
+      output.sources.push({
+        id: stringValue(meter.id),
+        name: stringValue(meter.name),
+        level: clampNumber(meter.level, 0, 1, 0)
+      });
+      outputs.set(channel, output);
+    }
+  }
+
+  return {
+    active: true,
+    slot: meters.slot,
+    title: meters.title,
+    measurementPoint: "JUCE source meters before ASIO output summing",
+    outputs: [...outputs.values()].sort((a, b) => a.channel - b.channel)
   };
 }
 
@@ -644,6 +843,7 @@ async function loadEngineManifest() {
 }
 
 function normalizeEngineStatus(value = {}) {
+  value = value || {};
   const allowed = new Set(["offline", "starting", "ready", "device-missing", "crashed"]);
   const state = allowed.has(value.state) ? value.state : "offline";
   const lastHeartbeatAt = stringValue(value.lastHeartbeatAt || (state === "ready" ? value.updatedAt : ""));
@@ -1204,6 +1404,7 @@ async function startNativeSlotPlayback(slot, options = {}) {
   return new Promise((resolveStart) => {
     const child = spawn(helperPath, [], { windowsHide: true });
     let stdout = "";
+    let stdoutBuffer = "";
     let stderr = "";
     let settled = false;
     const requestId = `play-${Date.now()}`;
@@ -1220,9 +1421,14 @@ async function startNativeSlotPlayback(slot, options = {}) {
     }
 
     child.stdout.on("data", (chunk) => {
-      stdout += chunk.toString();
-      const lines = stdout.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
-      for (const line of lines) {
+      const text = chunk.toString();
+      stdout = `${stdout}${text}`.slice(-1_000_000);
+      stdoutBuffer += text;
+      const lines = stdoutBuffer.split(/\r?\n/);
+      stdoutBuffer = lines.pop() || "";
+      for (const rawLine of lines) {
+        const line = rawLine.trim();
+        if (!line) continue;
         try {
           const response = JSON.parse(line);
           if (response.requestId !== requestId) {
@@ -1230,7 +1436,15 @@ async function startNativeSlotPlayback(slot, options = {}) {
             continue;
           }
           if (response.type === "playbackStarted") {
-            activePlaybackProcess = { child, slot, stdout, stderr, pending: new Map() };
+            activePlaybackProcess = {
+              child,
+              slot,
+              stdout,
+              stderr,
+              pending: new Map(),
+              outputChannels: positiveNumber(response.outputChannels),
+              requestedOutputChannels: positiveNumber(response.requestedOutputChannels)
+            };
             latestPlaybackMeters = {
               active: true,
               slot,
@@ -1239,7 +1453,22 @@ async function startNativeSlotPlayback(slot, options = {}) {
               updatedAt: new Date().toISOString()
             };
             broadcastMeterSnapshot();
-            finish({ ok: true, response });
+            saveEngineStatus(normalizeEngineStatus({
+              state: "ready",
+              simulated: false,
+              selectedDeviceName: stringValue(response.deviceName || device.name),
+              deviceType: stringValue(response.deviceType || device.driver),
+              requestedOutputChannels: positiveNumber(response.requestedOutputChannels),
+              outputChannels: positiveNumber(response.outputChannels),
+              sampleRate: positiveNumber(response.sampleRate),
+              bufferSize: positiveNumber(response.bufferSize),
+              manifestPath: ENGINE_MANIFEST_FILE,
+              message: `JUCE ready on ${response.deviceName || device.name}.`,
+              lastHeartbeatAt: new Date().toISOString(),
+              updatedAt: new Date().toISOString()
+            }))
+              .catch(() => {})
+              .finally(() => finish({ ok: true, response }));
           } else if (response.type === "commandRejected") {
             finish({ ok: false, error: response.reason || "JUCE rejected playback start." });
             child.kill();
@@ -1509,6 +1738,7 @@ function deviceMatchScore(device, selectedDeviceName) {
 
 async function probeEngineReadiness(settings, manifestPath) {
   const selectedDeviceName = stringValue(settings.audioEngine?.selectedDeviceName);
+  const requiredOutputChannels = requiredOutputsForSettings(settings);
   if (!selectedDeviceName) {
     const status = normalizeEngineStatus({
       state: "device-missing",
@@ -1530,7 +1760,7 @@ async function probeEngineReadiness(settings, manifestPath) {
       simulated: false,
       selectedDeviceName: device.id || selectedDeviceName,
       deviceType: "WaveOut",
-      requestedOutputChannels: 2,
+      requestedOutputChannels: requiredOutputChannels,
       outputChannels: device.channels || 2,
       sampleRate: settings.audioEngine?.sampleRate || 48000,
       bufferSize: 512,
@@ -1548,7 +1778,7 @@ async function probeEngineReadiness(settings, manifestPath) {
     requestId: "engine-probe",
     deviceName: device.name || selectedDeviceName,
     deviceType: device.driver,
-    requestedOutputChannels: 2
+    requestedOutputChannels: requiredOutputChannels
   }, { timeoutMs: 10000 });
 
   if (!probe.ok || probe.response?.type !== "deviceProbe") {
@@ -1595,6 +1825,7 @@ function engineMessage(state) {
 }
 
 function normalizePlaybackState(value = {}) {
+  value = value || {};
   const mode = value.mode === "performance" ? "performance" : "edit";
   return {
     mode,
@@ -1617,6 +1848,7 @@ function normalizePlaybackState(value = {}) {
 }
 
 function normalizePanicRuntime(value = {}) {
+  value = value || {};
   const state = value.state === PANIC_STATES.PANIC_HOLD ? PANIC_STATES.PANIC_HOLD : PANIC_STATES.NORMAL;
   return {
     state,
@@ -1630,6 +1862,7 @@ function normalizePanicRuntime(value = {}) {
 }
 
 function normalizeLiveRepeat(value = {}) {
+  value = value || {};
   const mode = ["once", "loop"].includes(value.mode) ? value.mode : "";
   return {
     mode,
@@ -1963,6 +2196,8 @@ async function buildEngineManifest(confirmedSet) {
     const dynamicClickMixer = matchMixerStem({ id: "dynamic-click" }, slotMetadata.mixer);
     const dynamicCueMixer = matchMixerStem({ id: "dynamic-cue" }, slotMetadata.mixer);
     const dynamicPadMixer = matchMixerStem({ id: "dynamic-pad" }, slotMetadata.mixer);
+    const dynamicClickRouting = routeForStem(canonicalBus(dynamicClickMixer?.routeBus || "click"), 0, routingPreset);
+    const dynamicCueRouting = routeForStem(canonicalBus(dynamicCueMixer?.routeBus || "dynamicCue"), 0, routingPreset);
     const manifestTempoMap = arrangementCache
       ? tempoMapForArrangement(slotMetadata.tempoMap, arrangementCache.blocks)
       : slotMetadata.tempoMap;
@@ -2014,14 +2249,14 @@ async function buildEngineManifest(confirmedSet) {
         clickEvents: Array.isArray(slotMetadata.dynamicClick?.clickEvents) ? slotMetadata.dynamicClick.clickEvents : [],
         confidence: positiveNumber(slotMetadata.dynamicClick?.confidence),
         tempoMap: manifestTempoMap,
-        volume: clampNumber(dynamicClickMixer?.volume, 0, 100, 80),
+        volume: dynamicClickRouting.outputChannels.length ? clampNumber(dynamicClickMixer?.volume, 0, 100, 80) : 0,
         solo: Boolean(dynamicClickMixer?.solo),
-        routing: routeForStem(canonicalBus(dynamicClickMixer?.routeBus || "click"), 0, routingPreset)
+        routing: dynamicClickRouting
       },
       dynamicCue: {
-        volume: clampNumber(dynamicCueMixer?.volume, 0, 100, 80),
+        volume: dynamicCueRouting.outputChannels.length ? clampNumber(dynamicCueMixer?.volume, 0, 100, 80) : 0,
         solo: Boolean(dynamicCueMixer?.solo),
-        routing: routeForStem(canonicalBus(dynamicCueMixer?.routeBus || "dynamicCue"), 0, routingPreset)
+        routing: dynamicCueRouting
       },
       dynamicPad,
       stems: playbackStems
@@ -2312,6 +2547,7 @@ function matchMixerStem(cachedStem, mixer) {
 function stemManifestEntry(stem, index, routingPreset, mixerStem = null) {
   const role = canonicalBus(mixerStem?.routeBus || mixerStem?.role || stem.bus || stem.role || stem.playbackRole) || "tracks";
   const iemSend = Boolean(mixerStem?.iemSend) && role === "tracks";
+  const routing = routeForStem(role, index, routingPreset);
   return {
     index: index + 1,
     id: stem.id,
@@ -2325,13 +2561,13 @@ function stemManifestEntry(stem, index, routingPreset, mixerStem = null) {
     channels: positiveNumber(stem.channels),
     durationMs: positiveNumber(stem.durationMs),
     sha256: stem.sha256 || "",
-    volume: clampNumber(mixerStem?.volume, 0, 100, 80),
+    volume: routing.outputChannels.length ? clampNumber(mixerStem?.volume, 0, 100, 80) : 0,
     solo: Boolean(mixerStem?.solo),
     iemSend,
     sourceRelativePath: stem.relativePath,
     cacheRelativePath: stem.cacheRelativePath || stem.relativePath,
     cachePath: stem.cachePath,
-    routing: routeForStem(role, index, routingPreset),
+    routing,
     iemRouting: iemSend ? routeForStem("iem", index, routingPreset) : null
   };
 }
@@ -2348,15 +2584,16 @@ function classifyStem(stem) {
 
 function routeForStem(role, index, routingPreset) {
   const routeKey = canonicalBus(role);
-  const presetOutputs = Array.isArray(routingPreset.routes?.[routeKey]) ? routingPreset.routes[routeKey] : [];
+  const hasPresetRoute = Array.isArray(routingPreset.routes?.[routeKey]);
+  const presetOutputs = hasPresetRoute ? routingPreset.routes[routeKey] : [];
   const defaultOutputChannels = [index + 1];
-  const outputChannels = presetOutputs.length ? presetOutputs : defaultOutputChannels;
+  const outputChannels = hasPresetRoute ? presetOutputs : defaultOutputChannels;
   return {
     presetId: routingPreset.id,
     bus: routeKey,
     outputChannels,
     defaultOutputChannels,
-    source: presetOutputs.length ? "routing-preset" : "stem-index-default"
+    source: hasPresetRoute ? "routing-preset" : "stem-index-default"
   };
 }
 
@@ -2387,6 +2624,7 @@ async function dynamicPadFilePath(folderPath, songKey) {
 async function dynamicPadManifestObject({ folderPath, songKey, mixer, routingPreset }) {
   const sourcePath = await dynamicPadFilePath(folderPath, songKey);
   const cached = sourcePath ? await cacheDynamicPadFile(sourcePath, songKey) : { filePath: "", status: "missing", error: "No matching pad WAV." };
+  const routing = routeForStem(canonicalBus(mixer?.routeBus || "pads"), 0, routingPreset);
   return {
     folderPath,
     sourcePath,
@@ -2394,9 +2632,9 @@ async function dynamicPadManifestObject({ folderPath, songKey, mixer, routingPre
     cacheStatus: cached.status,
     cacheError: cached.error || "",
     active: false,
-    volume: clampNumber(mixer?.volume, 0, 100, 80),
+    volume: routing.outputChannels.length ? clampNumber(mixer?.volume, 0, 100, 80) : 0,
     solo: Boolean(mixer?.solo),
-    routing: routeForStem(canonicalBus(mixer?.routeBus || "pads"), 0, routingPreset)
+    routing
   };
 }
 
@@ -2680,7 +2918,6 @@ async function ensureEditPlaybackManifest(slotNumber) {
     return { ok: false, error: `Slot ${slotNumber} has no playable stems in the editor manifest.` };
   }
   await writeFile(ENGINE_MANIFEST_FILE, `${JSON.stringify(manifest, null, 2)}\n`, "utf8");
-  await startEngineSimulator(settings, ENGINE_MANIFEST_FILE);
   return { ok: true, setlist, manifest };
 }
 
@@ -3483,6 +3720,8 @@ async function liveDynamicMixerObjects(slot, mixer, routingPreset, settings) {
   const dynamicClickMixer = matchMixerStem({ id: "dynamic-click" }, mixer);
   const dynamicCueMixer = matchMixerStem({ id: "dynamic-cue" }, mixer);
   const dynamicPadMixer = matchMixerStem({ id: "dynamic-pad" }, mixer);
+  const dynamicClickRouting = routeForStem(canonicalBus(dynamicClickMixer?.routeBus || "click"), 0, routingPreset);
+  const dynamicCueRouting = routeForStem(canonicalBus(dynamicCueMixer?.routeBus || "dynamicCue"), 0, routingPreset);
   const songMetadata = slot.folderPath ? await readSongMetadata(slot.folderPath) : null;
   const dynamicPad = await dynamicPadManifestObject({
     folderPath: settings.pads.folderPath,
@@ -3493,15 +3732,15 @@ async function liveDynamicMixerObjects(slot, mixer, routingPreset, settings) {
   return {
     dynamicClick: {
       ...(base.dynamicClick || songMetadata?.dynamicClick || {}),
-      volume: clampNumber(dynamicClickMixer?.volume, 0, 100, 80),
+      volume: dynamicClickRouting.outputChannels.length ? clampNumber(dynamicClickMixer?.volume, 0, 100, 80) : 0,
       solo: Boolean(dynamicClickMixer?.solo),
-      routing: routeForStem(canonicalBus(dynamicClickMixer?.routeBus || "click"), 0, routingPreset)
+      routing: dynamicClickRouting
     },
     dynamicCue: {
       ...(base.dynamicCue || {}),
-      volume: clampNumber(dynamicCueMixer?.volume, 0, 100, 80),
+      volume: dynamicCueRouting.outputChannels.length ? clampNumber(dynamicCueMixer?.volume, 0, 100, 80) : 0,
       solo: Boolean(dynamicCueMixer?.solo),
-      routing: routeForStem(canonicalBus(dynamicCueMixer?.routeBus || "dynamicCue"), 0, routingPreset)
+      routing: dynamicCueRouting
     },
     dynamicPad: {
       ...(base.dynamicPad || {}),

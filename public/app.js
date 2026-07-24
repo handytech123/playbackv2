@@ -550,6 +550,15 @@ function formatAudioDiagnosticReport(report) {
     lines.push(`- ${device.name || "--"} [${device.status || "--"}] ${device.manufacturer || ""}`);
   }
   lines.push("");
+  lines.push(`Live JUCE output signals: ${report.outputSignals?.active ? "active" : "stopped"}`);
+  lines.push(`Measurement: ${report.outputSignals?.measurementPoint || "--"}`);
+  for (const output of report.outputSignals?.outputs || []) {
+    const sources = (output.sources || [])
+      .map((source) => `${source.name}=${Number(source.level || 0).toFixed(4)}`)
+      .join(", ");
+    lines.push(`- Output ${output.channel}: peak=${Number(output.peak || 0).toFixed(4)} | ${sources || "no routed sources"}`);
+  }
+  lines.push("");
   lines.push(`Dante matches (${report.danteMatches?.length || 0})`);
   for (const device of report.danteMatches || []) {
     lines.push(`- ${device.name || device.id || "--"} [${device.driver || device.type || "--"}]`);
