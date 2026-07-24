@@ -8,12 +8,21 @@
 </head>
 <body>
   <main class="remote-shell">
-    <header class="remote-header">
-      <div>
-        <span class="eyebrow">Stage Remote</span>
-        <h1 id="songTitle">No song selected</h1>
-        <p id="songMeta">Waiting for playback computer</p>
+    <header class="top-bar">
+      <div class="compact-readout">
+        <strong id="tempoReadout">--</strong>
+        <span id="timeSigReadout">--</span>
       </div>
+      <div class="time-readout">
+        <strong id="transportTime">0:00.00</strong>
+        <span id="durationReadout">0:00 / 0:00</span>
+      </div>
+      <button id="padButton" class="top-command pad" type="button" data-command="panic">Pad</button>
+      <button class="top-command" type="button" data-command="previousSong">|&lt;</button>
+      <button id="playPauseButton" class="top-command play" type="button" data-command="play">Play</button>
+      <button class="top-command" type="button" data-command="fadeOut">Fade</button>
+      <button class="top-command danger" type="button" data-command="panic">Panic</button>
+      <button id="exitPanicButton" class="top-command recover" type="button" data-command="exitPanic">OK</button>
       <div id="connectionStatus" class="status-pill offline">Offline</div>
     </header>
 
@@ -22,36 +31,23 @@
       <span>Tracks Down / Click Alive</span>
     </section>
 
-    <section class="now-grid">
-      <div class="now-card">
-        <span>Transport</span>
-        <strong id="transportState">--</strong>
+    <section class="setlist-strip">
+      <div class="setlist-title">
+        <span id="modeStatus">Mode --</span>
+        <strong>Current Set</strong>
       </div>
-      <div class="now-card">
-        <span>Time</span>
-        <strong id="transportTime">0:00.00</strong>
-      </div>
-      <div class="now-card">
-        <span>Current</span>
-        <strong id="currentRegion">--</strong>
-      </div>
-      <div class="now-card">
-        <span>Next</span>
-        <strong id="nextRegion">--</strong>
-      </div>
+      <div id="setlistCards" class="setlist-cards"></div>
     </section>
 
     <section class="wave-panel">
+      <div class="wave-status">
+        <span id="transportState">--</span>
+        <strong id="songTitle">No song selected</strong>
+        <span id="songMeta">Waiting for playback computer</span>
+      </div>
       <canvas id="waveCanvas" width="1200" height="180" aria-label="Live waveform position"></canvas>
       <div id="wavePlayhead" class="wave-playhead"></div>
       <div id="waveRegionLabel" class="wave-region-label">--</div>
-    </section>
-
-    <section class="command-grid primary">
-      <button id="playPauseButton" class="command play" type="button" data-command="play">Play</button>
-      <button class="command" type="button" data-command="stop">Stop</button>
-      <button class="command danger" type="button" data-command="panic">Panic</button>
-      <button id="exitPanicButton" class="command recover" type="button" data-command="exitPanic">Exit Panic</button>
     </section>
 
     <section class="command-grid live">
@@ -59,18 +55,20 @@
       <button class="command warn" type="button" data-region-command="loopRegion">Loop</button>
       <button class="command" type="button" data-command="goOnRegion">Go On</button>
       <button class="command" type="button" data-command="nextSong">Next Song</button>
+      <button class="command" type="button" data-command="stop">Stop</button>
     </section>
 
     <section class="sections-panel">
       <div class="panel-title">
-        <strong>Jump To Section</strong>
-        <span id="sectionHint">safe-boundary commands</span>
+        <strong>Sections</strong>
+        <span id="sectionHint">tap to queue jump</span>
       </div>
       <div id="regionButtons" class="region-buttons"></div>
     </section>
 
     <footer class="remote-footer">
-      <span id="modeStatus">Mode --</span>
+      <span id="currentRegion">Current --</span>
+      <span id="nextRegion">Next --</span>
       <span id="lastMessage">Ready</span>
     </footer>
   </main>

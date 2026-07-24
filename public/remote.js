@@ -13,6 +13,10 @@ const els = {
   songMeta: document.querySelector("#songMeta"),
   connectionStatus: document.querySelector("#connectionStatus"),
   panicPanel: document.querySelector("#panicPanel"),
+  tempoReadout: document.querySelector("#tempoReadout"),
+  timeSigReadout: document.querySelector("#timeSigReadout"),
+  durationReadout: document.querySelector("#durationReadout"),
+  setlistCards: document.querySelector("#setlistCards"),
   transportState: document.querySelector("#transportState"),
   transportTime: document.querySelector("#transportTime"),
   currentRegion: document.querySelector("#currentRegion"),
@@ -118,6 +122,8 @@ function renderRemote() {
   const panicActive = playback.panic?.active === true;
 
   els.songTitle.textContent = song?.title || slot?.title || "No song selected";
+  els.tempoReadout.textContent = slot?.tempoMap?.bpm || song?.bpm || "--";
+  els.timeSigReadout.textContent = slot?.tempoMap?.timeSignature || song?.timeSignature || "--";
   els.songMeta.textContent = slot
     ? `${slot.tempoMap?.key || song?.key || "--"} | ${slot.tempoMap?.bpm || song?.bpm || "--"} BPM | ${slot.tempoMap?.timeSignature || song?.timeSignature || "--"}`
     : "Waiting for confirmed set";
@@ -126,13 +132,49 @@ function renderRemote() {
   els.currentRegion.textContent = region?.region?.name || "--";
   els.nextRegion.textContent = next?.region?.name || "--";
   els.modeStatus.textContent = `${titleCase(playback.mode || "edit")} mode`;
+  els.durationReadout.textContent = `${formatSeconds(currentTransportSeconds())} / ${formatSeconds(slotDurationSeconds(slot))}`;
   els.lastMessage.textContent = playback.lastMessage || els.lastMessage.textContent || "Ready";
   els.panicPanel.classList.toggle("hidden", !panicActive);
   els.playPause.textContent = playing ? "Pause" : "Play";
   els.playPause.dataset.command = playing ? "pause" : "play";
   els.exitPanic.disabled = !panicActive;
+  renderSetlistCards();
   renderWaveform(slot, region);
   renderRegionButtons(region);
+}
+
+function renderSetlistCards() {
+  const slots = (remote.setlist?.slots || []).filter((slot) => slot.songId);
+  els.setlistCards.replaceChildren();
+  if (!slots.length) {
+    const empty = document.createElement("div");
+    empty.className = "song-card";
+    empty.innerHTML = "<div class=\"song-card-title\">No confirmed set</div><div class=\"song-card-meta\">Load songs on playback PC</div>";
+    els.setlistCards.append(empty);
+    return;
+  }
+  const currentSlot = Number(remote.playback?.currentSlot || firstFilledSlot()?.slot || 0);
+  for (const slot of slots) {
+    const card = document.createElement("button");
+    card.type = "button";
+    card.className = "song-card";
+    card.classList.toggle("current", Number(slot.slot) === currentSlot);
+    card.innerHTML = `
+      <div class="song-card-title">${escapeHtml(slot.title || `Slot ${slot.slot}`)}</div>
+      <div class="song-card-meta">${escapeHtml(slot.key || "--")} | ${escapeHtml(slot.bpm || "--")} BPM</div>
+    `;
+    card.addEventListener("click", () => {
+      if (Number(slot.slot) === currentSlot) return;
+      if (remote.playback?.transport === "stopped") {
+        sendCommand("play", { slot: slot.slot });
+        return;
+      }
+      els.lastMessage.textContent = "Use Next Song during playback.";
+    });
+    els.setlistCards.append(card);
+  }
+  const currentCard = els.setlistCards.querySelector(".song-card.current");
+  currentCard?.scrollIntoView({ inline: "center", block: "nearest" });
 }
 
 function renderWaveform(slot, current) {
@@ -382,6 +424,16 @@ function commandLabel(command) {
 
 function titleCase(value) {
   return String(value || "").replace(/(^|[-_\s])([a-z])/g, (_, prefix, letter) => `${prefix === "-" || prefix === "_" ? " " : prefix}${letter.toUpperCase()}`);
+}
+
+function escapeHtml(value) {
+  return String(value ?? "").replace(/[&<>"']/g, (char) => ({
+    "&": "&amp;",
+    "<": "&lt;",
+    ">": "&gt;",
+    "\"": "&quot;",
+    "'": "&#39;"
+  }[char]));
 }
 
 function formatSeconds(value) {
