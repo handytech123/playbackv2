@@ -40,6 +40,7 @@ button {
 .remote-header,
 .panic-panel,
 .now-card,
+.wave-panel,
 .sections-panel,
 .remote-footer {
   border: 1px solid var(--line);
@@ -128,6 +129,57 @@ p {
 .now-card strong {
   font-size: clamp(20px, 4vw, 34px);
   line-height: 1;
+}
+
+.wave-panel {
+  position: relative;
+  min-height: 178px;
+  overflow: hidden;
+  background: #313b3f;
+}
+
+#waveCanvas {
+  display: block;
+  width: 100%;
+  height: 178px;
+}
+
+.wave-playhead {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  width: 4px;
+  background: #ff4b57;
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.3), 0 0 16px rgba(255, 75, 87, 0.45);
+  transform: translate3d(0, 0, 0);
+}
+
+.wave-playhead::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  left: -4px;
+  width: 12px;
+  height: 12px;
+  border-radius: 0 0 3px 3px;
+  background: #ff4b57;
+}
+
+.wave-region-label {
+  position: absolute;
+  left: 10px;
+  bottom: 10px;
+  max-width: calc(100% - 20px);
+  padding: 7px 10px;
+  border: 1px solid rgba(53, 208, 127, 0.9);
+  border-radius: 6px;
+  background: rgba(4, 19, 12, 0.82);
+  color: var(--text);
+  font-weight: 900;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .command-grid {
@@ -250,5 +302,11 @@ p {
 
   .command {
     min-height: 72px;
+  }
+
+  .wave-panel,
+  #waveCanvas {
+    min-height: 136px;
+    height: 136px;
   }
 }

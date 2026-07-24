@@ -4,7 +4,8 @@ const remote = {
   metadata: null,
   stateStream: null,
   refreshTimer: null,
-  commandPendingUntil: 0
+  commandPendingUntil: 0,
+  waveRenderKey: ""
 };
 
 const els = {
@@ -16,6 +17,9 @@ const els = {
   transportTime: document.querySelector("#transportTime"),
   currentRegion: document.querySelector("#currentRegion"),
   nextRegion: document.querySelector("#nextRegion"),
+  waveCanvas: document.querySelector("#waveCanvas"),
+  wavePlayhead: document.querySelector("#wavePlayhead"),
+  waveRegionLabel: document.querySelector("#waveRegionLabel"),
   playPause: document.querySelector("#playPauseButton"),
   exitPanic: document.querySelector("#exitPanicButton"),
   regionButtons: document.querySelector("#regionButtons"),
@@ -127,7 +131,135 @@ function renderRemote() {
   els.playPause.textContent = playing ? "Pause" : "Play";
   els.playPause.dataset.command = playing ? "pause" : "play";
   els.exitPanic.disabled = !panicActive;
+  renderWaveform(slot, region);
   renderRegionButtons(region);
+}
+
+function renderWaveform(slot, current) {
+  const canvas = els.waveCanvas;
+  if (!canvas) return;
+  const duration = slotDurationSeconds(slot);
+  const peaks = arrangedWaveformPeaks(slot);
+  const regionKey = regionEntries().map((entry) => `${entry.region.id}:${entry.startTime}:${entry.endTime}`).join("|");
+  const renderKey = `${slot?.slot || ""}:${duration}:${peaks.length}:${regionKey}:${canvas.clientWidth}:${canvas.clientHeight}`;
+  if (renderKey !== remote.waveRenderKey) {
+    remote.waveRenderKey = renderKey;
+    drawWaveCanvas(canvas, slot, peaks, duration);
+  }
+  const width = Math.max(1, canvas.clientWidth || canvas.width || 1);
+  const x = duration > 0 ? Math.max(0, Math.min(width, (currentTransportSeconds() / duration) * width)) : 0;
+  els.wavePlayhead.style.transform = `translate3d(${x}px, 0, 0)`;
+  els.waveRegionLabel.textContent = current?.region?.name || slot?.title || "--";
+}
+
+function drawWaveCanvas(canvas, slot, peaks, duration) {
+  const scale = window.devicePixelRatio || 1;
+  const width = Math.max(320, Math.floor(canvas.clientWidth || 1200));
+  const height = Math.max(120, Math.floor(canvas.clientHeight || 178));
+  canvas.width = Math.floor(width * scale);
+  canvas.height = Math.floor(height * scale);
+  const ctx = canvas.getContext("2d");
+  ctx.setTransform(scale, 0, 0, scale, 0, 0);
+  ctx.clearRect(0, 0, width, height);
+  ctx.fillStyle = "#5d696b";
+  ctx.fillRect(0, 0, width, height);
+  drawRemoteGrid(ctx, slot, width, height, duration);
+  drawRemoteRegions(ctx, width, height, duration);
+  drawRemotePeaks(ctx, peaks, width, height);
+}
+
+function drawRemoteGrid(ctx, slot, width, height, duration) {
+  const beats = Array.isArray(slot?.tempoMap?.beatGrid) ? slot.tempoMap.beatGrid : [];
+  ctx.lineWidth = 1;
+  for (const beat of beats) {
+    const time = Number(beat.timeSeconds || 0);
+    if (duration <= 0 || time < 0 || time > duration) continue;
+    const x = (time / duration) * width;
+    const isMeasure = Number(beat.beat || beat.beatInMeasure || 1) === 1;
+    ctx.strokeStyle = isMeasure ? "rgba(220, 232, 232, 0.28)" : "rgba(20, 25, 26, 0.25)";
+    ctx.beginPath();
+    ctx.moveTo(x, 0);
+    ctx.lineTo(x, height);
+    ctx.stroke();
+  }
+}
+
+function drawRemoteRegions(ctx, width, height, duration) {
+  if (duration <= 0) return;
+  const entries = regionEntries();
+  for (const entry of entries) {
+    const x = (entry.startTime / duration) * width;
+    const w = Math.max(2, ((entry.endTime - entry.startTime) / duration) * width);
+    ctx.fillStyle = "rgba(28, 124, 169, 0.2)";
+    ctx.fillRect(x, height * 0.58, w, height * 0.34);
+    ctx.strokeStyle = "rgba(66, 183, 255, 0.88)";
+    ctx.strokeRect(x + 0.5, height * 0.58 + 0.5, Math.max(1, w - 1), height * 0.34 - 1);
+  }
+}
+
+function drawRemotePeaks(ctx, peaks, width, height) {
+  const mid = height * 0.45;
+  const maxHalfHeight = height * 0.3;
+  ctx.strokeStyle = "#0b1011";
+  ctx.lineWidth = Math.max(1, width / Math.max(1, peaks.length));
+  if (!peaks.length) {
+    ctx.strokeStyle = "rgba(11, 16, 17, 0.55)";
+    ctx.beginPath();
+    ctx.moveTo(0, mid);
+    ctx.lineTo(width, mid);
+    ctx.stroke();
+    return;
+  }
+  ctx.beginPath();
+  peaks.forEach((peak, index) => {
+    const x = (index / Math.max(1, peaks.length - 1)) * width;
+    const level = Math.max(0, Math.min(1, Number(peak) || 0));
+    const top = mid - (level * maxHalfHeight);
+    const bottom = mid + (level * maxHalfHeight);
+    ctx.moveTo(x, top);
+    ctx.lineTo(x, bottom);
+  });
+  ctx.stroke();
+}
+
+function arrangedWaveformPeaks(slot) {
+  if (slot?.arrangementCache?.waveform?.peaks?.length) return slot.arrangementCache.waveform.peaks;
+  const peaks = Array.isArray(slot?.waveform?.peaks) ? slot.waveform.peaks : [];
+  const blocks = arrangedBlocks(slot);
+  if (!arrangementEnabled(slot) || !peaks.length || !blocks.length) return peaks;
+  const duration = Number(slot.waveform?.durationSeconds || 0);
+  if (!duration) return peaks;
+  const arranged = [];
+  const buckets = peaks.length;
+  blocks.forEach((block) => {
+    const start = Number(block.rawStartSeconds || timeForBarBeat(slot, block.rawStartBar, block.rawStartBeat || 1));
+    const end = Number(block.rawEndSeconds || timeForBarBeat(slot, block.rawEndBar, block.rawEndBeat || 1));
+    const startIndex = clamp(Math.floor((start / duration) * buckets), 0, buckets - 1);
+    const endIndex = clamp(Math.ceil((end / duration) * buckets), startIndex + 1, buckets);
+    arranged.push(...peaks.slice(startIndex, endIndex));
+  });
+  return arranged.length ? arranged : peaks;
+}
+
+function arrangedBlocks(slot) {
+  return Array.isArray(slot?.arrangementCache?.blocks) && slot.arrangementCache.ready
+    ? slot.arrangementCache.blocks
+    : Array.isArray(slot?.arrangement?.blocks)
+      ? slot.arrangement.blocks
+      : [];
+}
+
+function arrangementEnabled(slot) {
+  return slot?.arrangement?.enabled !== false;
+}
+
+function slotDurationSeconds(slot) {
+  const arrangementDuration = Number(slot?.arrangementCache?.durationSeconds || slot?.arrangementCache?.waveform?.durationSeconds || 0);
+  if (arrangementDuration > 0) return arrangementDuration;
+  const waveformDuration = Number(slot?.waveform?.durationSeconds || 0);
+  if (waveformDuration > 0) return waveformDuration;
+  const beatGrid = Array.isArray(slot?.tempoMap?.beatGrid) ? slot.tempoMap.beatGrid : [];
+  return Number(beatGrid.at(-1)?.timeSeconds || 0);
 }
 
 function renderRegionButtons(current) {
@@ -258,4 +390,8 @@ function formatSeconds(value) {
   const seconds = Math.floor(total % 60);
   const centiseconds = Math.floor((total - Math.floor(total)) * 100);
   return `${minutes}:${String(seconds).padStart(2, "0")}.${String(centiseconds).padStart(2, "0")}`;
+}
+
+function clamp(value, min, max) {
+  return Math.max(min, Math.min(max, value));
 }
