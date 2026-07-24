@@ -1316,6 +1316,10 @@ function isPlaybackInterruptCommand(command) {
 
 function playbackCommandPayload(command, extra = {}) {
   const payload = { command, slot: state.selectedMetadataSlot, ...extra };
+  if (command === "seek" && payload.seconds === undefined) {
+    payload.seconds = 0;
+    payload.slot = state.playbackState?.currentSlot || state.selectedMetadataSlot;
+  }
   if (command !== "play" || state.playbackState?.mode === "performance" || payload.startSeconds !== undefined) {
     return payload;
   }

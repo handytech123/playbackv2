@@ -83,6 +83,10 @@ async function sendCommand(command, extra = {}) {
   if (command === "play") {
     payload.slot = remote.playback?.currentSlot || firstFilledSlot()?.slot;
   }
+  if (command === "seek" && payload.seconds === undefined) {
+    payload.seconds = 0;
+    payload.slot = remote.playback?.currentSlot || firstFilledSlot()?.slot;
+  }
   remote.commandPendingUntil = Date.now() + 750;
   setConnection("pending", "Sent");
   try {
