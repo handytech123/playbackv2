@@ -70,6 +70,8 @@ const meterStreamClients = new Set();
 let meterStreamTimer = null;
 let meterStreamInFlight = false;
 let runtimeShutdownRequested = false;
+let libraryMemoryCache = null;
+let libraryLoadInFlight = null;
 const PANIC_TRACK_FADE_DOWN_MS = 1000;
 const PANIC_RECOVERY_FADE_MS = 4000;
 const PANIC_TRACK_TARGET_DB = -60;
@@ -125,7 +127,7 @@ const httpServer = createServer(async (req, res) => {
     }
 
     if (req.method === "GET" && url.pathname === "/api/library") {
-      return json(res, await loadLibrary());
+      return json(res, libraryForClient(await loadLibrary()));
     }
 
     if (req.method === "POST" && url.pathname === "/api/library/refresh") {
@@ -141,7 +143,7 @@ const httpServer = createServer(async (req, res) => {
       await cleanupSetlistGeneratedArtifacts(setlist);
       await markUnavailableSetlistSongsUnconfirmed(setlist, library);
       await refreshEngineManifestForMixer();
-      return json(res, { ...library, currentSetlist: setlist, metadata });
+      return json(res, { ...libraryForClient(library), currentSetlist: setlist, metadata });
     }
 
     if (req.method === "GET" && url.pathname === "/api/settings") {
@@ -330,24 +332,47 @@ httpServer.listen(PORT, () => {
 });
 
 async function loadLibrary() {
+  if (libraryMemoryCache) return libraryMemoryCache;
+  if (libraryLoadInFlight) return libraryLoadInFlight;
+
+  libraryLoadInFlight = (async () => {
+    try {
+      const library = await readJsonFile(LIBRARY_FILE, null);
+      if (library) {
+        libraryMemoryCache = library;
+        return library;
+      }
+      const scanned = await scanLibrary();
+      await saveLibrary(scanned);
+      return scanned;
+    } catch (error) {
+      if (error.code !== "ENOENT") throw error;
+      const library = await scanLibrary();
+      await saveLibrary(library);
+      return library;
+    }
+  })();
   try {
-    const library = await readJsonFile(LIBRARY_FILE, null);
-    if (library) return library;
-    const scanned = await scanLibrary();
-    await saveLibrary(scanned);
-    return scanned;
-  } catch (error) {
-    if (error.code !== "ENOENT") throw error;
-    const library = await scanLibrary();
-    await saveLibrary(library);
-    return library;
+    return await libraryLoadInFlight;
+  } finally {
+    libraryLoadInFlight = null;
   }
 }
 
 async function saveLibrary(library) {
   await mkdir(DATA_DIR, { recursive: true });
   await mkdir(SONG_METADATA_DIR, { recursive: true });
-  await writeFile(LIBRARY_FILE, `${JSON.stringify(library, null, 2)}\n`, "utf8");
+  const temporaryPath = `${LIBRARY_FILE}.${process.pid}.${Date.now()}.tmp`;
+  await writeFile(temporaryPath, `${JSON.stringify(library, null, 2)}\n`, "utf8");
+  await rename(temporaryPath, LIBRARY_FILE);
+  libraryMemoryCache = library;
+}
+
+function libraryForClient(library) {
+  return {
+    ...library,
+    songs: (library.songs || []).map(({ tempoMap, tracks, ...summary }) => summary)
+  };
 }
 
 async function loadSettings() {
@@ -2842,7 +2867,20 @@ async function validateSlotCache(slot) {
   }
 
   const expected = positiveNumber(slot.trackCount) || 0;
-  const cached = await countWavFiles(slot.cacheFolder);
+  const declaredStems = Array.isArray(slot.cachedStems) ? slot.cachedStems : [];
+  let cached = 0;
+  if (declaredStems.length) {
+    for (const stem of declaredStems) {
+      const stemPath = stem.cachePath || resolve(slot.cacheFolder, stem.cacheRelativePath || stem.relativePath);
+      try {
+        if ((await stat(stemPath)).isFile()) cached += 1;
+      } catch {
+        // A declared cache entry is not ready until its file exists.
+      }
+    }
+  } else {
+    cached = await countWavFiles(slot.cacheFolder);
+  }
   const missingStems = Array.isArray(slot.missingStems) ? slot.missingStems : [];
   const state = cached > 0 && cached + missingStems.length >= expected
     ? (missingStems.length ? "warning" : "ready")
@@ -3592,6 +3630,7 @@ async function cleanupSetlistGeneratedArtifacts(setlist) {
 
 async function confirmCurrentSet() {
   const settings = await loadSettings();
+  await stopNativePlayback();
   const setlist = await prepareSetlistCache(await loadCurrentSetlist(), { rebuild: true });
   await saveCurrentSetlist(setlist);
   const metadata = await ensureSetMetadata(setlist, { allowAnalysis: false });
@@ -4780,8 +4819,9 @@ async function applySlotAudioShift(slotNumber, shiftSeconds) {
   const slot = setlist.slots.find((item) => item.slot === slotNumber && item.songId);
   if (!slot) throw new Error(`Setlist slot ${slotNumber} is empty.`);
   const seconds = Number.isFinite(shiftSeconds) ? Math.max(-30, Math.min(30, shiftSeconds)) : 0;
+  await stopNativePlayback();
   await saveSongAudioAlignment(slot.folderPath, seconds);
-  const rebuilt = await prepareSetlistCache(setlist, { slotNumbers: [slotNumber] });
+  const rebuilt = await prepareSetlistCache(setlist, { slotNumbers: [slotNumber], forceRefresh: true });
   await saveCurrentSetlist(rebuilt);
   await removeGeneratedPath(arrangementCacheSlotDir(slotNumber));
   const nextSlot = rebuilt.slots.find((item) => item.slot === slotNumber && item.songId);
@@ -7009,6 +7049,7 @@ function normalizeCachedStem(stem) {
     playLive: stem.playLive !== false,
     transposeCached: Boolean(stem.transposeCached),
     transposeCents: Number.isFinite(Number(stem.transposeCents)) ? Number(stem.transposeCents) : 0,
+    audioShiftSeconds: Number.isFinite(Number(stem.audioShiftSeconds)) ? Number(stem.audioShiftSeconds) : 0,
     durationMs: positiveNumber(stem.durationMs),
     sampleRate: positiveNumber(stem.sampleRate),
     channels: positiveNumber(stem.channels),
@@ -7053,7 +7094,7 @@ async function prepareSetlistCache(setlist, options = {}) {
     }
 
     try {
-      const cache = await cacheSongForSetlistSlot(song, slot);
+      const cache = await cacheSongForSetlistSlot(song, slot, options);
       preparedSlots.push({
         ...slot,
         folderPath: song.folderPath,
@@ -7108,6 +7149,7 @@ async function updateSetlistSlotKey(slotNumber, selectedKeyInput) {
   if (!song) throw new Error("Song is no longer available in the library.");
   const originalKey = canonicalMajorKey(slot.originalKey || song.key || slot.key);
   const transposeCents = effectiveTransposeCents(originalKey, selectedKey);
+  await stopNativePlayback();
   const next = normalizeSetlist({
     ...setlist,
     slots: (setlist.slots || []).map((item) => Number(item.slot) === Number(slotNumber)
@@ -7130,7 +7172,7 @@ async function updateSetlistSlotKey(slotNumber, selectedKeyInput) {
   return prepared;
 }
 
-async function cacheSongForSetlistSlot(song, slot) {
+async function cacheSongForSetlistSlot(song, slot, options = {}) {
   const slotNumber = positiveNumber(slot?.slot) || 1;
   const tracks = Array.isArray(song.tracks) ? song.tracks : [];
   if (!tracks.length) {
@@ -7148,12 +7190,14 @@ async function cacheSongForSetlistSlot(song, slot) {
   });
   const cacheFolder = resolve(CACHE_DIR, "current-setlist", `slot-${String(slotNumber).padStart(2, "0")}-${song.id}`);
   assertInsideCache(cacheFolder);
-  await rm(cacheFolder, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   await mkdir(cacheFolder, { recursive: true });
 
   const missingStems = [];
   const cachedStems = [];
-  let cachedTrackCount = 0;
+  const priorStems = new Map((slot.cachedStems || []).map((stem) => [
+    stringValue(stem.cacheRelativePath || stem.relativePath).toLowerCase(),
+    stem
+  ]));
   for (const track of tracks) {
     const keyChangedTrack = keyChange.tracksById.get(track.id) || keyChange.tracksById.get(track.relativePath) || null;
     const sourcePath = keyChangedTrack?.filePath || resolve(song.folderPath, track.relativePath);
@@ -7163,25 +7207,39 @@ async function cacheSongForSetlistSlot(song, slot) {
       else assertInsideRoot(sourcePath);
       assertInsideCache(targetPath);
       await mkdir(dirname(targetPath), { recursive: true });
-      await copyFile(sourcePath, targetPath);
-      const shifted = await applyWavShiftIfNeeded(targetPath, alignment.shiftSeconds);
-      cachedTrackCount += 1;
+      const priorStem = priorStems.get(stringValue(track.relativePath).toLowerCase());
+      const reusable = !options.forceRefresh && await cachedStemCanBeReused({
+        sourcePath,
+        targetPath,
+        priorStem,
+        sourceSha256: track.sha256,
+        keyChanged: Boolean(keyChangedTrack),
+        transposeCents,
+        audioShiftSeconds: alignment.shiftSeconds
+      });
+      let shifted = null;
+      if (!reusable) {
+        await replaceCachedFile(sourcePath, targetPath);
+        shifted = await applyWavShiftIfNeeded(targetPath, alignment.shiftSeconds);
+      }
       cachedStems.push({
         ...trackSummary(track),
         transposeCached: Boolean(keyChangedTrack),
         transposeCents,
+        audioShiftSeconds: Number(alignment.shiftSeconds || 0),
         cacheRelativePath: track.relativePath,
         cachePath: targetPath,
-        durationMs: shifted ? Math.round(shifted.durationSeconds * 1000) : track.durationMs,
-        sampleRate: shifted?.sampleRate || track.sampleRate,
-        channels: shifted?.channels || track.channels,
-        sha256: shifted ? await fileSha1(targetPath) : track.sha256
+        durationMs: shifted ? Math.round(shifted.durationSeconds * 1000) : (priorStem?.durationMs || track.durationMs),
+        sampleRate: shifted?.sampleRate || priorStem?.sampleRate || track.sampleRate,
+        channels: shifted?.channels || priorStem?.channels || track.channels,
+        sha256: shifted ? await fileSha1(targetPath) : (priorStem?.sha256 || track.sha256)
       });
     } catch {
       missingStems.push(track.relativePath);
     }
   }
 
+  const cachedTrackCount = cachedStems.length;
   if (!cachedTrackCount) {
     throw new Error("No stems could be cached.");
   }
@@ -7198,6 +7256,40 @@ async function cacheSongForSetlistSlot(song, slot) {
     cachedStems,
     cachedAt: new Date().toISOString()
   };
+}
+
+async function cachedStemCanBeReused(context) {
+  let sourceStat;
+  let targetStat;
+  try {
+    [sourceStat, targetStat] = await Promise.all([stat(context.sourcePath), stat(context.targetPath)]);
+  } catch {
+    return false;
+  }
+  if (!sourceStat.isFile() || !targetStat.isFile()) return false;
+  const shiftSeconds = Number(context.audioShiftSeconds || 0);
+  if (!context.keyChanged && Math.abs(shiftSeconds) < 0.000001) {
+    if (context.priorStem?.sha256 && context.sourceSha256 && context.priorStem.sha256 !== context.sourceSha256) {
+      return false;
+    }
+    return sourceStat.size === targetStat.size;
+  }
+  if (!context.priorStem) return false;
+  return Boolean(context.priorStem.transposeCached) === context.keyChanged
+    && Math.abs(Number(context.priorStem.transposeCents || 0) - Number(context.transposeCents || 0)) < 0.01
+    && Math.abs(Number(context.priorStem.audioShiftSeconds || 0) - shiftSeconds) < 0.000001;
+}
+
+async function replaceCachedFile(sourcePath, targetPath) {
+  const temporaryPath = `${targetPath}.${process.pid}.${Date.now()}.preparing`;
+  assertInsideCache(temporaryPath);
+  try {
+    await copyFile(sourcePath, temporaryPath);
+    await rm(targetPath, { force: true, maxRetries: 5, retryDelay: 100 });
+    await rename(temporaryPath, targetPath);
+  } finally {
+    await rm(temporaryPath, { force: true }).catch(() => {});
+  }
 }
 
 async function prepareKeyChangeCacheForSong(song, context) {
@@ -7552,20 +7644,18 @@ function vendorForSongFolder(folderPath) {
 }
 
 async function loadSong(song) {
-  const metadata = await readSongMetadata(song.folderPath);
-  const tracks = metadata.valid ? metadata.tracks : [];
-  const duplicateWarnings = duplicateNameWarnings(tracks);
-  if (duplicateWarnings.length) {
-    await writeDuplicateWavReport(song.folderPath, duplicateWarnings);
-  } else {
-    await removeDuplicateWavReport(song.folderPath);
-  }
+  const tracks = Array.isArray(song.tracks) ? song.tracks : [];
+  const duplicateWarnings = Array.isArray(song.duplicateWarnings)
+    ? song.duplicateWarnings
+    : duplicateNameWarnings(tracks);
+  const summary = { ...song };
+  delete summary.tempoMap;
+  delete summary.tracks;
 
   return {
-    ...song,
+    ...summary,
     trackCount: tracks.length,
     duplicateWarnings,
-    tracks: tracks.map(trackSummary),
     loadedAt: new Date().toISOString(),
     status: tracks.length ? "loaded-stopped" : "metadata-missing"
   };
