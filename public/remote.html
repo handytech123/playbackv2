@@ -17,18 +17,20 @@
         <strong id="transportTime">0:00.00</strong>
         <span id="durationReadout">0:00 / 0:00</span>
       </div>
-      <button id="padButton" class="top-command pad" type="button" data-command="panic">Pad</button>
+      <button id="padButton" class="top-command pad" type="button" data-command="togglePad">Pad</button>
       <button class="top-command" type="button" data-command="seek">|&lt;</button>
       <button id="playPauseButton" class="top-command play" type="button" data-command="play">Play</button>
       <button class="top-command" type="button" data-command="fadeOut">Fade</button>
       <button class="top-command danger" type="button" data-command="panic">Panic</button>
-      <button id="exitPanicButton" class="top-command recover" type="button" data-command="exitPanic">OK</button>
+      <button id="exitPanicButton" class="top-command recover" type="button" data-command="exitPanic">Recover</button>
       <div id="connectionStatus" class="status-pill offline">Offline</div>
     </header>
 
     <section id="panicPanel" class="panic-panel hidden">
-      <strong>Panic Active</strong>
-      <span>Tracks Down / Click Alive</span>
+      <div>
+        <strong>Panic Active</strong>
+        <span>Tracks Down / Click Alive / Scheduled Cues Suppressed</span>
+      </div>
     </section>
 
     <section class="setlist-strip">
@@ -37,9 +39,14 @@
         <strong>Current Set</strong>
       </div>
       <div id="setlistCards" class="setlist-cards"></div>
+      <div id="transitionReadout" class="transition-readout">
+        <strong id="transitionNext">Next: --</strong>
+        <span id="transitionMode">Transition: --</span>
+        <span id="transitionPad">Pad: --</span>
+      </div>
     </section>
 
-    <section class="wave-panel">
+    <section id="wavePanel" class="wave-panel">
       <div class="wave-status">
         <span id="transportState">--</span>
         <strong id="songTitle">No song selected</strong>
@@ -48,13 +55,17 @@
       <canvas id="waveCanvas" width="1200" height="180" aria-label="Live waveform position"></canvas>
       <div id="wavePlayhead" class="wave-playhead"></div>
       <div id="waveRegionLabel" class="wave-region-label">--</div>
+      <div id="waveRecoveryBar" class="wave-recovery-bar hidden">
+        <span id="panicRecoveryTarget">Choose recovery target below</span>
+        <button class="panic-recover-next" type="button" data-command="exitPanic">Recover Next</button>
+      </div>
     </section>
 
     <section class="command-grid live">
       <button class="command warn" type="button" data-region-command="repeatRegion">Repeat 1</button>
       <button class="command warn" type="button" data-region-command="loopRegion">Loop</button>
       <button class="command" type="button" data-command="goOnRegion">Go On</button>
-      <button class="command" type="button" data-command="nextSong">Next Song</button>
+      <button class="command" type="button" data-command="songTransition">Cue Next</button>
       <button class="command" type="button" data-command="stop">Stop</button>
     </section>
 
@@ -72,6 +83,6 @@
       <span id="lastMessage">Ready</span>
     </footer>
   </main>
-  <script src="/remote.js"></script>
+  <script src="/remote.js?v=20260726-sync-1"></script>
 </body>
 </html>

@@ -3,6 +3,7 @@ import { execFile, spawn } from "node:child_process";
 import { createReadStream } from "node:fs";
 import { copyFile, mkdir, open, readFile, readdir, rename, rm, stat, unlink, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
+import { networkInterfaces } from "node:os";
 import { basename, dirname, extname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -24,6 +25,8 @@ const SET_METADATA_DIR = join(DATA_DIR, "set-metadata", "current");
 const CACHE_DIR = join(DATA_DIR, "cache");
 const ARRANGEMENT_CACHE_DIR = join(DATA_DIR, "arrangement-cache", "current");
 const SONG_METADATA_DIR = join(DATA_DIR, "song-metadata");
+const SONG_OVERRIDES_DIR = join(DATA_DIR, "song-overrides");
+const KEY_CACHE_DIR = join(DATA_DIR, "key-cache");
 const APP_PADS_DIR = join(__dirname, "pads");
 const DYNAMIC_PAD_CACHE_DIR = join(CACHE_DIR, "dynamic-pads");
 const PUBLIC_DIR = join(__dirname, "public");
@@ -38,6 +41,11 @@ const ANALYZER_EXE_CANDIDATES = [
   process.env.WAV_SONG_ANALYZER_EXE,
   "D:\\WavSongAnalyzer\\dist\\python-analyzer\\song-analyzer\\song-analyzer.exe"
 ].filter(Boolean);
+const FFMPEG_EXE_CANDIDATES = [
+  process.env.FFMPEG_EXE,
+  join(__dirname, "tools", "ffmpeg", "bin", "ffmpeg.exe"),
+  "D:\\WorshipPlaybackEngine\\tools\\ffmpeg\\bin\\ffmpeg.exe"
+].filter(Boolean);
 const ENGINE_HELPER_CANDIDATES = [
   process.env.JUCE_AUDIO_ENGINE_PATH,
   join(__dirname, "native", "juce-audio-engine", "bin", "win-x64", "juce-audio-engine.exe"),
@@ -46,6 +54,11 @@ const ENGINE_HELPER_CANDIDATES = [
 ].filter(Boolean);
 let activePlaybackProcess = null;
 let playbackCommandQueue = Promise.resolve();
+let liveSupervisorInFlight = false;
+let liveSupervisorLastError = "";
+let liveSupervisorLastTickAt = "";
+let liveSupervisorLastAction = "";
+let liveSupervisorLastActionAt = "";
 let latestPlaybackMeters = {
   active: false,
   slot: null,
@@ -64,6 +77,11 @@ const PANIC_STATES = {
   NORMAL: "NORMAL",
   PANIC_HOLD: "PANIC_HOLD"
 };
+const CUE_MARKER_RULE_VERSION = "cue-marker-snapped-source-v3-2026-07-24";
+const KEY_CHANGE_CACHE_VERSION = "rubberband-key-cache-v1";
+const KEY_OPTIONS = ["C", "Db", "D", "Eb", "E", "F", "Gb", "G", "Ab", "A", "Bb", "B"];
+const TRANSITION_MODES = new Set(["cue-next", "stay", "autolink", "crossfade", "overlap"]);
+const TRANSITION_PAD_BEHAVIORS = new Set(["off", "hold-current-key", "next-song-key", "crossfade-to-next-key"]);
 
 const mimeTypes = {
   ".html": "text/html; charset=utf-8",
@@ -94,10 +112,11 @@ createServer(async (req, res) => {
       let setlist = syncSetlistWithLibrary(await loadCurrentSetlist(), library);
       setlist = await prepareSetlistCache(setlist);
       await saveCurrentSetlist(setlist);
-      await ensureSetMetadata(setlist, { allowAnalysis: false });
+      const metadata = await ensureSetMetadata(setlist, { allowAnalysis: false });
       await cleanupSetlistGeneratedArtifacts(setlist);
       await markUnavailableSetlistSongsUnconfirmed(setlist, library);
-      return json(res, { ...library, currentSetlist: setlist });
+      await refreshEngineManifestForMixer();
+      return json(res, { ...library, currentSetlist: setlist, metadata });
     }
 
     if (req.method === "GET" && url.pathname === "/api/settings") {
@@ -129,12 +148,23 @@ createServer(async (req, res) => {
 
     if (req.method === "PUT" && url.pathname === "/api/setlist/current") {
       const body = await readJsonBody(req);
+      const previousSetlist = await loadCurrentSetlist();
+      const previousFingerprint = setFingerprint(previousSetlist);
       const setlist = await prepareSetlistCache(normalizeSetlist(body));
+      const nextFingerprint = setFingerprint(setlist);
       await saveCurrentSetlist(setlist);
       await ensureSetMetadata(setlist, { allowAnalysis: false });
       await cleanupSetlistGeneratedArtifacts(setlist);
-      await markSetUnconfirmed(setlist);
+      if (nextFingerprint !== previousFingerprint) {
+        await markSetUnconfirmed(setlist);
+      }
       return json(res, setlist);
+    }
+
+    const slotKeyMatch = url.pathname.match(/^\/api\/setlist\/slot\/(\d+)\/key$/);
+    if (req.method === "PUT" && slotKeyMatch) {
+      const body = await readJsonBody(req);
+      return json(res, await updateSetlistSlotKey(positiveNumber(slotKeyMatch[1]), body.key));
     }
 
     if (req.method === "GET" && url.pathname === "/api/playback/state") {
@@ -211,10 +241,26 @@ createServer(async (req, res) => {
       return json(res, await readCurrentSetMetadata());
     }
 
+    if (req.method === "POST" && url.pathname === "/api/set-metadata/current/rehydrate") {
+      const body = await readJsonBody(req);
+      return json(res, await rehydrateCurrentSetMetadata({
+        includeWaveforms: body.includeWaveforms === true
+      }));
+    }
+
+    if (req.method === "GET" && url.pathname === "/api/set-metadata/current/audit") {
+      return json(res, await auditCurrentSetMetadata());
+    }
+
     const metadataSlotMatch = url.pathname.match(/^\/api\/set-metadata\/current\/slot\/(\d+)$/);
     if (metadataSlotMatch && req.method === "PUT") {
       const body = await readJsonBody(req);
       return json(res, await saveSlotMetadata(Number(metadataSlotMatch[1]), body));
+    }
+
+    const approveSlotMatch = url.pathname.match(/^\/api\/set-metadata\/current\/slot\/(\d+)\/approve$/);
+    if (approveSlotMatch && req.method === "POST") {
+      return json(res, await approveSlotCueRegionMetadata(Number(approveSlotMatch[1])));
     }
 
     const waveformSlotMatch = url.pathname.match(/^\/api\/set-metadata\/current\/slot\/(\d+)\/waveform$/);
@@ -253,6 +299,7 @@ createServer(async (req, res) => {
   }
 }).listen(PORT, () => {
   console.log(`Playback App V2 running at http://localhost:${PORT}`);
+  startLiveSupervisor();
 });
 
 async function loadLibrary() {
@@ -473,7 +520,13 @@ function normalizeSettings(value = {}) {
     },
     pads: {
       folderPath: stringValue(value.pads?.folderPath || APP_PADS_DIR),
-      outputBus: "pads"
+      outputBus: "pads",
+      defaultEnabled: value.pads?.defaultEnabled !== false,
+      startWithSong: value.pads?.startWithSong !== false,
+      continueBetweenSongs: value.pads?.continueBetweenSongs !== false,
+      defaultVolume: clampNumber(value.pads?.defaultVolume, 0, 1, 0.65),
+      fadeInMs: Math.max(0, Number(value.pads?.fadeInMs) || 1500),
+      fadeOutMs: Math.max(0, Number(value.pads?.fadeOutMs) || 2500)
     },
     dynamicClick: {
       soundFolderPath: stringValue(value.dynamicClick?.soundFolderPath),
@@ -520,8 +573,20 @@ function systemInfo() {
     vendors: VENDORS,
     cacheDir: CACHE_DIR,
     songMetadataDir: SONG_METADATA_DIR,
-    setMetadataDir: SET_METADATA_DIR
+    setMetadataDir: SET_METADATA_DIR,
+    remoteUrls: remoteAccessUrls()
   };
+}
+
+function remoteAccessUrls() {
+  const urls = [`http://127.0.0.1:${PORT}/remote`];
+  for (const addresses of Object.values(networkInterfaces())) {
+    for (const address of addresses || []) {
+      if (address.family !== "IPv4" || address.internal) continue;
+      urls.push(`http://${address.address}:${PORT}/remote`);
+    }
+  }
+  return [...new Set(urls)];
 }
 
 async function loadAudioDevices() {
@@ -760,7 +825,12 @@ function listWindowsSoundDevices() {
 
 async function loadCurrentSetlist() {
   try {
-    return normalizeSetlist(await readJsonFile(SETLIST_FILE, null));
+    const raw = await readJsonFile(SETLIST_FILE, null);
+    const normalized = normalizeSetlist(raw);
+    if (JSON.stringify(raw?.transitions || []) !== JSON.stringify(normalized.transitions || [])) {
+      await saveCurrentSetlist(normalized);
+    }
+    return normalized;
   } catch (error) {
     if (error.code !== "ENOENT") throw error;
     const setlist = normalizeSetlist({});
@@ -1146,6 +1216,7 @@ async function analyzeDynamicCuesForSlot(slotNumber) {
     songId: slot.songId,
     title: slot.title,
     sourceFolder: slot.folderPath,
+    timeSignature: slot.timeSignature || "",
     recognizer: cueAnalysis.speechEngine?.cueRecognizer || cueAnalysis.speechEngine?.cueProvider || "vosk-closed-grammar",
     voskStatus: cueAnalysis.speechEngine?.voskStatus || "",
     status: cueAnalysis.status || raw.analysisStatus || "unknown",
@@ -1238,18 +1309,20 @@ function compactRegionCandidates(candidates) {
 
 async function buildDynamicCueMapFromCandidates(report, dynamicCueFolder) {
   const available = await availableDynamicCueFiles(dynamicCueFolder);
+  const cueTiming = cueTimingContextForReport(report);
   const entries = report.candidates.map((candidate) => {
     const phrase = candidate.normalizedPhrase || candidate.rawTranscript || candidate.label;
     const parts = matchDynamicCuePhrase(phrase, available);
     const approved = ["trusted", "review"].includes(candidate.status);
+    const trigger = sectionCuePositionFromReport(candidate, report, cueTiming);
     return {
       candidateId: candidate.id,
       label: candidate.label,
       phrase,
       command: candidate.command,
       status: approved && parts.every((part) => part.filePath) ? "mapped" : approved ? "missing-dynamic-cue-files" : "not-approved",
-      triggerMeasure: candidate.snappedMeasure,
-      triggerBeat: candidate.snappedBeat,
+      triggerMeasure: trigger.bar,
+      triggerBeat: trigger.beat,
       targetMeasure: candidate.targetMeasure,
       targetBeat: candidate.targetBeat,
       parts
@@ -1276,50 +1349,144 @@ async function seedCueMarkersFromAnalysisIfEmpty(slotDir, report) {
   }
   const cueMarkers = (report.candidates || [])
     .filter((candidate) => ["trusted", "review"].includes(candidate.status))
-    .map((candidate, index) => ({
-      id: `cue-${candidate.id || index + 1}`,
-      name: cueMarkerName(candidate, index),
-      bar: positiveNumber(candidate.snappedMeasure || candidate.targetMeasure) || 1,
-      beat: positiveNumber(candidate.snappedBeat || candidate.targetBeat) || 1
-    }))
+    .map((candidate, index) => cueMarkerFromAnalysisCandidate(candidate, report, index))
     .filter((cue) => cue.name && cue.bar > 0 && cue.beat > 0);
   await writeFile(cueMarkerPath, `${JSON.stringify({
     ...current,
     dynamicCueMatching: current.dynamicCueMatching || "fuzzy-name",
     cueMarkers,
     updatedAt: new Date().toISOString(),
-    source: "dynamic-cue-analysis"
+    source: "dynamic-cue-analysis",
+    sourceFingerprint: cueMarkerDefaultsFingerprint(report)
   }, null, 2)}\n`, "utf8");
   return { created: cueMarkers.length };
 }
 
 function buildDefaultRegionsFromReport(report) {
-  const candidates = (report.regionCandidates || [])
+  const analyzerRegions = analyzerRegionsFromReport(report);
+  if (analyzerRegions.regions.length) {
+    return analyzerRegions;
+  }
+
+  const regionCandidates = (report.regionCandidates || [])
     .filter((candidate) => candidate.status === "verified" && candidate.startMeasure && candidate.startBeat)
     .sort((a, b) => (a.startMeasure - b.startMeasure) || (a.startBeat - b.startBeat));
-  const endMeasure = positiveNumber(report.gridReference?.measureCount);
-  const regions = candidates.map((candidate, index) => {
-    const next = candidates[index + 1];
+  if (regionCandidates.length) {
+    const endMeasure = positiveNumber(report.gridReference?.measureCount);
+    const regions = regionCandidates.map((candidate, index) => {
+      const next = regionCandidates[index + 1];
+      return {
+        id: `region-${candidate.sourceCueCandidateId || candidate.id || index + 1}`,
+        name: cueMarkerName({
+          id: candidate.sourceCueCandidateId || candidate.id,
+          label: candidate.sourceCueText,
+          normalizedPhrase: candidate.sourceCueText
+        }, index),
+        startBar: candidate.startMeasure,
+        startBeat: candidate.startBeat,
+        endBar: next?.startMeasure || endMeasure || candidate.startMeasure + 1,
+        endBeat: next?.startBeat || 1,
+        sourceCueId: `cue-${candidate.sourceCueCandidateId || candidate.id || index + 1}`,
+        source: "derived-from-analyzer-region-candidates"
+      };
+    }).filter((region) => region.endBar > region.startBar || (region.endBar === region.startBar && region.endBeat > region.startBeat));
     return {
-      id: `region-${candidate.sourceCueCandidateId || candidate.id || index + 1}`,
-      name: cueMarkerName({
-        id: candidate.sourceCueCandidateId || candidate.id,
-        label: candidate.sourceCueText,
-        normalizedPhrase: candidate.sourceCueText
-      }, index),
-      startBar: candidate.startMeasure,
-      startBeat: candidate.startBeat,
-      endBar: next?.startMeasure || endMeasure || candidate.startMeasure + 1,
-      endBeat: next?.startBeat || 1,
-      sourceCueId: `cue-${candidate.sourceCueCandidateId || candidate.id || index + 1}`,
-      source: "derived-from-analyzer-region-candidates"
+      regions,
+      source: regions.length ? "derived-from-analyzer-region-candidates" : "empty-default",
+      sourceFingerprint: stringValue(report.sourceFingerprint),
+      updatedAt: new Date().toISOString()
+    };
+  }
+
+  const timing = cueTimingContextForReport(report);
+  const candidates = (report.candidates || [])
+    .filter((candidate) => ["trusted", "review", "verified"].includes(stringValue(candidate.status)))
+    .map((candidate, index) => {
+      const cue = cueMarkerFromAnalysisCandidate(candidate, report, index);
+      const start = shiftBarBeatByBeats(cue.bar, cue.beat, timing.sectionCueLeadBeats, timing.beatsPerMeasure);
+      return { candidate, cue, start, index };
+    })
+    .filter((entry) => entry.cue.name && entry.start.bar > 0 && entry.start.beat > 0)
+    .sort((a, b) => (a.start.bar - b.start.bar) || (a.start.beat - b.start.beat));
+  const endMeasure = positiveNumber(report.gridReference?.measureCount);
+  const regions = candidates.map((entry, index) => {
+    const next = candidates[index + 1];
+    const candidateId = entry.candidate.id || entry.index + 1;
+    return {
+      id: `region-${candidateId}`,
+      name: entry.cue.name,
+      startBar: entry.start.bar,
+      startBeat: entry.start.beat,
+      endBar: next?.start.bar || endMeasure || entry.start.bar + 1,
+      endBeat: next?.start.beat || 1,
+      sourceCueId: `cue-${candidateId}`,
+      source: "derived-from-cue-lead-rule",
+      cueLeadBeats: timing.sectionCueLeadBeats
     };
   }).filter((region) => region.endBar > region.startBar || (region.endBar === region.startBar && region.endBeat > region.startBeat));
   return {
     regions,
-    source: regions.length ? "derived-from-analyzer-region-candidates" : "empty-default",
+    source: regions.length ? "derived-from-cue-lead-rule" : "empty-default",
+    sourceFingerprint: stringValue(report.sourceFingerprint),
     updatedAt: new Date().toISOString()
   };
+}
+
+function analyzerRegionsFromReport(report) {
+  const sourceRegions = Array.isArray(report?.inferredRegions?.regions) ? report.inferredRegions.regions : [];
+  const regions = sourceRegions.map((region, index) => ({
+    id: stringValue(region.id || `region-${region.sourceCueId || index + 1}`),
+    name: stringValue(region.name || region.label || `Region ${index + 1}`),
+    startBar: positiveNumber(region.startMeasure || region.startBar) || 1,
+    startBeat: positiveNumber(region.startBeat) || 1,
+    endBar: positiveNumber(region.endMeasure || region.endBar) || positiveNumber(region.startMeasure || region.startBar) || 1,
+    endBeat: positiveNumber(region.endBeat) || 1,
+    sourceCueId: stringValue(region.sourceCueId || region.sourceCueCandidateId || ""),
+    source: "analyzer-cue-intelligence-inferred-regions"
+  })).filter((region) => region.endBar > region.startBar || (region.endBar === region.startBar && region.endBeat > region.startBeat));
+  return {
+    regions,
+    source: regions.length ? "analyzer-cue-intelligence-inferred-regions" : "empty-default",
+    regionSource: regions.length ? "inferred-from-cues" : "",
+    sourceFingerprint: stringValue(report?.sourceFingerprint),
+    updatedAt: new Date().toISOString()
+  };
+}
+
+function analyzerDefaultNeedsRefresh(current, sourceFingerprint) {
+  if (!sourceFingerprint || !current || typeof current !== "object") return false;
+  if (metadataMapIsOperatorApproved(current)) return false;
+  const analyzerSources = new Set([
+    "",
+    "empty-default",
+    "dynamic-cue-analysis",
+    "derived-from-analyzer-region-candidates",
+    "derived-from-cue-lead-rule",
+    "analyzer-cue-phrase-marker-refresh",
+    "analyzer-cue-intelligence",
+    "analyzer-cue-intelligence-inferred-regions",
+    "editor-autosave"
+  ]);
+  if (!analyzerSources.has(stringValue(current.source))) return false;
+  return stringValue(current.sourceFingerprint) !== sourceFingerprint;
+}
+
+function metadataMapIsOperatorApproved(current) {
+  const status = stringValue(current?.status || current?.approvalStatus);
+  return Boolean(
+    current?.approved === true
+    || current?.operatorApproved === true
+    || current?.locked === true
+    || status === "approved"
+    || stringValue(current?.source) === "operator-approved"
+  );
+}
+
+function metadataMapIsOperatorWorkingDraft(current) {
+  return Boolean(
+    current && typeof current === "object"
+    && stringValue(current.source) === "operator-working-draft"
+  );
 }
 
 async function seedRegionsFromAnalysisIfEmpty(slotDir, report) {
@@ -1395,6 +1562,49 @@ function normalizeCuePhrase(value) {
 }
 
 async function startNativeSlotPlayback(slot, options = {}) {
+  if (options.reuseActive === true && activePlaybackProcess) {
+    const settings = await loadSettings();
+    const device = await resolveEngineDevice(settings.audioEngine.selectedDeviceName);
+    const nativePlayback = await requestNativePlaybackCommand("playSlot", {
+      manifestPath: ENGINE_MANIFEST_FILE,
+      slot,
+      deviceName: device.name,
+      deviceType: device.driver,
+      sampleRate: settings.audioEngine?.sampleRate || 48000,
+      startSeconds: nonNegativeNumber(options.startSeconds) ?? 0
+    }, { timeoutMs: 10000 });
+    if (!nativePlayback.ok || nativePlayback.response?.type !== "playbackStarted") {
+      return { ok: false, error: nativePlayback.error || nativePlayback.response?.reason || "JUCE playback failed to start." };
+    }
+    activePlaybackProcess.slot = slot;
+    activePlaybackProcess.outputChannels = positiveNumber(nativePlayback.response.outputChannels);
+    activePlaybackProcess.requestedOutputChannels = positiveNumber(nativePlayback.response.requestedOutputChannels);
+    latestPlaybackMeters = {
+      active: true,
+      slot,
+      title: stringValue(nativePlayback.response.title),
+      currentTimeSeconds: nonNegativeNumber(nativePlayback.response.currentPositionSeconds) ?? nonNegativeNumber(options.startSeconds) ?? 0,
+      stems: [],
+      updatedAt: new Date().toISOString()
+    };
+    broadcastMeterSnapshot();
+    await saveEngineStatus(normalizeEngineStatus({
+      state: "ready",
+      simulated: false,
+      selectedDeviceName: stringValue(nativePlayback.response.deviceName || device.name),
+      deviceType: stringValue(nativePlayback.response.deviceType || device.driver),
+      requestedOutputChannels: positiveNumber(nativePlayback.response.requestedOutputChannels),
+      outputChannels: positiveNumber(nativePlayback.response.outputChannels),
+      sampleRate: positiveNumber(nativePlayback.response.sampleRate),
+      bufferSize: positiveNumber(nativePlayback.response.bufferSize),
+      manifestPath: ENGINE_MANIFEST_FILE,
+      message: `JUCE ready on ${nativePlayback.response.deviceName || device.name}.`,
+      lastHeartbeatAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString()
+    }));
+    return { ok: true, response: nativePlayback.response };
+  }
+
   await stopNativePlayback();
 
   const helperPath = await findEngineHelperPath();
@@ -1453,6 +1663,7 @@ async function startNativeSlotPlayback(slot, options = {}) {
               active: true,
               slot,
               title: stringValue(response.title),
+              currentTimeSeconds: nonNegativeNumber(response.currentPositionSeconds) ?? nonNegativeNumber(options.startSeconds) ?? 0,
               stems: [],
               updatedAt: new Date().toISOString()
             };
@@ -1489,6 +1700,12 @@ async function startNativeSlotPlayback(slot, options = {}) {
       stderr += chunk.toString();
     });
 
+    child.stdin.on("error", (error) => {
+      stderr += `\nstdin error: ${error.message}`;
+      if (activePlaybackProcess?.child === child) activePlaybackProcess = null;
+      finish({ ok: false, error: error.message });
+    });
+
     child.on("error", (error) => {
       finish({ ok: false, error: error.message });
     });
@@ -1505,6 +1722,7 @@ async function startNativeSlotPlayback(slot, options = {}) {
       slot,
       deviceName: device.name,
       deviceType: device.driver,
+      sampleRate: settings.audioEngine?.sampleRate || 48000,
       startSeconds: nonNegativeNumber(options.startSeconds) ?? 0
     })}\n`);
   });
@@ -1521,11 +1739,16 @@ async function sendNativePlaybackCommand(type, body = {}) {
     return { ok: true, active: false };
   }
 
-  child.stdin.write(`${JSON.stringify({
-    type,
-    requestId: `${type}-${Date.now()}`,
-    ...body
-  })}\n`);
+  try {
+    child.stdin.write(`${JSON.stringify({
+      type,
+      requestId: `${type}-${Date.now()}`,
+      ...body
+    })}\n`);
+  } catch (error) {
+    activePlaybackProcess = null;
+    return { ok: false, active: false, error: error.message };
+  }
 
   return { ok: true, active: true };
 }
@@ -1547,7 +1770,14 @@ async function requestNativePlaybackCommand(type, body = {}, options = {}) {
       clearTimeout(timeout);
       resolveRequest({ ok: response.type !== "commandRejected", active: true, response, error: response.reason || "" });
     });
-    child.stdin.write(`${JSON.stringify({ type, requestId, ...body })}\n`);
+    try {
+      child.stdin.write(`${JSON.stringify({ type, requestId, ...body })}\n`);
+    } catch (error) {
+      pending?.delete(requestId);
+      clearTimeout(timeout);
+      activePlaybackProcess = null;
+      resolveRequest({ ok: false, active: false, error: error.message });
+    }
   });
 }
 
@@ -1558,6 +1788,7 @@ function handleNativePlaybackResponse(response) {
       active: Boolean(response.nativeAudioActive),
       slot: positiveNumber(response.slot),
       title: stringValue(response.title),
+      currentTimeSeconds: nonNegativeNumber(response.currentPositionSeconds),
       stems: Array.isArray(response.stems) ? response.stems.map((stem) => ({
         id: stringValue(stem.id),
         name: stringValue(stem.name),
@@ -1782,7 +2013,8 @@ async function probeEngineReadiness(settings, manifestPath) {
     requestId: "engine-probe",
     deviceName: device.name || selectedDeviceName,
     deviceType: device.driver,
-    requestedOutputChannels: requiredOutputChannels
+    requestedOutputChannels: requiredOutputChannels,
+    sampleRate: settings.audioEngine?.sampleRate || 48000
   }, { timeoutMs: 10000 });
 
   if (!probe.ok || probe.response?.type !== "deviceProbe") {
@@ -1840,7 +2072,9 @@ function normalizePlaybackState(value = {}) {
     transportStartedAt: stringValue(value.transportStartedAt),
     activeRegionId: stringValue(value.activeRegionId),
     liveRepeat: normalizeLiveRepeat(value.liveRepeat),
+    pad: normalizePadRuntime(value.pad),
     panic: normalizePanicRuntime(value.panic),
+    transition: normalizeTransitionRuntime(value.transition),
     lastCommand: stringValue(value.lastCommand),
     commandStatus: stringValue(value.commandStatus),
     confirmed: Boolean(value.confirmed),
@@ -1848,6 +2082,36 @@ function normalizePlaybackState(value = {}) {
     confirmedAt: stringValue(value.confirmedAt),
     lastMessage: stringValue(value.lastMessage),
     updatedAt: stringValue(value.updatedAt || new Date().toISOString())
+  };
+}
+
+function normalizeTransitionRuntime(value = {}) {
+  value = value || {};
+  const mode = TRANSITION_MODES.has(value.mode) ? value.mode : "cue-next";
+  const padBehavior = TRANSITION_PAD_BEHAVIORS.has(value.padBehavior) ? value.padBehavior : "next-song-key";
+  const status = ["idle", "waiting-next", "active", "completed", "blocked"].includes(value.status) ? value.status : "idle";
+  return {
+    active: Boolean(value.active),
+    fromSlot: positiveNumber(value.fromSlot),
+    toSlot: positiveNumber(value.toSlot),
+    mode,
+    padBehavior,
+    startedAt: value.startedAt === null ? null : stringValue(value.startedAt),
+    durationSeconds: positiveNumber(value.durationSeconds) || 5,
+    status,
+    message: stringValue(value.message)
+  };
+}
+
+function normalizePadRuntime(value = {}) {
+  value = value || {};
+  return {
+    active: Boolean(value.active),
+    slot: positiveNumber(value.slot),
+    songId: stringValue(value.songId),
+    padKey: stringValue(value.padKey),
+    source: stringValue(value.source || "operator"),
+    updatedAt: stringValue(value.updatedAt)
   };
 }
 
@@ -1859,6 +2123,14 @@ function normalizePanicRuntime(value = {}) {
     active: state !== PANIC_STATES.NORMAL && value.active !== false,
     label: state === PANIC_STATES.PANIC_HOLD ? stringValue(value.label || "Panic Active") : "",
     detail: state === PANIC_STATES.PANIC_HOLD ? stringValue(value.detail || "Tracks Down / Click Alive") : "",
+    startedAt: stringValue(value.startedAt),
+    slot: positiveNumber(value.slot),
+    songId: stringValue(value.songId),
+    heldPadKey: stringValue(value.heldPadKey),
+    tracksMuted: Boolean(state === PANIC_STATES.PANIC_HOLD && value.tracksMuted !== false),
+    clickMuted: Boolean(value.clickMuted),
+    cueMuted: false,
+    recoveryTarget: value.recoveryTarget || null,
     trackTargetDb: state === PANIC_STATES.PANIC_HOLD ? PANIC_TRACK_TARGET_DB : 0,
     source: stringValue(value.source),
     updatedAt: stringValue(value.updatedAt)
@@ -1874,7 +2146,27 @@ function normalizeLiveRepeat(value = {}) {
     regionName: mode ? stringValue(value.regionName) : "",
     queued: Boolean(mode && value.queued !== false),
     releaseRequested: Boolean(mode === "loop" && value.releaseRequested),
-    releaseAfterNextPass: Boolean(mode === "loop" && value.releaseAfterNextPass)
+    releaseAfterNextPass: Boolean(mode === "loop" && value.releaseAfterNextPass),
+    cueFired: Boolean(mode && value.cueFired),
+    actionInFlight: Boolean(mode && value.actionInFlight),
+    repeatCuePlan: mode ? normalizeRepeatCuePlan(value.repeatCuePlan) : null
+  };
+}
+
+function normalizeRepeatCuePlan(value = {}) {
+  if (!value || typeof value !== "object") return null;
+  const triggerSeconds = nonNegativeNumber(value.triggerSeconds);
+  const startSeconds = nonNegativeNumber(value.startSeconds);
+  const endSeconds = nonNegativeNumber(value.endSeconds);
+  if (triggerSeconds === null || startSeconds === null || endSeconds === null) return null;
+  return {
+    triggerSeconds,
+    startSeconds,
+    endSeconds,
+    repeatedCueDelayMs: Math.max(0, Math.min(3000, Number(value.repeatedCueDelayMs || 0))),
+    suppressCueStartSeconds: nonNegativeNumber(value.suppressCueStartSeconds),
+    suppressCueEndSeconds: nonNegativeNumber(value.suppressCueEndSeconds),
+    generatedAt: stringValue(value.generatedAt)
   };
 }
 
@@ -1925,12 +2217,224 @@ function openPlaybackStateStream(req, res) {
   });
 }
 
+function startLiveSupervisor() {
+  setInterval(() => {
+    serviceLiveSupervisor().catch((error) => {
+      const message = error?.message || String(error);
+      if (message !== liveSupervisorLastError) {
+        liveSupervisorLastError = message;
+        console.error(`Live supervisor failed: ${message}`);
+      }
+    });
+  }, 50);
+}
+
+async function serviceLiveSupervisor() {
+  if (liveSupervisorInFlight) return;
+  liveSupervisorInFlight = true;
+  try {
+    await playbackCommandQueue;
+    liveSupervisorLastTickAt = new Date().toISOString();
+    const state = await loadPlaybackState();
+    if (state.transport !== "playing" || !state.currentSlot) return;
+    if (!activePlaybackProcess) {
+      await savePlaybackState(normalizePlaybackState({
+        ...state,
+        transport: "stopped",
+        currentTimeSeconds: computedPlaybackTimeSeconds(state),
+        transportAnchorSeconds: computedPlaybackTimeSeconds(state),
+        transportStartedAt: "",
+        liveRepeat: {},
+        panic: {},
+        lastCommand: "engine-lost",
+        commandStatus: "stopped",
+        lastMessage: "Playback engine stopped unexpectedly. Restart playback from the selected song.",
+        updatedAt: new Date().toISOString()
+      }));
+      markLiveSupervisorAction("engine-lost-stop");
+      return;
+    }
+
+    if (await servicePanicRecoveryBackend(state)) return;
+    if (await serviceLiveRepeatBackend(state)) return;
+    await serviceSongEndBackend(state);
+  } finally {
+    liveSupervisorInFlight = false;
+  }
+}
+
+async function servicePanicRecoveryBackend(state) {
+  const pending = state.panic?.recoveryTarget;
+  if (state.panic?.active !== true || !pending?.pending) return false;
+  const current = computedPlaybackTimeSeconds(state);
+  const slot = positiveNumber(pending.slot || state.currentSlot);
+  const cueSeconds = nonNegativeNumber(pending.cueSeconds);
+  if (!pending.cueFired && cueSeconds !== null && current >= cueSeconds - 0.035) {
+    markLiveSupervisorAction("panic-recovery-cue");
+    const nextState = normalizePlaybackState({
+      ...state,
+      panic: normalizePanicRuntime({
+        ...state.panic,
+        recoveryTarget: {
+          ...pending,
+          cueFired: true
+        }
+      }),
+      lastCommand: "triggerPanicRecoveryCue",
+      commandStatus: "accepted",
+      lastMessage: `Recovery cue reached for ${pending.regionName || "target region"}.`,
+      updatedAt: new Date().toISOString()
+    });
+    await savePlaybackState(nextState);
+    return true;
+  }
+  const executeSeconds = nonNegativeNumber(pending.executeSeconds ?? pending.targetSeconds);
+  if (executeSeconds !== null && current >= executeSeconds - 0.035) {
+    markLiveSupervisorAction("panic-release");
+    await handlePlaybackCommand("exitPanic", {
+      slot,
+      targetSeconds: nonNegativeNumber(pending.targetSeconds ?? pending.seekSeconds) ?? 0,
+      regionId: pending.regionId,
+      regionName: pending.regionName,
+      recoveryCueAlreadyTriggered: pending.cueFired === true,
+      recoveryCueSkipped: pending.cueSkipped === true,
+      systemAction: true
+    });
+    return true;
+  }
+  return false;
+}
+
+async function serviceLiveRepeatBackend(state) {
+  const repeat = normalizeLiveRepeat(state.liveRepeat);
+  const plan = repeat.repeatCuePlan || {};
+  if (!["once", "loop"].includes(repeat.mode) || !plan || repeat.actionInFlight) return false;
+  const current = computedPlaybackTimeSeconds(state);
+  const triggerSeconds = nonNegativeNumber(plan.triggerSeconds);
+  const startSeconds = nonNegativeNumber(plan.startSeconds);
+  const endSeconds = nonNegativeNumber(plan.endSeconds);
+  if (startSeconds === null || endSeconds === null || endSeconds <= startSeconds + 0.1) return false;
+
+  if (!repeat.cueFired && !repeat.releaseRequested && triggerSeconds !== null && current >= triggerSeconds && current < endSeconds - 0.1) {
+    markLiveSupervisorAction("repeat-cue");
+    await handlePlaybackCommand("triggerRepeatCue", {
+      slot: state.currentSlot,
+      regionId: repeat.regionId,
+      regionName: repeat.regionName,
+      repeatedCueDelayMs: Number(plan.repeatedCueDelayMs || 0),
+      suppressCueStartSeconds: plan.suppressCueStartSeconds,
+      suppressCueEndSeconds: plan.suppressCueEndSeconds,
+      systemAction: true
+    });
+    return true;
+  }
+
+  if (current < Math.max(startSeconds + 0.1, endSeconds) - 0.08) return false;
+  if (repeat.mode === "loop" && repeat.releaseRequested) {
+    markLiveSupervisorAction("repeat-clear-release");
+    await handlePlaybackCommand("clearRegionRepeat", {
+      slot: state.currentSlot,
+      regionId: repeat.regionId,
+      regionName: repeat.regionName,
+      systemAction: true
+    });
+    return true;
+  }
+  if (repeat.mode === "loop" && repeat.releaseAfterNextPass) {
+    markLiveSupervisorAction("repeat-loop-defer-release");
+    await handlePlaybackCommand("seek", {
+      slot: state.currentSlot,
+      seconds: startSeconds,
+      regionId: repeat.regionId,
+      regionName: repeat.regionName,
+      systemAction: true
+    });
+    await handlePlaybackCommand("goOnRegion", {
+      slot: state.currentSlot,
+      regionId: repeat.regionId,
+      regionName: repeat.regionName,
+      systemAction: true
+    });
+    return true;
+  }
+  markLiveSupervisorAction("repeat-seek");
+  await handlePlaybackCommand("seek", {
+    slot: state.currentSlot,
+    seconds: startSeconds,
+    regionId: repeat.regionId,
+    regionName: repeat.regionName,
+    systemAction: true
+  });
+  if (repeat.mode === "once") {
+    markLiveSupervisorAction("repeat-once-clear");
+    await handlePlaybackCommand("clearRegionRepeat", {
+      slot: state.currentSlot,
+      regionId: repeat.regionId,
+      regionName: repeat.regionName,
+      systemAction: true
+    });
+  }
+  return true;
+}
+
+async function serviceSongEndBackend(state) {
+  if (state.panic?.active === true) return false;
+  const liveSong = await activeManifestSong(state.currentSlot);
+  const duration = manifestSongDurationSeconds(liveSong);
+  if (!duration) return false;
+  const setlist = await loadCurrentSetlist();
+  const transition = transitionForFromSlot(setlist, state.currentSlot);
+  const current = computedPlaybackTimeSeconds(state);
+  const lead = ["crossfade", "overlap"].includes(transition?.mode)
+    ? Math.max(0.25, Number(transition.durationSeconds || 5))
+    : 0.08;
+  if (current < duration - lead) return false;
+  if (state.mode === "performance" && transition) {
+    markLiveSupervisorAction("song-transition");
+    await handlePlaybackCommand("songTransition", {
+      fromSlot: transition.fromSlot,
+      toSlot: transition.toSlot,
+      systemAction: true
+    });
+  } else {
+    markLiveSupervisorAction("song-end-stop");
+    await handlePlaybackCommand("stop", {
+      slot: state.currentSlot,
+      systemAction: true
+    });
+  }
+  return true;
+}
+
+function markLiveSupervisorAction(action) {
+  liveSupervisorLastAction = action;
+  liveSupervisorLastActionAt = new Date().toISOString();
+}
+
+function manifestSongDurationSeconds(song) {
+  if (!song) return 0;
+  const explicit = nonNegativeNumber(song.durationSeconds) ?? (nonNegativeNumber(song.durationMs) !== null ? nonNegativeNumber(song.durationMs) / 1000 : null);
+  if (explicit) return explicit;
+  return Math.max(0, ...(Array.isArray(song.stems) ? song.stems : [])
+    .map((stem) => nonNegativeNumber(stem.durationMs) !== null ? nonNegativeNumber(stem.durationMs) / 1000 : nonNegativeNumber(stem.durationSeconds) || 0));
+}
+
 function computedPlaybackTimeSeconds(state) {
+  const meterTime = activeMeterPositionSeconds(state?.currentSlot);
+  if (meterTime !== null) return meterTime;
   const anchor = nonNegativeNumber(state.transportAnchorSeconds) ?? nonNegativeNumber(state.currentTimeSeconds) ?? 0;
   if (state.transport !== "playing" || !state.transportStartedAt) return anchor;
   const startedAt = Date.parse(state.transportStartedAt);
   if (!Number.isFinite(startedAt)) return anchor;
   return Math.max(0, anchor + ((Date.now() - startedAt) / 1000));
+}
+
+function activeMeterPositionSeconds(slotNumber) {
+  if (!activePlaybackProcess || !latestPlaybackMeters.active) return null;
+  if (positiveNumber(latestPlaybackMeters.slot) !== positiveNumber(slotNumber)) return null;
+  const updatedAt = Date.parse(latestPlaybackMeters.updatedAt || "");
+  if (!Number.isFinite(updatedAt) || Date.now() - updatedAt > 500) return null;
+  return nonNegativeNumber(latestPlaybackMeters.currentTimeSeconds);
 }
 
 function livePlaybackActivityAgeMs() {
@@ -1984,9 +2488,11 @@ async function buildReadiness(setlist, settings) {
   const effectiveHeartbeatAgeMs = activePlaybackProcess
     ? Math.min(heartbeatAgeMs, liveActivityAgeMs)
     : heartbeatAgeMs;
-  const heartbeatFresh = engineStatus.state === "ready" && (!activePlaybackProcess || effectiveHeartbeatAgeMs <= ENGINE_HEARTBEAT_GRACE_MS);
+  const heartbeatRequired = Boolean(activePlaybackProcess);
+  const heartbeatFresh = engineStatus.state === "ready" && heartbeatRequired && effectiveHeartbeatAgeMs <= ENGINE_HEARTBEAT_GRACE_MS;
   const engine = {
     ...engineStatus,
+    heartbeatRequired,
     heartbeatFresh,
     heartbeatAgeMs: Number.isFinite(effectiveHeartbeatAgeMs) ? effectiveHeartbeatAgeMs : null,
     statusFileHeartbeatAgeMs: Number.isFinite(heartbeatAgeMs) ? heartbeatAgeMs : null,
@@ -2000,7 +2506,7 @@ async function buildReadiness(setlist, settings) {
 
   if (engine.state !== "ready" && engine.state !== "device-missing") {
     performanceBlockers.push(engine.state === "crashed" ? "JUCE engine crashed." : "JUCE engine offline.");
-  } else if (settings.audioEngine?.selectedDeviceName && !heartbeatFresh) {
+  } else if (settings.audioEngine?.selectedDeviceName && heartbeatRequired && !heartbeatFresh) {
     performanceBlockers.push("JUCE heartbeat stale.");
   }
   if (audioDevice.state === "missing") {
@@ -2083,12 +2589,16 @@ async function runSystemCheck() {
   const metadata = await readCurrentSetMetadata();
   const filledSlots = (setlist.slots || []).filter((slot) => slot.songId);
   const librarySongIds = new Set((library.songs || []).map((song) => song.id));
+  const readiness = playback.readiness || {};
 
   await mkdir(DATA_DIR, { recursive: true });
   await mkdir(SONG_METADATA_DIR, { recursive: true });
   await checkDirectory(libraryRoot, "Library scan folder", errors);
   await checkDirectory(DATA_DIR, "App data folder", errors);
   await checkDirectory(SONG_METADATA_DIR, "Song metadata folder", errors);
+  const padReadiness = await padFolderReadiness(settings.pads?.folderPath, filledSlots);
+  errors.push(...padReadiness.errors);
+  warnings.push(...padReadiness.warnings);
 
   if (resolve(libraryRoot).toLowerCase() === resolve(ROOT).toLowerCase()) {
     for (const vendor of VENDORS) {
@@ -2101,9 +2611,40 @@ async function runSystemCheck() {
     if (!librarySongIds.has(slot.songId)) {
       errors.push(`Slot ${slot.slot}: song is not in the current metadata-backed library.`);
     }
+    if (slot.folderPath) {
+      const currentFingerprint = await sourceMetadataFingerprintForSongFolder(slot.folderPath);
+      const importedFingerprint = stringValue(slot.metadataVersionInfo?.fingerprint);
+      if (importedFingerprint && currentFingerprint && importedFingerprint !== currentFingerprint) {
+        errors.push(`Slot ${slot.slot}: source metadata changed after import. Refresh Library before testing or performing this song.`);
+      }
+    }
   }
   if (filledSlots.length && metadata.slots.length !== filledSlots.length) {
     errors.push("Set metadata slot count does not match filled setlist slots.");
+  }
+  for (const blocker of readiness.performanceBlockers || []) {
+    errors.push(blocker);
+  }
+  if (
+    readiness.engine?.state === "ready"
+    && positiveNumber(readiness.engine.sampleRate)
+    && positiveNumber(settings.audioEngine?.sampleRate)
+    && positiveNumber(readiness.engine.sampleRate) !== positiveNumber(settings.audioEngine.sampleRate)
+  ) {
+    errors.push(`JUCE sample rate ${readiness.engine.sampleRate} does not match Settings sample rate ${settings.audioEngine.sampleRate}.`);
+  }
+  for (const slotMetadata of metadata.slots || []) {
+    const metadataFolder = stringValue(slotMetadata.metadataFolder);
+    const regionsPath = stringValue(slotMetadata.files?.regions || (metadataFolder ? join(metadataFolder, "regions.json") : ""));
+    const cuesPath = stringValue(slotMetadata.files?.cues || (metadataFolder ? join(metadataFolder, "cue-markers.json") : ""));
+    const regions = regionsPath ? await readJsonFile(regionsPath, null) : null;
+    const cues = cuesPath ? await readJsonFile(cuesPath, null) : null;
+    if (regions?.sourceMetadataChangedUnderDraft) {
+      warnings.push(`Slot ${slotMetadata.slot}: regions are an operator draft preserved over newer analyzer metadata. Approve, reload from analyzer, or clear the draft before judging analyzer timing.`);
+    }
+    if (cues?.sourceMetadataChangedUnderDraft) {
+      warnings.push(`Slot ${slotMetadata.slot}: cue markers are an operator draft preserved over newer analyzer metadata. Approve, reload from analyzer, or clear the draft before judging dynamic cues.`);
+    }
   }
   for (const row of cacheReport.rows) {
     if (row.state === "failed") errors.push(`Slot ${row.slot}: ${row.message || "cache failed"}`);
@@ -2115,9 +2656,22 @@ async function runSystemCheck() {
     if (manifest.exists && manifest.manifest?.songs?.length !== filledSlots.length) {
       errors.push("Engine manifest song count does not match filled setlist slots.");
     }
+    if (manifest.exists) {
+      const liveCueReadiness = await liveCommandCueReadiness(manifest.manifest, settings.dynamicCue?.folderPath);
+      errors.push(...liveCueReadiness.errors);
+      warnings.push(...liveCueReadiness.warnings);
+    }
     for (const song of manifest.exists ? manifest.manifest?.songs || [] : []) {
       if (song.dynamicPad?.sourcePath && song.dynamicPad?.cacheStatus === "cache-failed") {
         errors.push(`Slot ${song.slot}: dynamic pad cache failed for ${song.tempoMap?.key || "song key"}. ${song.dynamicPad.cacheError || ""}`.trim());
+      }
+      const click = song.dynamicClick || {};
+      if (click.status === "ready" && Number(click.clickEventCount || 0) === 0 && Number(click.patternLength || 0) < 16) {
+        warnings.push(`Slot ${song.slot}: dynamic click is grid/pattern driven with only ${Number(click.patternLength || 0)} pattern beats. Analyzer should provide first-16/event click data for best click-stem match.`);
+      }
+      const missingCueCount = (Array.isArray(song.dynamicCues) ? song.dynamicCues : []).filter((cue) => cue.status !== "matched").length;
+      if (missingCueCount) {
+        warnings.push(`Slot ${song.slot}: ${missingCueCount} dynamic cue event(s) have no matching WAV in the dynamic cue folder.`);
       }
     }
   }
@@ -2133,8 +2687,88 @@ async function runSystemCheck() {
       filledSlots: filledSlots.length,
       metadataSlots: metadata.slots.length,
       cacheRows: cacheReport.rows.length
+    },
+    liveSupervisor: {
+      lastTickAt: liveSupervisorLastTickAt,
+      inFlight: liveSupervisorInFlight,
+      lastAction: liveSupervisorLastAction,
+      lastActionAt: liveSupervisorLastActionAt,
+      lastError: liveSupervisorLastError
     }
   };
+}
+
+async function liveCommandCueReadiness(manifest, folderPath) {
+  const errors = [];
+  const warnings = [];
+  const folder = stringValue(folderPath);
+  if (!folder) {
+    errors.push("Dynamic cue folder is not configured. Repeat and Panic recovery cues cannot sound.");
+    return { errors, warnings };
+  }
+  let entries = [];
+  try {
+    entries = await readdir(folder, { withFileTypes: true });
+  } catch {
+    errors.push("Dynamic cue folder is unavailable. Repeat and Panic recovery cues cannot sound.");
+    return { errors, warnings };
+  }
+  const wavs = entries
+    .filter((entry) => entry.isFile() && entry.name.toLowerCase().endsWith(".wav"))
+    .map((entry) => ({ name: entry.name, filePath: join(folder, entry.name), key: cueMatchKey(entry.name.replace(/\.wav$/i, "")) }));
+
+  if (!findCueWav(wavs, "Repeat")) {
+    errors.push("Repeat.wav is missing from the dynamic cue folder. Region repeat announcements cannot sound.");
+  }
+  if (!findCueWav(wavs, "In")) {
+    warnings.push("In.wav is missing from the dynamic cue folder. Panic recovery will announce only the target region.");
+  }
+
+  for (const song of Array.isArray(manifest?.songs) ? manifest.songs : []) {
+    const missingRegionNames = [...new Set((Array.isArray(song.regions) ? song.regions : [])
+      .map((region) => stringValue(region.name))
+      .filter(Boolean)
+      .filter((name) => !liveRegionCueCommands(name, wavs).length))];
+    if (missingRegionNames.length) {
+      warnings.push(`Slot ${song.slot}: ${missingRegionNames.slice(0, 8).join(", ")} region cue WAV${missingRegionNames.length === 1 ? " is" : "s are"} missing for repeat/Panic recovery.${missingRegionNames.length > 8 ? ` ${missingRegionNames.length - 8} more.` : ""}`);
+    }
+  }
+
+  return { errors, warnings };
+}
+
+async function padFolderReadiness(folderPath, filledSlots = []) {
+  const errors = [];
+  const warnings = [];
+  const folder = stringValue(folderPath);
+  if (!folder) {
+    errors.push("Pad folder is not configured. Dynamic pads cannot sound.");
+    return { errors, warnings };
+  }
+  let entries = [];
+  try {
+    entries = await readdir(folder, { withFileTypes: true });
+  } catch {
+    errors.push("Pad folder is unavailable. Dynamic pads cannot sound.");
+    return { errors, warnings };
+  }
+  const available = new Set(entries
+    .filter((entry) => entry.isFile() && entry.name.toLowerCase().endsWith(".wav"))
+    .map((entry) => padFileMatchKey(entry.name.replace(/\.wav$/i, "")))
+    .filter(Boolean));
+  const missingKeys = KEY_OPTIONS
+    .map((key) => padFileMatchKey(key))
+    .filter((key) => !available.has(key));
+  if (missingKeys.length) {
+    warnings.push(`Pad folder is missing ${missingKeys.join(", ")} pad WAV${missingKeys.length === 1 ? "" : "s"}. Songs in those keys will not have dynamic pad.`);
+  }
+  for (const slot of filledSlots) {
+    const key = padFileMatchKey(slot.padKey || slot.selectedKey || slot.key);
+    if (key && !available.has(key)) {
+      errors.push(`Slot ${slot.slot}: dynamic pad WAV for key ${slot.padKey || slot.selectedKey || slot.key} is missing.`);
+    }
+  }
+  return { errors, warnings };
 }
 
 async function checkDirectory(folderPath, label, errors) {
@@ -2242,9 +2876,10 @@ async function buildEngineManifest(confirmedSet) {
       : slotMetadata.dynamicCues;
     const dynamicPad = await dynamicPadManifestObject({
       folderPath: confirmedSet.settings.pads.folderPath,
-      songKey: slotMetadata.tempoMap.key || slot.key,
+      songKey: slotMetadata.padKey || slotMetadata.tempoMap.key || slot.key,
       mixer: dynamicPadMixer,
-      routingPreset
+      routingPreset,
+      settings: confirmedSet.settings.pads
     });
     songs.push({
       slot: slot.slot,
@@ -2291,6 +2926,7 @@ async function buildEngineManifest(confirmedSet) {
         solo: Boolean(dynamicCueMixer?.solo),
         routing: dynamicCueRouting
       },
+      pad: dynamicPad.pad,
       dynamicPad,
       stems: playbackStems
         .map((stem, index) => {
@@ -2329,15 +2965,22 @@ async function readSlotManifestMetadata(slot, settings) {
   const arrangement = await readJsonFile(join(slotDir, "arrangement.json"), {});
   const dynamicCueMap = await readJsonFile(join(slotDir, "dynamic-cue-map.json"), null);
   const songMetadata = slot.folderPath ? await readSongMetadata(slot.folderPath) : null;
+  const normalizedRegions = normalizeRegions(regions.regions || []);
+  const normalizedCues = normalizeCueMarkers(cues.cueMarkers || []);
+  const normalizedTempoMap = extendTempoMapForSongPositions(
+    normalizeTempoMap(tempoMap, slot),
+    songGridPositions(normalizedRegions, normalizedCues)
+  );
   return {
-    regions: normalizeRegions(regions.regions || []),
-    cueMarkers: normalizeCueMarkers(cues.cueMarkers || []),
-    tempoMap: normalizeTempoMap(tempoMap, slot),
+    regions: normalizedRegions,
+    cueMarkers: normalizedCues,
+    tempoMap: normalizedTempoMap,
+    padKey: stringValue(songMetadata?.padKey || songMetadata?.key || tempoMap.key || slot.key),
     mixer: normalizeMixer(mixer, slot),
     arrangement: normalizeArrangement(arrangement),
     dynamicClick: songMetadata?.dynamicClick || normalizeSongDynamicClick(null),
     dynamicCueMap,
-    dynamicCues: await buildDynamicCueManifest(cues.cueMarkers || [], settings.dynamicCue.folderPath, normalizeTempoMap(tempoMap, slot))
+    dynamicCues: await buildDynamicCueManifest(normalizedCues, settings.dynamicCue.folderPath, normalizedTempoMap)
   };
 }
 
@@ -2364,7 +3007,7 @@ function dynamicCueManifestEntry(cue, match, status, tempoMap) {
     cueName: cue.name,
     bar: cue.bar,
     beat: cue.beat,
-    triggerTimeSeconds: nonNegativeNumber(cue.triggerTimeSeconds) ?? timeForCueMarker(cue, tempoMap),
+    triggerTimeSeconds: timeForCueMarker(cue, tempoMap),
     status,
     filePath: match?.filePath || ""
   };
@@ -2372,25 +3015,12 @@ function dynamicCueManifestEntry(cue, match, status, tempoMap) {
 
 function dynamicCueSequenceEntries(cue, wavs, tempoMap) {
   const entries = [];
-  const numberedCue = numberedSectionCueParts(cue, wavs);
-  if (numberedCue) {
-    const cueTime = timeForCueMarker(cue, tempoMap);
-    entries.push(dynamicCueManifestEntry({
-      ...cue,
-      id: `${cue.id}-section`,
-      name: numberedCue.baseName,
-      triggerTimeSeconds: cueTime
-    }, numberedCue.baseMatch, "matched", tempoMap));
-    entries.push(dynamicCueManifestEntry({
-      ...cue,
-      id: `${cue.id}-number-${numberedCue.number}`,
-      name: numberedCue.numberName,
-      triggerTimeSeconds: cueTime + 0.55
-    }, numberedCue.numberMatch, "matched", tempoMap));
-  } else {
-    const sectionMatch = findCueWav(wavs, cue.name);
-    entries.push(dynamicCueManifestEntry(cue, sectionMatch, sectionMatch ? "matched" : "missing", tempoMap));
-  }
+  const sectionCue = sectionOnlyCueMatch(cue, wavs);
+  entries.push(dynamicCueManifestEntry({
+    ...cue,
+    name: sectionCue.name,
+    triggerTimeSeconds: timeForCueMarker(cue, tempoMap)
+  }, sectionCue.match, sectionCue.match ? "matched" : "missing", tempoMap));
 
   for (const countCue of countCueMarkersForSectionCue(cue, tempoMap)) {
     const match = findCueWav(wavs, countCue.name);
@@ -2398,6 +3028,19 @@ function dynamicCueSequenceEntries(cue, wavs, tempoMap) {
   }
 
   return entries;
+}
+
+function sectionCueInstruction(cueName) {
+  const text = stringValue(cueName).trim();
+  const match = text.match(/^(.+?)\s+([2-8]{1,7})$/);
+  if (!match) return { sectionName: text, counts: null };
+  const counts = [...match[2]]
+    .map((value) => Number(value))
+    .filter((value, index, values) => value >= 2 && value <= 8 && values.indexOf(value) === index);
+  return {
+    sectionName: match[1].trim() || text,
+    counts: counts.length ? counts : null
+  };
 }
 
 function numberedSectionCueParts(cue, wavs) {
@@ -2411,6 +3054,17 @@ function numberedSectionCueParts(cue, wavs) {
   const numberMatch = findCueWav(wavs, numberName);
   if (!baseMatch || !numberMatch) return null;
   return { baseName, number, numberName, baseMatch, numberMatch };
+}
+
+function sectionOnlyCueMatch(cue, wavs) {
+  const exactMatch = findCueWav(wavs, cue.name);
+  if (exactMatch) return { name: cue.name, match: exactMatch };
+  const instruction = sectionCueInstruction(cue.name);
+  if (!instruction.counts) return { name: cue.name, match: null };
+  const baseName = instruction.sectionName;
+  if (!baseName) return { name: cue.name, match: null };
+  const baseMatch = findCueWav(wavs, baseName);
+  return baseMatch ? { name: baseName, match: baseMatch } : { name: cue.name, match: null };
 }
 
 function findCueWav(wavs, cueName) {
@@ -2433,7 +3087,11 @@ function cueNumberWord(number) {
 function countCueMarkersForSectionCue(cue, tempoMap) {
   const signature = stringValue(tempoMap?.timeSignature || "4/4");
   const isSixEight = signature.startsWith("6/8");
-  const counts = isSixEight
+  const instruction = sectionCueInstruction(cue.name);
+  const explicitCounts = Array.isArray(instruction.counts) ? instruction.counts : null;
+  const counts = explicitCounts
+    ? explicitCounts.map((beat) => ({ beat, name: cueNumberNameForSignature(beat, signature) }))
+    : isSixEight
     ? [
         { beat: 4, name: "Four 6/8" },
         { beat: 5, name: "Five 6/8" },
@@ -2444,12 +3102,27 @@ function countCueMarkersForSectionCue(cue, tempoMap) {
         { beat: 3, name: "Three" },
         { beat: 4, name: "Four" }
       ];
+  const useSequentialOffsets = !explicitCounts && counts.some((count) => count.beat < (positiveNumber(cue.beat) || 1));
 
-  return counts.map((count) => ({
+  return counts.map((count, index) => ({
     id: `${cue.id}-count-${count.beat}`,
     name: count.name,
-    ...countCueGridPosition(cue, tempoMap, count.beat - 1)
+    ...countCueGridPosition(cue, tempoMap, countCueOffsetFromCue(cue, count.beat, index, useSequentialOffsets))
   }));
+}
+
+function countCueOffsetFromCue(cue, countBeat, countIndex = 0, useSequentialOffsets = false) {
+  if (useSequentialOffsets) return countIndex + 1;
+  const cueBeat = positiveNumber(cue.beat) || 1;
+  const beat = positiveNumber(countBeat) || 1;
+  const sameMeasureOffset = beat - cueBeat;
+  return sameMeasureOffset >= 0 ? sameMeasureOffset : beat - 1;
+}
+
+function cueNumberNameForSignature(number, signature) {
+  const word = cueNumberWord(number);
+  if (!word) return "";
+  return stringValue(signature).startsWith("6/8") ? `${word} 6/8` : word;
 }
 
 function countCueGridPosition(cue, tempoMap, offset) {
@@ -2484,13 +3157,11 @@ function cueMarkersForArrangement(cueMarkers, blocks, tempoMap, arrangement = {}
     const associated = associatedCueForArrangementBlock(cues, block, removedCueIds);
     if (associated) {
       usedCueIds.add(associated.id);
-      const rawCueTime = timeForCueMarker(associated, tempoMap);
       arranged.push({
         ...associated,
         id: `${associated.id}-${block.id}`,
         bar: Math.max(1, Number(block.startBar || 1) - 2),
-        beat: positiveNumber(associated.beat) || 1,
-        triggerTimeSeconds: Math.max(0, Number(block.arrangedStartSeconds || 0) - Math.max(0, Number(block.rawStartSeconds || 0) - rawCueTime))
+        beat: positiveNumber(associated.beat) || 1
       });
     }
     cues.forEach((cue) => {
@@ -2499,13 +3170,11 @@ function cueMarkersForArrangement(cueMarkers, blocks, tempoMap, arrangement = {}
       if (usedCueIds.has(cue.id)) return;
       const cueBar = positiveNumber(cue.bar) || 1;
       if (cueBar < block.rawStartBar || cueBar >= block.rawEndBar) return;
-      const rawCueTime = timeForCueMarker(cue, tempoMap);
       arranged.push({
         ...cue,
         id: `${cue.id}-${block.id}`,
         bar: Number(block.startBar || 1) + (cueBar - Number(block.rawStartBar || 1)),
-        beat: positiveNumber(cue.beat) || 1,
-        triggerTimeSeconds: Number(block.arrangedStartSeconds || 0) + Math.max(0, rawCueTime - Number(block.rawStartSeconds || 0))
+        beat: positiveNumber(cue.beat) || 1
       });
     });
   });
@@ -2654,20 +3323,37 @@ async function dynamicPadFilePath(folderPath, songKey) {
   return "";
 }
 
-async function dynamicPadManifestObject({ folderPath, songKey, mixer, routingPreset }) {
+async function dynamicPadManifestObject({ folderPath, songKey, mixer, routingPreset, settings = {} }) {
   const sourcePath = await dynamicPadFilePath(folderPath, songKey);
   const cached = sourcePath ? await cacheDynamicPadFile(sourcePath, songKey) : { filePath: "", status: "missing", error: "No matching pad WAV." };
   const routing = routeForStem(canonicalBus(mixer?.routeBus || "pads"), 0, routingPreset);
+  const mixerVolume = routing.outputChannels.length ? clampNumber(mixer?.volume, 0, 100, Math.round((settings.defaultVolume ?? 0.65) * 100)) : 0;
+  const pad = {
+    enabled: settings.defaultEnabled !== false,
+    padKey: stringValue(songKey),
+    source: "settings-pads-folder",
+    filePath: cached.filePath || sourcePath,
+    volume: mixerVolume / 100,
+    startWithSong: settings.startWithSong !== false,
+    continueAfterSong: settings.continueBetweenSongs !== false,
+    status: cached.status === "cached" || sourcePath ? "ready" : "missing"
+  };
   return {
+    enabled: pad.enabled,
+    key: pad.padKey,
     folderPath,
+    bus: "pads",
     sourcePath,
     filePath: cached.filePath || sourcePath,
+    fadeInMs: Math.max(0, Number(settings.fadeInMs) || 1500),
+    fadeOutMs: Math.max(0, Number(settings.fadeOutMs) || 2500),
     cacheStatus: cached.status,
     cacheError: cached.error || "",
     active: false,
-    volume: routing.outputChannels.length ? clampNumber(mixer?.volume, 0, 100, 80) : 0,
+    volume: mixerVolume,
     solo: Boolean(mixer?.solo),
-    routing
+    routing,
+    pad
   };
 }
 
@@ -2710,6 +3396,7 @@ function padFileMatchKey(value) {
   const tokens = text
     .split(/[^a-z#]+/g)
     .map((token) => token.replace(/(?:major|minor|maj|min)$/g, ""))
+    .map((token) => token.endsWith("#") ? `${token.slice(0, -1)}sharp` : token)
     .filter(Boolean);
   const validKeys = new Set(["a", "asharp", "bb", "b", "c", "csharp", "db", "d", "dsharp", "eb", "e", "f", "fsharp", "gb", "g", "gsharp", "ab"]);
   for (const token of tokens) {
@@ -2998,6 +3685,7 @@ async function handlePlaybackCommandLocked(command, payload = {}) {
     "stop",
     "fadeOut",
     "panic",
+    "togglePad",
     "exitPanic",
     "restart",
     "nextSong",
@@ -3009,7 +3697,10 @@ async function handlePlaybackCommandLocked(command, payload = {}) {
     "loopRegion",
     "goOnRegion",
     "clearRegionRepeat",
-    "triggerRepeatCue"
+    "triggerRepeatCue",
+    "triggerPanicRecoveryCue",
+    "selectSlot",
+    "songTransition"
   ]);
   const action = stringValue(command);
   if (!allowed.has(action)) {
@@ -3017,6 +3708,57 @@ async function handlePlaybackCommandLocked(command, payload = {}) {
   }
 
   const state = await loadPlaybackState();
+  let setlist = await loadCurrentSetlist();
+  if (action === "selectSlot") {
+    const targetSlotNumber = positiveNumber(payload.slot);
+    const targetSlot = (setlist.slots || []).find((slot) => Number(slot.slot) === targetSlotNumber && slot.songId);
+    const switchingActivePlayback = state.transport === "playing" && Number(state.currentSlot) !== targetSlotNumber;
+    if (!targetSlot || switchingActivePlayback) {
+      const rejected = normalizePlaybackState({
+        ...state,
+        lastCommand: action,
+        commandStatus: "rejected",
+        lastMessage: switchingActivePlayback
+          ? "Pause or stop before selecting another song."
+          : "No setlist song is available for selection.",
+        updatedAt: new Date().toISOString()
+      });
+      await savePlaybackState(rejected);
+      return {
+        state: await playbackStateSnapshot(),
+        command: action,
+        accepted: false,
+        reason: rejected.lastMessage,
+        engine: ENGINE_HELPER,
+        protocolVersion: ENGINE_PROTOCOL_VERSION,
+        nativeEngineConnected: Boolean(activePlaybackProcess)
+      };
+    }
+    const sameSlot = Number(state.currentSlot) === targetSlotNumber;
+    const nextState = normalizePlaybackState({
+      ...state,
+      currentSlot: targetSlotNumber,
+      currentTimeSeconds: sameSlot ? state.currentTimeSeconds : 0,
+      transportAnchorSeconds: sameSlot ? state.transportAnchorSeconds : 0,
+      transportStartedAt: state.transport === "playing" ? state.transportStartedAt : "",
+      activeRegionId: sameSlot ? state.activeRegionId : "",
+      liveRepeat: sameSlot ? state.liveRepeat : {},
+      transition: sameSlot ? state.transition : {},
+      lastCommand: action,
+      commandStatus: "accepted",
+      lastMessage: commandMessage(action, { ...payload, title: targetSlot.title }),
+      updatedAt: new Date().toISOString()
+    });
+    await savePlaybackState(nextState);
+    return {
+      state: await playbackStateSnapshot(),
+      command: action,
+      accepted: true,
+      engine: ENGINE_HELPER,
+      protocolVersion: ENGINE_PROTOCOL_VERSION,
+      nativeEngineConnected: Boolean(activePlaybackProcess)
+    };
+  }
   if (!payload.systemAction && state.transport === "playing" && isPlaybackInterruptCommand(action)) {
     const rejected = normalizePlaybackState({
       ...state,
@@ -3036,9 +3778,8 @@ async function handlePlaybackCommandLocked(command, payload = {}) {
       nativeEngineConnected: Boolean(activePlaybackProcess)
     };
   }
-  let setlist = await loadCurrentSetlist();
   const confirmed = state.confirmed && state.confirmedFingerprint === setFingerprint(setlist);
-  const requiresConfirmedSet = new Set(["play", "restart", "nextSong", "previousSong", "seek", "jumpRegion", "skipRegion", "repeatRegion", "loopRegion", "goOnRegion", "clearRegionRepeat", "triggerRepeatCue"]);
+  const requiresConfirmedSet = new Set(["play", "restart", "nextSong", "previousSong", "seek", "jumpRegion", "skipRegion", "repeatRegion", "loopRegion", "goOnRegion", "clearRegionRepeat", "triggerRepeatCue", "triggerPanicRecoveryCue", "togglePad", "songTransition"]);
   const requiresPerformanceGate = state.mode === "performance" && requiresConfirmedSet.has(action);
   if (requiresPerformanceGate && !confirmed) {
     const rejected = normalizePlaybackState({
@@ -3081,6 +3822,9 @@ async function handlePlaybackCommandLocked(command, payload = {}) {
       };
     }
   }
+  if (action === "songTransition") {
+    return applySetlistTransitionLocked(state, setlist, payload);
+  }
   const filledSlots = (setlist.slots || []).filter((slot) => slot.songId);
   const requestedSlot = positiveNumber(payload.slot);
   const baseSlot = action === "nextSong"
@@ -3089,6 +3833,51 @@ async function handlePlaybackCommandLocked(command, payload = {}) {
   const currentSlot = action === "previousSong"
     ? baseSlot || filledSlots[0]?.slot || null
     : nextCommandSlot(action, baseSlot, filledSlots);
+  if (state.panic?.active === true && (action === "panic" || (action === "exitPanic" && payload.systemAction !== true))) {
+    const queued = await queuePanicReleaseFromState(state, currentSlot || state.currentSlot, payload);
+    const nextState = normalizePlaybackState({
+      ...state,
+      currentSlot: currentSlot || state.currentSlot || positiveNumber(payload.slot),
+      panic: queued.panic,
+      lastCommand: action,
+      commandStatus: queued.ok ? "accepted" : "rejected",
+      lastMessage: queued.message,
+      updatedAt: new Date().toISOString()
+    });
+    await savePlaybackState(nextState);
+    return {
+      state: await playbackStateSnapshot(),
+      command: action,
+      accepted: queued.ok,
+      reason: queued.ok ? "" : queued.message,
+      engine: ENGINE_HELPER,
+      protocolVersion: ENGINE_PROTOCOL_VERSION,
+      nativeEngineConnected: Boolean(activePlaybackProcess)
+    };
+  }
+  if (state.panic?.active === true && action === "jumpRegion") {
+    const queued = await queuePanicReleaseFromState(state, currentSlot || state.currentSlot, payload);
+    const nextState = normalizePlaybackState({
+      ...state,
+      currentSlot: currentSlot || state.currentSlot || positiveNumber(payload.slot),
+      panic: queued.panic,
+      activeRegionId: stringValue(payload.regionId || state.activeRegionId),
+      lastCommand: action,
+      commandStatus: queued.ok ? "accepted" : "rejected",
+      lastMessage: queued.message,
+      updatedAt: new Date().toISOString()
+    });
+    await savePlaybackState(nextState);
+    return {
+      state: await playbackStateSnapshot(),
+      command: action,
+      accepted: queued.ok,
+      reason: queued.ok ? "" : queued.message,
+      engine: ENGINE_HELPER,
+      protocolVersion: ENGINE_PROTOCOL_VERSION,
+      nativeEngineConnected: Boolean(activePlaybackProcess)
+    };
+  }
   if (["play", "restart", "nextSong", "previousSong"].includes(action) && !currentSlot) {
     const rejected = normalizePlaybackState({
       ...state,
@@ -3109,9 +3898,15 @@ async function handlePlaybackCommandLocked(command, payload = {}) {
     };
   }
   let nativePlayback = { ok: true };
-  const resumesPausedPlay = action === "play" && state.transport === "paused" && activePlaybackProcess && activePlaybackProcess.slot === currentSlot;
-  const editPlayStartSeconds = action === "play" && state.mode === "edit" && !resumesPausedPlay
-    ? nonNegativeNumber(payload.startSeconds ?? payload.seconds)
+  const explicitEditStartSeconds = nonNegativeNumber(payload.startSeconds ?? payload.seconds);
+  const previousTimeSeconds = computedPlaybackTimeSeconds(state);
+  const resumesPausedPlay = action === "play"
+    && explicitEditStartSeconds === null
+    && state.transport === "paused"
+    && activePlaybackProcess
+    && activePlaybackProcess.slot === currentSlot;
+  const playStartSeconds = action === "play" && !resumesPausedPlay
+    ? explicitEditStartSeconds ?? (state.transport === "stopped" ? previousTimeSeconds : 0)
     : null;
   if (action === "play" && state.mode === "edit" && !resumesPausedPlay) {
     nativePlayback = await ensureEditPlaybackManifest(currentSlot);
@@ -3123,7 +3918,11 @@ async function handlePlaybackCommandLocked(command, payload = {}) {
       nativePlayback.response = { type: "playbackResumed", stemCount: null };
     } else {
       nativePlayback = await startNativeSlotPlayback(currentSlot, {
-        startSeconds: editPlayStartSeconds ?? 0
+        startSeconds: playStartSeconds ?? 0,
+        reuseActive: action === "play"
+          && state.transition?.status === "waiting-next"
+          && Number(state.transition?.toSlot) === Number(currentSlot)
+          && Boolean(activePlaybackProcess)
       });
     }
     if (!nativePlayback.ok) {
@@ -3153,11 +3952,56 @@ async function handlePlaybackCommandLocked(command, payload = {}) {
   if (action === "seek") {
     await sendNativePlaybackCommand("seek", { seconds: nonNegativeNumber(payload.seconds) ?? 0 });
   }
-  if (action === "triggerRepeatCue") {
-    const repeatCue = await repeatCueCommandPayload();
-    if (repeatCue.ok) {
-      await sendNativePlaybackCommand("triggerCue", repeatCue.command);
+  if (action === "exitPanic") {
+    const recoverySeconds = nonNegativeNumber(payload.targetSeconds ?? payload.recoveryTargetSeconds ?? payload.seekSeconds);
+    if (recoverySeconds !== null) {
+      await sendNativePlaybackCommand("seek", { seconds: recoverySeconds });
     }
+  }
+  if (action === "triggerRepeatCue") {
+    const repeatCue = await repeatCueCommandPayload(payload);
+    if (repeatCue.ok) {
+      const suppressStart = nonNegativeNumber(payload.suppressCueStartSeconds);
+      const suppressEnd = nonNegativeNumber(payload.suppressCueEndSeconds);
+      if (suppressStart !== null && suppressEnd !== null && suppressEnd > suppressStart) {
+        await sendNativePlaybackCommand("markDynamicCuesTriggeredBetween", {
+          startSeconds: suppressStart,
+          endSeconds: suppressEnd
+        });
+      }
+      for (const command of repeatCue.commands) {
+        await requestNativePlaybackCommand("triggerCue", command, { timeoutMs: 1500 });
+        await sleep(command.delayAfterMs ?? 520);
+      }
+    }
+  }
+  if (action === "triggerPanicRecoveryCue") {
+    const pendingRecovery = state.panic?.recoveryTarget;
+    const cueSeconds = nonNegativeNumber(pendingRecovery?.cueSeconds);
+    const recoveryCurrentSeconds = computedPlaybackTimeSeconds(state);
+    if (!pendingRecovery?.pending || cueSeconds === null || recoveryCurrentSeconds < cueSeconds - 0.1) {
+      const rejected = normalizePlaybackState({
+        ...state,
+        lastCommand: action,
+        commandStatus: "rejected",
+        lastMessage: "Panic recovery cue is not scheduled.",
+        updatedAt: new Date().toISOString()
+      });
+      await savePlaybackState(rejected);
+      return {
+        state: await playbackStateSnapshot(),
+        command: action,
+        accepted: false,
+        reason: rejected.lastMessage,
+        engine: ENGINE_HELPER,
+        protocolVersion: ENGINE_PROTOCOL_VERSION,
+        nativeEngineConnected: Boolean(activePlaybackProcess)
+      };
+    }
+    const liveSong = await activeManifestSong(currentSlot || state.currentSlot) || await liveMixerManifestSong(currentSlot || state.currentSlot);
+    payload.recoveryCue = liveSong
+      ? await triggerPanicRecoveryCue(liveSong, { ...payload, keepScheduledCuesSuppressed: true })
+      : { ok: false, regionName: stringValue(payload.regionName), error: "No live manifest song was available." };
   }
   if (action === "previousSong" && activePlaybackProcess && activePlaybackProcess.slot === currentSlot) {
     await sendNativePlaybackCommand("seek", { seconds: 0 });
@@ -3171,11 +4015,23 @@ async function handlePlaybackCommandLocked(command, payload = {}) {
   const panicRuntime = action === "panic"
     ? await enterPanicHold(currentSlot || state.currentSlot, payload.source || "operator")
     : action === "exitPanic"
-      ? await exitPanicHold(currentSlot || state.currentSlot, payload.source || "operator")
+      ? await exitPanicHold(currentSlot || state.currentSlot, payload.source || "operator", payload)
+    : action === "triggerPanicRecoveryCue" && state.panic?.recoveryTarget
+      ? normalizePanicRuntime({
+        ...state.panic,
+        recoveryTarget: {
+          ...state.panic.recoveryTarget,
+          cueFired: true
+        }
+      })
     : ["play", "stop", "fadeOut", "restart", "nextSong", "previousSong"].includes(action)
       ? normalizePanicRuntime({})
       : state.panic;
-  const liveRepeat = nextLiveRepeatState(action, state.liveRepeat, payload);
+  const padRuntime = await nextPadRuntimeState(action, state.pad, payload, currentSlot || state.currentSlot, setlist, panicRuntime);
+  const liveRepeatPayload = ["repeatRegion", "loopRegion"].includes(action)
+    ? { ...payload, repeatCuePlan: await liveRepeatCuePlanForCommand(currentSlot || state.currentSlot, payload) }
+    : payload;
+  const liveRepeat = nextLiveRepeatState(action, state.liveRepeat, liveRepeatPayload);
   const transportByCommand = {
     play: "playing",
     pause: "paused",
@@ -3183,19 +4039,23 @@ async function handlePlaybackCommandLocked(command, payload = {}) {
     fadeOut: "stopped",
     panic: state.transport === "playing" ? "playing" : "panic",
     exitPanic: state.transport === "panic" ? "playing" : state.transport,
-    restart: "playing"
+    restart: "playing",
+    nextSong: "playing"
   };
-  const previousTimeSeconds = computedPlaybackTimeSeconds(state);
   const nextTransport = transportByCommand[action] || state.transport || "stopped";
   const startsFromZero = ["restart", "nextSong", "previousSong"].includes(action)
-    || (action === "play" && !resumesPausedPlay);
-  const seekSeconds = action === "seek" ? nonNegativeNumber(payload.seconds) : null;
+    || (action === "play" && !resumesPausedPlay && playStartSeconds === null);
+  const seekSeconds = action === "seek"
+    ? nonNegativeNumber(payload.seconds)
+    : action === "exitPanic"
+      ? nonNegativeNumber(payload.targetSeconds ?? payload.recoveryTargetSeconds ?? payload.seekSeconds)
+      : null;
   const nextTimeSeconds = nextTransport === "stopped"
     ? 0
     : seekSeconds !== null
       ? seekSeconds
-      : editPlayStartSeconds !== null
-      ? editPlayStartSeconds
+      : playStartSeconds !== null
+      ? playStartSeconds
       : startsFromZero
       ? 0
       : previousTimeSeconds;
@@ -3205,6 +4065,7 @@ async function handlePlaybackCommandLocked(command, payload = {}) {
     currentSlot: currentSlot || state.currentSlot || positiveNumber(payload.slot),
     activeRegionId: stringValue(payload.regionId || state.activeRegionId),
     liveRepeat,
+    pad: padRuntime,
     panic: panicRuntime,
     lastCommand: action,
     commandStatus: "accepted",
@@ -3216,6 +4077,12 @@ async function handlePlaybackCommandLocked(command, payload = {}) {
     updatedAt: new Date().toISOString()
   });
   await savePlaybackState(nextState);
+  if (["play", "restart", "nextSong", "previousSong", "togglePad", "panic", "exitPanic", "stop", "fadeOut"].includes(action)) {
+    await applyLivePadState(nextState.currentSlot, nextState);
+  }
+  if (["panic", "exitPanic", "stop", "fadeOut", "restart", "nextSong", "previousSong"].includes(action)) {
+    await setLiveScheduledDynamicCuesSuppressed(nextState.currentSlot, nextState.panic?.active === true);
+  }
   const snapshot = await playbackStateSnapshot();
   return {
     state: snapshot,
@@ -3233,6 +4100,266 @@ function isPlaybackInterruptCommand(action) {
   return ["play", "restart", "nextSong", "previousSong", "fadeOut", "seek"].includes(action);
 }
 
+async function applySetlistTransitionLocked(state, setlist, payload = {}) {
+  const fromSlot = positiveNumber(payload.fromSlot || state.currentSlot);
+  const transition = transitionForFromSlot(setlist, fromSlot);
+  if (!transition) {
+    const blocked = normalizePlaybackState({
+      ...state,
+      lastCommand: "songTransition",
+      commandStatus: "rejected",
+      transition: {
+        active: false,
+        fromSlot,
+        status: "blocked",
+        message: "No transition is available for this slot."
+      },
+      lastMessage: "No transition is available for this slot.",
+      updatedAt: new Date().toISOString()
+    });
+    await savePlaybackState(blocked);
+    return {
+      state: await playbackStateSnapshot(),
+      command: "songTransition",
+      accepted: false,
+      reason: blocked.lastMessage,
+      engine: ENGINE_HELPER,
+      protocolVersion: ENGINE_PROTOCOL_VERSION,
+      nativeEngineConnected: Boolean(activePlaybackProcess)
+    };
+  }
+  const currentSlot = (setlist.slots || []).find((slot) => slot.slot === transition.fromSlot && slot.songId);
+  const nextSlot = (setlist.slots || []).find((slot) => slot.slot === transition.toSlot && slot.songId);
+  if (!currentSlot || !nextSlot) {
+    const blocked = normalizePlaybackState({
+      ...state,
+      transport: "stopped",
+      transition: {
+        ...transition,
+        active: false,
+        status: "blocked",
+        message: "Transition target song is missing."
+      },
+      lastCommand: "songTransition",
+      commandStatus: "rejected",
+      lastMessage: "Transition target song is missing.",
+      updatedAt: new Date().toISOString()
+    });
+    await stopNativePlayback();
+    await savePlaybackState(blocked);
+    return {
+      state: await playbackStateSnapshot(),
+      command: "songTransition",
+      accepted: false,
+      reason: blocked.lastMessage,
+      engine: ENGINE_HELPER,
+      protocolVersion: ENGINE_PROTOCOL_VERSION,
+      nativeEngineConnected: false
+    };
+  }
+
+  if (["crossfade", "overlap"].includes(transition.mode)) {
+    await stopNativePlayback({ fade: true, durationMs: 250 });
+    const blocked = normalizePlaybackState({
+      ...state,
+      transport: "stopped",
+      currentSlot: transition.fromSlot,
+      currentTimeSeconds: 0,
+      transportAnchorSeconds: 0,
+      transportStartedAt: "",
+      transition: {
+        ...transition,
+        active: false,
+        status: "blocked",
+        message: `${transition.mode} needs deeper engine support and is planned.`
+      },
+      lastCommand: "songTransition",
+      commandStatus: "rejected",
+      lastMessage: `${transition.mode} transition is planned but not enabled yet.`,
+      updatedAt: new Date().toISOString()
+    });
+    await savePlaybackState(blocked);
+    return {
+      state: await playbackStateSnapshot(),
+      command: "songTransition",
+      accepted: false,
+      reason: blocked.lastMessage,
+      engine: ENGINE_HELPER,
+      protocolVersion: ENGINE_PROTOCOL_VERSION,
+      nativeEngineConnected: false
+    };
+  }
+
+  const pad = transitionPadRuntime(transition, currentSlot, nextSlot);
+  let nativePlayback = { ok: true };
+  let transport = "stopped";
+  let currentSlotNumber = transition.mode === "stay" ? transition.fromSlot : transition.toSlot;
+  let status = transition.mode === "cue-next" ? "waiting-next" : "completed";
+  let message = transitionMessage(transition, currentSlot, nextSlot);
+  if (transition.mode === "autolink") {
+    nativePlayback = await startNativeSlotPlayback(transition.toSlot, { startSeconds: 0 });
+    if (!nativePlayback.ok) {
+      status = "blocked";
+      message = nativePlayback.error || `${transitionModeLabel(transition.mode)} could not start the next song.`;
+      transport = "stopped";
+      currentSlotNumber = transition.toSlot;
+    } else {
+      transport = "playing";
+    }
+  } else if (transition.mode === "cue-next") {
+    await applyTransitionPadHold(currentSlot, nextSlot, pad);
+  } else {
+    await stopNativePlayback();
+  }
+
+  const nextState = normalizePlaybackState({
+    ...state,
+    currentSlot: currentSlotNumber,
+    transport,
+    currentTimeSeconds: 0,
+    transportAnchorSeconds: 0,
+    transportStartedAt: transport === "playing" ? new Date().toISOString() : "",
+    liveRepeat: normalizeLiveRepeat({}),
+    pad,
+    panic: normalizePanicRuntime({}),
+    transition: {
+      ...transition,
+      active: transition.mode === "autolink" && transport === "playing",
+      startedAt: new Date().toISOString(),
+      status,
+      message
+    },
+    lastCommand: "songTransition",
+    commandStatus: status === "blocked" ? "rejected" : "accepted",
+    lastMessage: message,
+    updatedAt: new Date().toISOString()
+  });
+  await savePlaybackState(nextState);
+  if (transport === "playing") {
+    await applyLivePadState(nextState.currentSlot, nextState);
+  }
+  const snapshot = await playbackStateSnapshot();
+  return {
+    state: snapshot,
+    command: "songTransition",
+    accepted: status !== "blocked",
+    reason: status === "blocked" ? message : "",
+    engine: ENGINE_HELPER,
+    protocolVersion: ENGINE_PROTOCOL_VERSION,
+    nativeEngineConnected: Boolean(snapshot.readiness?.engine?.nativeEngineConnected),
+    nativePlaybackStarted: nativePlayback.response?.type === "playbackStarted"
+  };
+}
+
+function transitionForFromSlot(setlist, fromSlot) {
+  const normalized = normalizeSetlistTransitions(setlist?.transitions, setlist?.slots);
+  return normalized.find((transition) => transition.fromSlot === fromSlot) || null;
+}
+
+function transitionPadRuntime(transition, currentSlot, nextSlot) {
+  if (!transition.continuePad || transition.padBehavior === "off") {
+    return normalizePadRuntime({
+      active: false,
+      source: "transition",
+      updatedAt: new Date().toISOString()
+    });
+  }
+  const useNext = ["next-song-key", "crossfade-to-next-key"].includes(transition.padBehavior);
+  const slot = useNext ? nextSlot : currentSlot;
+  return normalizePadRuntime({
+    active: true,
+    slot: slot?.slot,
+    songId: slot?.songId,
+    padKey: slot?.padKey || slot?.key,
+    source: "transition",
+    updatedAt: new Date().toISOString()
+  });
+}
+
+function transitionMessage(transition, currentSlot, nextSlot) {
+  if (transition.mode === "stay") return `Transition Stay: ${currentSlot.title} stopped and remains selected.`;
+  if (transition.mode === "autolink") return `AutoLink: starting ${nextSlot.title}.`;
+  return `Cue Next: ${nextSlot.title} selected.`;
+}
+
+async function applyTransitionPadHold(currentSlot, nextSlot, padRuntime) {
+  if (!padRuntime?.active || activePlaybackProcess?.slot !== currentSlot?.slot) {
+    await stopNativePlayback();
+    return;
+  }
+  const settings = await loadSettings();
+  const currentLiveSong = await activeManifestSong(currentSlot.slot) || await liveMixerManifestSong(currentSlot.slot);
+  const nextLiveSong = await liveMixerManifestSong(nextSlot.slot);
+  if (!currentLiveSong || !nextLiveSong?.dynamicPad) {
+    await stopNativePlayback();
+    return;
+  }
+  await sendNativePlaybackCommand("setScheduledDynamicCuesSuppressed", { suppressed: true });
+  await sendNativePlaybackCommand("allowScheduledDynamicCuePrefix", { cueIdPrefix: "" });
+  await fadeTransitionPad({
+    currentLiveSong,
+    nextLiveSong,
+    fadeOutMs: transitionPadDelayMs(currentLiveSong, 2),
+    fadeInMs: settings.pads?.fadeInMs
+  });
+}
+
+async function fadeTransitionPad({ currentLiveSong, nextLiveSong, fadeOutMs = 1200, fadeInMs = 1500 }) {
+  const currentPad = currentLiveSong.dynamicPad || {};
+  const nextPad = nextLiveSong.dynamicPad || {};
+  const currentVolume = clampNumber(currentPad.volume, 0, 100, 65);
+  const nextVolume = clampNumber(nextPad.volume, 0, 100, 65);
+  const click = currentLiveSong.dynamicClick || null;
+  const cue = currentLiveSong.dynamicCue || null;
+  const fadeOutSteps = Math.max(1, Math.floor(Math.max(0, Number(fadeOutMs) || 0) / 50));
+  for (let step = 1; step <= fadeOutSteps; step += 1) {
+    const volume = currentVolume * (1 - (step / fadeOutSteps));
+    await sendNativePlaybackCommand("updateDynamicMixer", {
+      dynamicClick: click,
+      dynamicCue: cue,
+      dynamicPad: { ...currentPad, active: true, volume }
+    });
+    await sleep(50);
+  }
+
+  const sampleResult = await requestNativePlaybackCommand("updateDynamicPadSample", {
+    filePath: nextPad.filePath || nextPad.pad?.filePath || ""
+  }, { timeoutMs: 1500 });
+  if (!sampleResult.ok) {
+    await stopNativePlayback();
+    return;
+  }
+
+  const fadeInSteps = Math.max(1, Math.floor(Math.max(0, Number(fadeInMs) || 0) / 50));
+  for (let step = 1; step <= fadeInSteps; step += 1) {
+    const volume = nextVolume * (step / fadeInSteps);
+    await sendNativePlaybackCommand("updateDynamicMixer", {
+      dynamicClick: click,
+      dynamicCue: cue,
+      dynamicPad: { ...nextPad, active: true, volume }
+    });
+    await sleep(50);
+  }
+}
+
+function transitionPadDelayMs(liveSong, beats = 2) {
+  const beatGrid = Array.isArray(liveSong?.tempoMap?.beatGrid) ? liveSong.tempoMap.beatGrid : [];
+  const intervals = [];
+  for (let index = Math.max(1, beatGrid.length - 10); index < beatGrid.length; index += 1) {
+    const previous = nonNegativeNumber(beatGrid[index - 1]?.timeSeconds);
+    const current = nonNegativeNumber(beatGrid[index]?.timeSeconds);
+    if (previous !== null && current !== null && current > previous) {
+      intervals.push(current - previous);
+    }
+  }
+  const beatSeconds = intervals.length
+    ? intervals.sort((a, b) => a - b)[Math.floor(intervals.length / 2)]
+    : positiveNumber(liveSong?.tempoMap?.bpm)
+      ? 60 / positiveNumber(liveSong.tempoMap.bpm)
+      : 0.75;
+  return Math.max(150, Math.round(beatSeconds * Math.max(1, Number(beats) || 2) * 1000));
+}
+
 function nextLiveRepeatState(action, current, payload = {}) {
   const existing = normalizeLiveRepeat(current);
   if (action === "repeatRegion") {
@@ -3240,7 +4367,8 @@ function nextLiveRepeatState(action, current, payload = {}) {
       mode: "once",
       regionId: payload.regionId,
       regionName: payload.regionName,
-      queued: true
+      queued: true,
+      repeatCuePlan: payload.repeatCuePlan
     });
   }
   if (action === "loopRegion") {
@@ -3248,18 +4376,117 @@ function nextLiveRepeatState(action, current, payload = {}) {
       mode: "loop",
       regionId: payload.regionId,
       regionName: payload.regionName,
-      queued: true
+      queued: true,
+      repeatCuePlan: payload.repeatCuePlan
     });
   }
   if (action === "goOnRegion" && existing.mode === "loop") {
     return normalizeLiveRepeat({
       ...existing,
       releaseRequested: !payload.deferRelease,
-      releaseAfterNextPass: Boolean(payload.deferRelease)
+      releaseAfterNextPass: Boolean(payload.deferRelease),
+      actionInFlight: false
+    });
+  }
+  if (action === "triggerRepeatCue" && existing.mode) {
+    return normalizeLiveRepeat({
+      ...existing,
+      cueFired: true
+    });
+  }
+  if (action === "seek" && existing.mode) {
+    return normalizeLiveRepeat({
+      ...existing,
+      cueFired: false,
+      actionInFlight: false
     });
   }
   if (["stop", "fadeOut", "panic", "restart", "nextSong", "previousSong", "clearRegionRepeat"].includes(action)) {
     return normalizeLiveRepeat({});
+  }
+  return existing;
+}
+
+async function liveRepeatCuePlanForCommand(slotNumber, payload = {}) {
+  const liveSong = await activeManifestSong(slotNumber) || await liveMixerManifestSong(slotNumber);
+  if (!liveSong) return null;
+  const regions = normalizeRegions(Array.isArray(liveSong.regions) ? liveSong.regions : []);
+  const regionId = stringValue(payload.regionId);
+  const regionName = stringValue(payload.regionName);
+  const region = regionId
+    ? regions.find((item) => item.id === regionId)
+    : regions.find((item) => sameText(item.name, regionName));
+  if (!region) return null;
+  const beatGrid = Array.isArray(liveSong.tempoMap?.beatGrid) ? liveSong.tempoMap.beatGrid : [];
+  if (!beatGrid.length) return null;
+  const startSeconds = timeForBarBeatServer(liveSong.tempoMap, region.startBar, region.startBeat);
+  const endSeconds = timeForBarBeatServer(liveSong.tempoMap, region.endBar, region.endBeat);
+  const boundaryIndex = beatGrid.findIndex((beat) => Number(beat.timeSeconds || 0) >= endSeconds - 0.0001);
+  const endIndex = boundaryIndex < 0 ? beatGrid.length : boundaryIndex;
+  const cueBeat = beatGrid[endIndex - 8];
+  if (!cueBeat) return null;
+  const repeatedCueBeat = beatGrid[endIndex - 6] || cueBeat;
+  const suppressStart = beatGrid[endIndex - 4];
+  const suppressEnd = beatGrid[endIndex - 3];
+  const triggerSeconds = nonNegativeNumber(cueBeat.timeSeconds);
+  const repeatedCueSeconds = nonNegativeNumber(repeatedCueBeat.timeSeconds) ?? triggerSeconds;
+  if (triggerSeconds === null) return null;
+  return normalizeRepeatCuePlan({
+    triggerSeconds,
+    startSeconds,
+    endSeconds,
+    repeatedCueDelayMs: Math.max(0, Math.round((repeatedCueSeconds - triggerSeconds) * 1000)),
+    suppressCueStartSeconds: nonNegativeNumber(suppressStart?.timeSeconds),
+    suppressCueEndSeconds: suppressStart && suppressEnd
+      ? Math.max(Number(suppressStart.timeSeconds || 0) + 0.25, Number(suppressEnd.timeSeconds || 0) - 0.05)
+      : null,
+    generatedAt: new Date().toISOString()
+  });
+}
+
+async function nextPadRuntimeState(action, current, payload, slotNumber, setlist, panicRuntime) {
+  const existing = normalizePadRuntime(current);
+  const slot = (setlist.slots || []).find((item) => item.slot === slotNumber && item.songId);
+  const settings = await loadSettings();
+  if (action === "togglePad") {
+    const active = payload.active === undefined ? !existing.active : Boolean(payload.active);
+    return normalizePadRuntime({
+      active,
+      slot: slot?.slot || slotNumber,
+      songId: slot?.songId,
+      padKey: slot?.padKey || slot?.key,
+      source: "operator",
+      updatedAt: new Date().toISOString()
+    });
+  }
+  if (["stop", "fadeOut"].includes(action)) {
+    return normalizePadRuntime({
+      ...existing,
+      active: panicRuntime?.active === true || (existing.active && settings.pads?.continueBetweenSongs === true),
+      updatedAt: new Date().toISOString()
+    });
+  }
+  if (["play", "restart", "nextSong", "previousSong"].includes(action)) {
+    const shouldStart = settings.pads?.defaultEnabled !== false && settings.pads?.startWithSong !== false;
+    return normalizePadRuntime({
+      active: shouldStart || existing.active,
+      slot: slot?.slot || slotNumber,
+      songId: slot?.songId,
+      padKey: slot?.padKey || slot?.key,
+      source: shouldStart ? "startWithSong" : existing.source,
+      updatedAt: new Date().toISOString()
+    });
+  }
+  if (action === "panic") {
+    return normalizePadRuntime({
+      ...existing,
+      active: true,
+      slot: slot?.slot || slotNumber,
+      songId: slot?.songId,
+      padKey: slot?.padKey || slot?.key,
+      source: "panic",
+      updatedAt: new Date().toISOString()
+    });
   }
   return existing;
 }
@@ -3275,13 +4502,24 @@ function nextCommandSlot(action, currentSlot, filledSlots) {
 }
 
 function commandMessage(action, payload) {
+  const recoveryCue = payload.recoveryCue || null;
+  const recoveryCueMessage = recoveryCue
+      ? recoveryCue.ok
+      ? recoveryCue.skipped
+        ? " Recovery cue skipped because the cue point already passed."
+        : recoveryCue.alreadyTriggered
+        ? " Recovery cue already fired."
+        : ` Recovery cue fired: ${(recoveryCue.triggered || []).join(", ") || recoveryCue.regionName}.`
+      : ` Recovery cue failed: ${recoveryCue.error || "unknown error"}.`
+    : "";
   const labels = {
     play: "Play command queued.",
     pause: "Pause command queued.",
     stop: "Stop command queued.",
     fadeOut: "Fade out then stop command queued.",
-    panic: "Panic hold active. Tracks down, click and cues alive.",
-    exitPanic: "Panic recovery active. Tracks fading back in, pad fading out.",
+    togglePad: "Pad toggle queued.",
+    panic: "Panic hold active. Tracks down, click alive, scheduled cues suppressed.",
+    exitPanic: `Panic recovery${payload.regionName ? ` to ${payload.regionName}` : ""}.${recoveryCueMessage} Tracks fading back in, pad fading out.`,
     restart: "Restart command queued.",
     nextSong: "Next song command queued.",
     previousSong: "Return to song start queued.",
@@ -3292,12 +4530,14 @@ function commandMessage(action, payload) {
     loopRegion: `Loop${payload.regionName ? ` ${payload.regionName}` : " region"} until next action command queued.`,
     goOnRegion: "Go On queued at the end of the current loop.",
     clearRegionRepeat: "Region repeat cleared.",
-    triggerRepeatCue: "Repeat cue triggered."
+    triggerRepeatCue: "Repeat cue triggered.",
+    triggerPanicRecoveryCue: `Recovery cue triggered${payload.regionName ? ` for ${payload.regionName}` : ""}.${recoveryCueMessage}`,
+    selectSlot: `Selected ${payload.title || "setlist song"}.`
   };
   return labels[action] || `${action} command queued.`;
 }
 
-async function repeatCueCommandPayload() {
+async function repeatCueCommandPayload(payload = {}) {
   const settings = await loadSettings();
   const folderPath = stringValue(settings.dynamicCue?.folderPath);
   if (!folderPath) return { ok: false, error: "Dynamic cue folder is not configured." };
@@ -3307,19 +4547,69 @@ async function repeatCueCommandPayload() {
   } catch {
     return { ok: false, error: "Dynamic cue folder is unavailable." };
   }
-  const match = entries
+  const wavs = entries
     .filter((entry) => entry.isFile() && entry.name.toLowerCase().endsWith(".wav"))
-    .map((entry) => ({ name: entry.name, filePath: join(folderPath, entry.name), key: cueMatchKey(entry.name.replace(/\.wav$/i, "")) }))
-    .find((entry) => entry.key === cueMatchKey("Repeat"));
+    .map((entry) => ({ name: entry.name, filePath: join(folderPath, entry.name), key: cueMatchKey(entry.name.replace(/\.wav$/i, "")) }));
+  const match = findCueWav(wavs, "Repeat");
   if (!match) return { ok: false, error: "Repeat.wav was not found in the dynamic cue folder." };
+  const regionName = stringValue(payload.regionName).trim();
+  const regionCue = regionName ? liveRegionCueCommands(regionName, wavs) : [];
+  const repeatedCueDelayMs = Math.max(0, Math.min(3000, Number(payload.repeatedCueDelayMs || 0)));
   return {
     ok: true,
-    command: {
-      cueId: "live-repeat",
-      cueName: "Repeat",
-      filePath: match.filePath
-    }
+    commands: [
+      {
+        cueId: "live-repeat",
+        cueName: "Repeat",
+        filePath: match.filePath,
+        delayAfterMs: regionCue.length ? repeatedCueDelayMs : 500
+      },
+      ...regionCue
+    ]
   };
+}
+
+async function recoveryCueCommandPayload(regionName) {
+  const settings = await loadSettings();
+  const folderPath = stringValue(settings.dynamicCue?.folderPath);
+  if (!folderPath) return { ok: false, commands: [], error: "Dynamic cue folder is not configured." };
+  let entries = [];
+  try {
+    entries = await readdir(folderPath, { withFileTypes: true });
+  } catch {
+    return { ok: false, commands: [], error: "Dynamic cue folder is unavailable." };
+  }
+  const wavs = entries
+    .filter((entry) => entry.isFile() && entry.name.toLowerCase().endsWith(".wav"))
+    .map((entry) => ({ name: entry.name, filePath: join(folderPath, entry.name), key: cueMatchKey(entry.name.replace(/\.wav$/i, "")) }));
+  const intro = findCueWav(wavs, "In");
+  const regionCue = liveRegionCueCommands(regionName, wavs);
+  const commands = [];
+  if (intro) {
+    commands.push({
+      cueId: "panic-recovery-in",
+      cueName: "In",
+      filePath: intro.filePath,
+      delayAfterMs: regionCue.length ? 220 : 500
+    });
+  }
+  commands.push(...regionCue.map((command) => ({
+    ...command,
+    cueId: `panic-recovery-${command.cueId}`,
+    delayAfterMs: command.delayAfterMs ?? 650
+  })));
+  return {
+    ok: commands.length > 0,
+    commands
+  };
+}
+
+function liveRegionCueCommands(regionName, wavs) {
+  const cue = { id: `live-repeat-${cueMatchKey(regionName)}`, name: regionName };
+  const sectionCue = sectionOnlyCueMatch(cue, wavs);
+  return sectionCue.match
+    ? [{ cueId: cue.id, cueName: sectionCue.name, filePath: sectionCue.match.filePath, delayAfterMs: 650 }]
+    : [];
 }
 
 async function readCurrentSetMetadata() {
@@ -3373,19 +4663,53 @@ async function saveSlotMetadata(slotNumber, metadata) {
   await mkdir(slotDir, { recursive: true });
   const regions = normalizeRegions(metadata.regions?.regions || metadata.regions || []);
   const cueMarkers = normalizeCueMarkers(metadata.cues?.cueMarkers || metadata.cueMarkers || []);
-  const tempoMap = normalizeTempoMap(metadata.tempoMap || {}, slot);
+  const tempoMap = extendTempoMapForSongPositions(
+    normalizeTempoMap(metadata.tempoMap || {}, slot),
+    songGridPositions(regions, cueMarkers)
+  );
   const mixer = normalizeMixer(metadata.mixer || {}, slot);
   const arrangement = normalizeArrangement(metadata.arrangement || {});
 
-  await writeFile(join(slotDir, "regions.json"), `${JSON.stringify({ regions }, null, 2)}\n`, "utf8");
-  await writeFile(join(slotDir, "cue-markers.json"), `${JSON.stringify({ cueMarkers, dynamicCueMatching: "fuzzy-name" }, null, 2)}\n`, "utf8");
+  const savedAt = new Date().toISOString();
+  await writeFile(join(slotDir, "regions.json"), `${JSON.stringify({
+    regions,
+    source: "operator-working-draft",
+    updatedAt: savedAt
+  }, null, 2)}\n`, "utf8");
+  await writeFile(join(slotDir, "cue-markers.json"), `${JSON.stringify({
+    cueMarkers,
+    dynamicCueMatching: "fuzzy-name",
+    source: "operator-working-draft",
+    updatedAt: savedAt
+  }, null, 2)}\n`, "utf8");
   await writeFile(join(slotDir, "tempo-map.json"), `${JSON.stringify(tempoMap, null, 2)}\n`, "utf8");
   await writeFile(join(slotDir, "mixer.json"), `${JSON.stringify(mixer, null, 2)}\n`, "utf8");
   await writeFile(join(slotDir, "arrangement.json"), `${JSON.stringify(arrangement, null, 2)}\n`, "utf8");
-  await saveSongDefaultRegionCueMetadata(slot, regions, cueMarkers);
   await renderArrangementCacheForSlot(slot, { regions, cueMarkers, tempoMap, arrangement, mixer });
   await markSetUnconfirmed(setlist);
   return readCurrentSetMetadata();
+}
+
+async function approveSlotCueRegionMetadata(slotNumber) {
+  const state = await playbackStateSnapshot();
+  if (state.mode === "performance") {
+    throw new Error("Cue/region approval is locked in Performance mode.");
+  }
+  const setlist = await loadCurrentSetlist();
+  const slot = setlist.slots.find((item) => item.slot === slotNumber && item.songId);
+  if (!slot) throw new Error(`Setlist slot ${slotNumber} is empty.`);
+  const slotDir = join(SET_METADATA_DIR, `slot-${String(slotNumber).padStart(2, "0")}`);
+  const regions = normalizeRegions((await readJsonFile(join(slotDir, "regions.json"), { regions: [] })).regions || []);
+  const cueMarkers = normalizeCueMarkers((await readJsonFile(join(slotDir, "cue-markers.json"), { cueMarkers: [] })).cueMarkers || []);
+  await saveApprovedSongRegionCueMetadata(slot, regions, cueMarkers);
+  return {
+    ok: true,
+    slot: slotNumber,
+    songId: slot.songId,
+    approvedAt: new Date().toISOString(),
+    cueCount: cueMarkers.length,
+    regionCount: regions.length
+  };
 }
 
 async function applySlotAudioShift(slotNumber, shiftSeconds) {
@@ -3417,20 +4741,25 @@ async function applySlotAudioShift(slotNumber, shiftSeconds) {
   };
 }
 
-async function saveSongDefaultRegionCueMetadata(slot, regions, cueMarkers) {
+async function saveApprovedSongRegionCueMetadata(slot, regions, cueMarkers) {
   if (!slot.folderPath) return;
-  const metadataDir = appSongMetadataDir(slot.folderPath);
-  await mkdir(metadataDir, { recursive: true });
-  await writeFile(appDefaultRegionsPath(slot.folderPath), `${JSON.stringify({
+  const overrideDir = appSongOverridesDir(slot.songId);
+  await mkdir(overrideDir, { recursive: true });
+  const approvedAt = new Date().toISOString();
+  await writeFile(appApprovedRegionsPath(slot.songId), `${JSON.stringify({
     regions,
-    source: "editor-autosave",
-    updatedAt: new Date().toISOString()
+    source: "operator-approved",
+    approved: true,
+    approvedAt,
+    updatedAt: approvedAt
   }, null, 2)}\n`, "utf8");
-  await writeFile(appDefaultCueMarkersPath(slot.folderPath), `${JSON.stringify({
+  await writeFile(appApprovedCueMarkersPath(slot.songId), `${JSON.stringify({
     cueMarkers,
     dynamicCueMatching: "fuzzy-name",
-    source: "editor-autosave",
-    updatedAt: new Date().toISOString()
+    source: "operator-approved",
+    approved: true,
+    approvedAt,
+    updatedAt: approvedAt
   }, null, 2)}\n`, "utf8");
 }
 
@@ -3447,7 +4776,11 @@ async function readArrangementCacheManifest(slot) {
 
 async function renderArrangementCacheForSlot(slot, metadata) {
   const arrangement = normalizeArrangement(metadata.arrangement || {});
-  const hasArrangement = arrangement.enabled !== false && (arrangement.blocks.length || arrangement.cuts.length);
+  const hasSongTrim = (positiveNumber(arrangement.trimStartBar) || 1) > 1
+    || positiveNumber(arrangement.trimEndBar)
+    || nonNegativeNumber(arrangement.trimStartSeconds)
+    || nonNegativeNumber(arrangement.trimEndSeconds);
+  const hasArrangement = arrangement.enabled !== false && (arrangement.blocks.length || arrangement.cuts.length || hasSongTrim);
   const cacheDir = arrangementCacheSlotDir(slot.slot);
   if (!hasArrangement) {
     await rm(cacheDir, { recursive: true, force: true });
@@ -3523,6 +4856,10 @@ function arrangementBlocksForRender(slot, regions, arrangement, tempoMap) {
   if (!orderedRegions.length) return [];
   const sourceBlocks = arrangement.blocks.length ? arrangement.blocks : orderedRegions.map((region) => ({ regionId: region.id }));
   const activeCuts = arrangement.blocks.length ? [] : arrangement.cuts;
+  const trimStartBar = positiveNumber(arrangement.trimStartBar) || 1;
+  const trimEndBar = positiveNumber(arrangement.trimEndBar);
+  const trimStartSeconds = nonNegativeNumber(arrangement.trimStartSeconds) ?? 0;
+  const trimEndSeconds = nonNegativeNumber(arrangement.trimEndSeconds);
   let cursor = 1;
   let arrangedSeconds = 0;
   return sourceBlocks.map((block, index) => {
@@ -3530,11 +4867,22 @@ function arrangementBlocksForRender(slot, regions, arrangement, tempoMap) {
     if (!region) return null;
     const regionStartBar = positiveNumber(region.startBar) || 1;
     const regionEndBar = Math.max(regionStartBar + 1, positiveNumber(region.endBar) || regionStartBar + 1);
-    const rawStartBar = Math.max(regionStartBar, positiveNumber(block.trimStartBar) || regionStartBar);
-    const rawEndBar = Math.min(regionEndBar, Math.max(rawStartBar + 1, positiveNumber(block.trimEndBar) || regionEndBar));
+    const rawStartBar = Math.max(regionStartBar, trimStartBar, positiveNumber(block.trimStartBar) || regionStartBar);
+    const useMeasureEndTrim = Boolean(trimEndBar && trimEndSeconds === null);
+    const rawEndBar = Math.min(regionEndBar, useMeasureEndTrim ? trimEndBar : regionEndBar, Math.max(rawStartBar + 1, positiveNumber(block.trimEndBar) || regionEndBar));
+    if (rawEndBar <= rawStartBar) return null;
     if (activeCuts.some((cut) => rawStartBar >= cut.startBar && rawEndBar <= cut.endBar)) return null;
-    const rawStartSeconds = timeForBarBeatServer(tempoMap, rawStartBar, positiveNumber(region.startBeat) || 1);
-    const rawEndSeconds = timeForBarBeatServer(tempoMap, rawEndBar, positiveNumber(region.endBeat) || 1);
+    const blockStartSeconds = timeForBarBeatServer(tempoMap, rawStartBar, positiveNumber(region.startBeat) || 1);
+    const blockEndSeconds = timeForBarBeatServer(tempoMap, rawEndBar, positiveNumber(region.endBeat) || 1);
+    const blockTrimStartSeconds = nonNegativeNumber(block.trimStartSeconds);
+    const blockTrimEndSeconds = nonNegativeNumber(block.trimEndSeconds);
+    const rawStartSeconds = Math.max(blockStartSeconds, trimStartSeconds, blockTrimStartSeconds ?? 0);
+    const rawEndSeconds = Math.min(
+      blockEndSeconds,
+      trimEndSeconds !== null ? trimEndSeconds : blockEndSeconds,
+      blockTrimEndSeconds !== null ? blockTrimEndSeconds : blockEndSeconds
+    );
+    if (rawEndSeconds <= rawStartSeconds) return null;
     const length = Math.max(1, rawEndBar - rawStartBar);
     const duration = Math.max(0, rawEndSeconds - rawStartSeconds);
     const arranged = {
@@ -3715,7 +5063,7 @@ async function saveSlotMixer(slotNumber, value) {
     await sendNativePlaybackCommand("updateDynamicMixer", {
       dynamicClick: liveSong?.dynamicClick || null,
       dynamicCue: liveSong?.dynamicCue || null,
-      dynamicPad: { ...(liveSong?.dynamicPad || {}), active: playbackState.panic?.active === true }
+      dynamicPad: { ...(liveSong?.dynamicPad || {}), active: playbackState.panic?.active === true || playbackState.pad?.active === true }
     });
   }
   return readCurrentSetMetadata();
@@ -3743,7 +5091,7 @@ async function applyLiveMixerUpdate(slotNumber, value) {
   await sendNativePlaybackCommand("updateDynamicMixer", {
     dynamicClick: dynamic.dynamicClick,
     dynamicCue: dynamic.dynamicCue,
-    dynamicPad: { ...dynamic.dynamicPad, active: playbackState.panic?.active === true }
+    dynamicPad: { ...dynamic.dynamicPad, active: playbackState.panic?.active === true || playbackState.pad?.active === true }
   });
   return { ok: true, active: true, slot: slotNumber };
 }
@@ -3758,9 +5106,10 @@ async function liveDynamicMixerObjects(slot, mixer, routingPreset, settings) {
   const songMetadata = slot.folderPath ? await readSongMetadata(slot.folderPath) : null;
   const dynamicPad = await dynamicPadManifestObject({
     folderPath: settings.pads.folderPath,
-    songKey: slot.key,
+    songKey: slot.padKey || slot.key,
     mixer: dynamicPadMixer,
-    routingPreset
+    routingPreset,
+    settings: settings.pads
   });
   return {
     dynamicClick: {
@@ -3782,9 +5131,28 @@ async function liveDynamicMixerObjects(slot, mixer, routingPreset, settings) {
   };
 }
 
+async function setLiveScheduledDynamicCuesSuppressed(slotNumber, suppressed) {
+  if (!slotNumber || activePlaybackProcess?.slot !== slotNumber) return;
+  await sendNativePlaybackCommand("setScheduledDynamicCuesSuppressed", { suppressed: Boolean(suppressed) });
+}
+
+async function applyLivePadState(slotNumber, playbackState = null) {
+  if (!slotNumber || activePlaybackProcess?.slot !== slotNumber) return;
+  const liveSong = await activeManifestSong(slotNumber) || await liveMixerManifestSong(slotNumber);
+  if (!liveSong) return;
+  const state = playbackState || await loadPlaybackState();
+  const active = state.panic?.active === true || state.pad?.active === true;
+  await sendNativePlaybackCommand("updateDynamicMixer", {
+    dynamicClick: liveSong.dynamicClick || null,
+    dynamicCue: liveSong.dynamicCue || null,
+    dynamicPad: { ...(liveSong.dynamicPad || {}), active }
+  });
+}
+
 async function enterPanicHold(slotNumber, source = "operator") {
   const liveSong = await activeManifestSong(slotNumber) || await liveMixerManifestSong(slotNumber);
   if (activePlaybackProcess?.slot === slotNumber && liveSong) {
+    await setLiveScheduledDynamicCuesSuppressed(slotNumber, true);
     await sendNativePlaybackCommand("updateDynamicMixer", {
       dynamicClick: liveSong.dynamicClick || null,
       dynamicCue: liveSong.dynamicCue || null,
@@ -3798,17 +5166,46 @@ async function enterPanicHold(slotNumber, source = "operator") {
     state: PANIC_STATES.PANIC_HOLD,
     active: true,
     label: "Panic Active",
-    detail: "Tracks Down / Click Alive",
+    detail: "Tracks Down / Click Alive / Scheduled Cues Suppressed",
+    startedAt: new Date().toISOString(),
+    slot: slotNumber,
+    songId: stringValue(liveSong?.songId),
+    heldPadKey: stringValue(liveSong?.dynamicPad?.key || liveSong?.pad?.padKey || liveSong?.tempoMap?.key),
+    tracksMuted: true,
+    clickMuted: false,
+    cueMuted: false,
+    recoveryTarget: null,
     trackTargetDb: PANIC_TRACK_TARGET_DB,
     source,
     updatedAt: new Date().toISOString()
   };
 }
 
-async function exitPanicHold(slotNumber, source = "operator") {
+async function exitPanicHold(slotNumber, source = "operator", payload = {}) {
   const liveSong = await activeManifestSong(slotNumber) || await liveMixerManifestSong(slotNumber);
+  const state = await loadPlaybackState();
+  const recoveryRegion = recoveryRegionFromPayload(liveSong, payload, computedPlaybackTimeSeconds(state));
+  if (recoveryRegion?.name) {
+    payload.regionId = recoveryRegion.id || payload.regionId || "";
+    payload.regionName = recoveryRegion.name;
+    if (payload.targetSeconds === undefined && Number.isFinite(recoveryRegion.startSeconds)) {
+      payload.targetSeconds = recoveryRegion.startSeconds;
+    }
+  }
   if (activePlaybackProcess?.slot === slotNumber && liveSong) {
-    await fadeRecoverLiveMusicAndPad(liveSong, PANIC_RECOVERY_FADE_MS);
+    payload.recoveryCue = payload.recoveryCueAlreadyTriggered
+      ? { ok: true, regionName: stringValue(payload.regionName), triggered: [], alreadyTriggered: !payload.recoveryCueSkipped, skipped: Boolean(payload.recoveryCueSkipped) }
+      : { ok: true, regionName: stringValue(payload.regionName), triggered: [], skipped: true };
+    await sendNativePlaybackCommand("setScheduledDynamicCuesSuppressed", { suppressed: false });
+    await sendNativePlaybackCommand("allowScheduledDynamicCuePrefix", { cueIdPrefix: "" });
+    fadeRecoverLiveMusicAndPad(liveSong, PANIC_RECOVERY_FADE_MS)
+      .catch((error) => console.warn(`[panic-recovery] fade restore failed: ${error.message}`));
+  } else {
+    payload.recoveryCue = {
+      ok: false,
+      regionName: stringValue(payload.regionName),
+      error: activePlaybackProcess?.slot === slotNumber ? "No live manifest song was available." : "No active playback engine was running for this slot."
+    };
   }
   return {
     state: PANIC_STATES.NORMAL,
@@ -3825,6 +5222,159 @@ async function activeManifestSong(slotNumber) {
   const manifest = await readJsonFile(ENGINE_MANIFEST_FILE, null);
   if (!manifest || !Array.isArray(manifest.songs)) return null;
   return manifest.songs.find((song) => song.slot === slotNumber) || null;
+}
+
+function recoveryRegionFromPayload(liveSong, payload = {}, fallbackCurrentSeconds = null) {
+  const regions = normalizeRegions(Array.isArray(liveSong?.regions)
+    ? liveSong.regions
+    : Array.isArray(liveSong?.regions?.regions)
+      ? liveSong.regions.regions
+      : []);
+  if (!regions.length) {
+    const name = stringValue(payload.regionName);
+    return name ? { id: stringValue(payload.regionId), name } : null;
+  }
+
+  const targetSeconds = nonNegativeNumber(payload.targetSeconds ?? payload.recoveryTargetSeconds);
+  if (targetSeconds !== null) {
+    const starts = recoveryRegionStarts(liveSong, regions);
+    const exact = starts.find((entry) => Math.abs(entry.seconds - targetSeconds) <= 0.35);
+    if (exact) return { ...exact.region, startSeconds: exact.seconds };
+    const next = starts.find((entry) => entry.seconds >= targetSeconds - 0.35);
+    if (next) return { ...next.region, startSeconds: next.seconds };
+    const nearest = starts
+      .slice()
+      .sort((a, b) => Math.abs(a.seconds - targetSeconds) - Math.abs(b.seconds - targetSeconds))[0];
+    if (nearest) return { ...nearest.region, startSeconds: nearest.seconds };
+  }
+
+  const id = stringValue(payload.regionId);
+  if (id) {
+    const starts = recoveryRegionStarts(liveSong, regions);
+    const match = starts.find((entry) => entry.region.id === id);
+    if (match) return { ...match.region, startSeconds: match.seconds };
+  }
+  const name = stringValue(payload.regionName);
+  if (name) {
+    const starts = recoveryRegionStarts(liveSong, regions);
+    const match = starts.find((entry) => sameText(entry.region.name, name));
+    if (match) return { ...match.region, startSeconds: match.seconds };
+    return { id, name };
+  }
+
+  const currentSeconds = nonNegativeNumber(fallbackCurrentSeconds);
+  if (currentSeconds !== null) {
+    const starts = recoveryRegionStarts(liveSong, regions);
+    const next = starts.find((entry) => entry.seconds > currentSeconds + 0.25);
+    if (next) return { ...next.region, startSeconds: next.seconds };
+    const current = starts
+      .slice()
+      .reverse()
+      .find((entry) => entry.seconds <= currentSeconds + 0.25);
+    if (current) return { ...current.region, startSeconds: current.seconds };
+  }
+
+  return null;
+}
+
+function recoveryRegionStarts(liveSong, regions) {
+  return regions
+    .map((region) => ({
+      region,
+      seconds: timeForBarBeatServer(liveSong?.tempoMap, region.startBar, region.startBeat)
+    }))
+      .filter((entry) => Number.isFinite(entry.seconds))
+      .sort((a, b) => a.seconds - b.seconds);
+}
+
+async function queuePanicReleaseFromState(state, slotNumber, payload = {}) {
+  const liveSong = await activeManifestSong(slotNumber) || await liveMixerManifestSong(slotNumber);
+  if (!liveSong) {
+    return {
+      ok: false,
+      panic: state.panic,
+      message: "Cannot queue Panic release because the live song map is not loaded."
+    };
+  }
+  const regions = normalizeRegions(Array.isArray(liveSong.regions)
+    ? liveSong.regions
+    : Array.isArray(liveSong.regions?.regions)
+      ? liveSong.regions.regions
+      : []);
+  const currentSeconds = computedPlaybackTimeSeconds(state);
+  const starts = recoveryRegionStarts(liveSong, regions);
+  const requestedId = stringValue(payload.regionId);
+  const requestedName = stringValue(payload.regionName);
+  const targetSeconds = nonNegativeNumber(payload.targetSeconds ?? payload.recoveryTargetSeconds ?? payload.seekSeconds);
+  const requested = requestedId
+    ? starts.find((entry) => stringValue(entry.region.id) === requestedId)
+    : requestedName
+      ? starts.find((entry) => sameText(entry.region.name, requestedName))
+      : targetSeconds !== null
+      ? starts.slice().sort((a, b) => Math.abs(a.seconds - targetSeconds) - Math.abs(b.seconds - targetSeconds))[0]
+      : null;
+  const execute = starts.find((entry) => entry.seconds > currentSeconds + 0.25);
+  const target = requested || execute;
+  if (!target) {
+    return {
+      ok: false,
+      panic: state.panic,
+      message: "Cannot queue Panic release because no next region was found."
+    };
+  }
+  const regionName = stringValue(target.region.name);
+  const cue = (Array.isArray(liveSong.cueMarkers)
+    ? liveSong.cueMarkers
+    : Array.isArray(liveSong.cues)
+      ? liveSong.cues
+      : Array.isArray(liveSong.cues?.cueMarkers)
+        ? liveSong.cues.cueMarkers
+      : [])
+    .map((marker) => ({
+      marker,
+      seconds: timeForBarBeatServer(liveSong.tempoMap, marker.bar, marker.beat)
+    }))
+    .filter((entry) => Number.isFinite(entry.seconds)
+      && entry.seconds < target.seconds - 0.02
+      && sameText(entry.marker.name, regionName))
+    .sort((a, b) => b.seconds - a.seconds)[0];
+  const recoveryTarget = {
+    pending: true,
+    slot: slotNumber,
+    executeSeconds: target.seconds,
+    targetSeconds: target.seconds,
+    cueSeconds: Number.isFinite(cue?.seconds) ? cue.seconds : null,
+    cueFired: Number.isFinite(cue?.seconds) && cue.seconds < currentSeconds - 0.1,
+    cueSkipped: Number.isFinite(cue?.seconds) && cue.seconds < currentSeconds - 0.1,
+    cueId: stringValue(cue?.marker?.id),
+    regionId: stringValue(target.region.id),
+    regionName,
+    seekSeconds: null,
+    queuedAt: new Date().toISOString()
+  };
+  if (activePlaybackProcess?.slot === slotNumber && recoveryTarget.cueId && !recoveryTarget.cueFired) {
+    await sendNativePlaybackCommand("allowScheduledDynamicCuePrefix", {
+      cueIdPrefix: recoveryTarget.cueId
+    });
+  }
+  recoveryTarget.message = `Panic release queued at ${regionName || formatSecondsForLog(target.seconds)}.${Number.isFinite(recoveryTarget.cueSeconds) ? recoveryTarget.cueFired ? " Cue point already passed." : ` Cue at ${formatSecondsForLog(recoveryTarget.cueSeconds)}.` : ""}`;
+  return {
+    ok: true,
+    panic: {
+      ...state.panic,
+      recoveryTarget,
+      detail: recoveryTarget.message,
+      updatedAt: new Date().toISOString()
+    },
+    message: recoveryTarget.message
+  };
+}
+
+function formatSecondsForLog(seconds) {
+  const total = Math.max(0, Math.floor(Number(seconds) || 0));
+  const minutes = Math.floor(total / 60);
+  const secs = total % 60;
+  return `${minutes}:${String(secs).padStart(2, "0")}`;
 }
 
 async function fadeLiveMusicStems(baseStems, targetGain, durationMs) {
@@ -3856,6 +5406,9 @@ async function fadeRecoverLiveMusicAndPad(liveSong, durationMs) {
       }))
     });
     if (basePad) {
+      const state = await loadPlaybackState();
+      if (Number(state.currentSlot) !== Number(liveSong.slot)) return;
+      if (state.pad?.active === true && state.pad?.source === "transition") return;
       await sendNativePlaybackCommand("updateDynamicMixer", {
         dynamicClick: liveSong.dynamicClick || null,
         dynamicCue: liveSong.dynamicCue || null,
@@ -3869,6 +5422,10 @@ async function fadeRecoverLiveMusicAndPad(liveSong, durationMs) {
     await sleep(50);
   }
   if (basePad) {
+    const state = await loadPlaybackState();
+    if (Number(state.currentSlot) !== Number(liveSong.slot)) return;
+    if (state.pad?.active === true && state.pad?.source === "transition") return;
+    await sendNativePlaybackCommand("markDynamicCuesTriggeredNow");
     await sendNativePlaybackCommand("updateDynamicMixer", {
       dynamicClick: liveSong.dynamicClick || null,
       dynamicCue: liveSong.dynamicCue || null,
@@ -3933,6 +5490,7 @@ async function refreshEngineManifestForMixer() {
     }
   };
   const manifest = await buildEngineManifest(confirmed);
+  await writeFile(CONFIRMED_SET_FILE, `${JSON.stringify(confirmed, null, 2)}\n`, "utf8");
   await writeFile(ENGINE_MANIFEST_FILE, `${JSON.stringify(manifest, null, 2)}\n`, "utf8");
 }
 
@@ -3959,6 +5517,12 @@ function normalizeCueMarkers(cueMarkers) {
 function normalizeArrangement(value = {}) {
   return {
     enabled: value.enabled !== false,
+    trimStartBar: positiveNumber(value.trimStartBar),
+    trimStartBeat: positiveNumber(value.trimStartBeat),
+    trimEndBar: positiveNumber(value.trimEndBar),
+    trimEndBeat: positiveNumber(value.trimEndBeat),
+    trimStartSeconds: nonNegativeNumber(value.trimStartSeconds),
+    trimEndSeconds: nonNegativeNumber(value.trimEndSeconds),
     removedCueSourceIds: Array.isArray(value.removedCueSourceIds)
       ? value.removedCueSourceIds.map((id) => stringValue(id)).filter(Boolean)
       : [],
@@ -3969,7 +5533,9 @@ function normalizeArrangement(value = {}) {
       trimStartBar: positiveNumber(block.trimStartBar),
       trimStartBeat: positiveNumber(block.trimStartBeat),
       trimEndBar: positiveNumber(block.trimEndBar),
-      trimEndBeat: positiveNumber(block.trimEndBeat)
+      trimEndBeat: positiveNumber(block.trimEndBeat),
+      trimStartSeconds: nonNegativeNumber(block.trimStartSeconds),
+      trimEndSeconds: nonNegativeNumber(block.trimEndSeconds)
     })).filter((block) => block.regionId),
     cuts: (Array.isArray(value.cuts) ? value.cuts : []).map((cut, index) => ({
       id: stringValue(cut.id || `cut-${index + 1}`),
@@ -4003,6 +5569,71 @@ function normalizeTempoMap(value, slot) {
     timeSignatureChanges: Array.isArray(value.timeSignatureChanges) ? value.timeSignatureChanges : [],
     beatGrid: normalizeBeatGrid(value.beatGrid)
   };
+}
+
+function songGridPositions(regions = [], cues = []) {
+  const positions = [];
+  for (const region of regions) {
+    positions.push({ measure: region.startBar, beat: region.startBeat });
+    positions.push({ measure: region.endBar, beat: region.endBeat });
+  }
+  for (const cue of cues) positions.push({ measure: cue.bar, beat: cue.beat });
+  return positions;
+}
+
+function extendTempoMapForSongPositions(tempoMap, positions = []) {
+  const beatGrid = Array.isArray(tempoMap?.beatGrid) ? tempoMap.beatGrid.map((beat) => ({ ...beat })) : [];
+  if (!beatGrid.length || !Array.isArray(positions) || !positions.length) return tempoMap;
+  const beatsPerMeasure = beatsPerMeasureForTempoMap(tempoMap);
+  const positionValue = (position) => {
+    const measure = Number(position?.measure);
+    const beat = Number(position?.beat);
+    if (!Number.isFinite(measure) || !Number.isFinite(beat)) return null;
+    return ((measure - 1) * beatsPerMeasure) + (beat - 1);
+  };
+  const requested = Math.max(...positions.map(positionValue).filter((value) => value !== null));
+  let last = beatGrid.at(-1);
+  let lastPosition = positionValue({ measure: last?.measure, beat: last?.beat });
+  if (!Number.isFinite(requested) || !Number.isFinite(lastPosition) || requested <= lastPosition) return tempoMap;
+  const previous = beatGrid.slice(0, -1).reverse().find((beat) => Number.isFinite(Number(beat.timeSeconds)));
+  const measuredInterval = previous ? Number(last.timeSeconds) - Number(previous.timeSeconds) : null;
+  const beatInterval = measuredInterval && measuredInterval > 0
+    ? measuredInterval
+    : positiveNumber(tempoMap?.bpm)
+      ? 60 / positiveNumber(tempoMap.bpm)
+      : null;
+  if (!beatInterval) return tempoMap;
+  const extended = {
+    ...tempoMap,
+    source: `${tempoMap.source || "tempo-map"}+tail-grid`
+  };
+  let guard = 0;
+  while (lastPosition < requested && guard < 64) {
+    const nextBeat = Number(last.beat || last.beatInMeasure || 1) >= beatsPerMeasure ? 1 : Number(last.beat || last.beatInMeasure || 1) + 1;
+    const nextMeasure = nextBeat === 1 ? Number(last.measure || 1) + 1 : Number(last.measure || 1);
+    last = {
+      index: Number(last.index || beatGrid.length) + 1,
+      timeSeconds: Number((Number(last.timeSeconds || 0) + beatInterval).toFixed(6)),
+      measure: nextMeasure,
+      beat: nextBeat,
+      globalBeat: Number.isFinite(Number(last.globalBeat)) ? Number(last.globalBeat) + 1 : beatGrid.length,
+      isDownbeat: nextBeat === 1,
+      isCountIn: false,
+      tempoSegmentIndex: Number.isFinite(Number(last.tempoSegmentIndex)) ? Number(last.tempoSegmentIndex) : 0,
+      confidence: positiveNumber(last.confidence)
+    };
+    beatGrid.push(last);
+    lastPosition = positionValue({ measure: last.measure, beat: last.beat });
+    guard += 1;
+  }
+  extended.beatGrid = beatGrid;
+  return extended;
+}
+
+function beatsPerMeasureForTempoMap(tempoMap) {
+  const signature = stringValue(tempoMap?.timeSignature || "4/4");
+  const numerator = positiveNumber(signature.split("/")[0]);
+  return Math.max(1, Math.floor(numerator || 4));
 }
 
 function normalizeTempoChanges(value) {
@@ -4100,11 +5731,16 @@ function canonicalBus(value) {
 
 async function ensureSetMetadata(setlist, options = {}) {
   const allowAnalysis = options.allowAnalysis !== false;
+  const includeWaveforms = options.includeWaveforms === true;
   await mkdir(SET_METADATA_DIR, { recursive: true });
   const library = await loadLibrary();
   const slots = [];
   for (const slot of setlist.slots) {
     if (!slot.songId) continue;
+    const song = (library.songs || []).find((item) => item.id === slot.songId);
+    if (slot.folderPath || song?.folderPath) {
+      await importSongMetadata(slot.folderPath || song.folderPath, { autoAnalyze: false });
+    }
     const slotDir = join(SET_METADATA_DIR, `slot-${String(slot.slot).padStart(2, "0")}`);
     await mkdir(slotDir, { recursive: true });
     const files = {
@@ -4118,10 +5754,7 @@ async function ensureSetMetadata(setlist, options = {}) {
       dynamicCueMap: join(slotDir, "dynamic-cue-map.json")
     };
     await resetSlotMetadataIfNeeded(slot, files);
-    const song = (library.songs || []).find((item) => item.id === slot.songId);
-    if (allowAnalysis) {
-      await ensureSongCueAnalysis(slot, song);
-    }
+    await ensureSongCueAnalysis(slot, song, { allowAnalysis });
     await ensureSongDefaultMetadata(slot, song, { allowAnalysis });
     await migrateExistingSlotMetadataToSongDefaults(slot, files);
     const analyzerTempoMap = await readAnalyzerTempoMapForSlot(slot, song);
@@ -4130,7 +5763,7 @@ async function ensureSetMetadata(setlist, options = {}) {
     await syncCueAnalysisToSlot(slot, files);
     await writeIfMissing(files.tempoMap, analyzerTempoMap);
     await ensureMixerMetadata(files.mixer, slot, library);
-    if (slot.cachedStems?.length) {
+    if (includeWaveforms && slot.cachedStems?.length) {
       await writeSlotWaveformBaseline(slot, files.waveform, WAVEFORM_BUCKETS);
     }
     const sourceMetadataFingerprint = await songMetadataFingerprintForSlot(slot);
@@ -4178,38 +5811,68 @@ async function ensureSongDefaultMetadata(slot, song, options = {}) {
 
   const defaultRegionsPath = appDefaultRegionsPath(folderPath);
   const defaultCuesPath = appDefaultCueMarkersPath(folderPath);
+  const cueReport = await readJsonFile(appCueRecognitionReportPath(folderPath), null);
+  const currentSourceFingerprint = stringValue(cueReport?.sourceFingerprint);
+  const currentCueFingerprint = cueMarkerDefaultsFingerprint(cueReport);
 
   let defaultCues = await readJsonFile(defaultCuesPath, null);
-  if (!defaultCues || (!defaultCues.cueMarkers?.length && defaultCues.source === "empty-default")) {
-    if (allowAnalysis) {
-      defaultCues = await buildDefaultCueMarkersFromAnalysis(folderPath, slot.songId);
+  if (
+    !defaultCues
+    || (!defaultCues.cueMarkers?.length && defaultCues.source === "empty-default")
+    || analyzerDefaultNeedsRefresh(defaultCues, currentCueFingerprint)
+  ) {
+    defaultCues = await buildDefaultCueMarkersFromAnalysis(folderPath, slot.songId);
+    if (defaultCues.cueMarkers?.length || allowAnalysis) {
       await writeFile(defaultCuesPath, `${JSON.stringify(defaultCues, null, 2)}\n`, "utf8");
     }
   }
 
   const defaultRegions = await readJsonFile(defaultRegionsPath, null);
-  if (!defaultRegions || (!defaultRegions.regions?.length && defaultRegions.source === "empty-default")) {
-    if (allowAnalysis) {
-      await writeFile(defaultRegionsPath, `${JSON.stringify(await buildDefaultRegionsFromAnalysis(folderPath, slot.songId), null, 2)}\n`, "utf8");
+  if (
+    !defaultRegions
+    || (!defaultRegions.regions?.length && defaultRegions.source === "empty-default")
+    || analyzerDefaultNeedsRefresh(defaultRegions, currentSourceFingerprint)
+  ) {
+    const nextRegions = await buildDefaultRegionsFromAnalysis(folderPath, slot.songId);
+    if (nextRegions.regions?.length || allowAnalysis) {
+      await writeFile(defaultRegionsPath, `${JSON.stringify(nextRegions, null, 2)}\n`, "utf8");
     }
   } else {
     await writeIfMissing(defaultRegionsPath, { regions: [] });
   }
 }
 
-async function ensureSongCueAnalysis(slot, song) {
+async function ensureSongCueAnalysis(slot, song, options = {}) {
+  const allowAnalysis = options.allowAnalysis !== false;
   const folderPath = slot.folderPath || song?.folderPath || "";
   if (!folderPath) return;
   const reportPath = appCueRecognitionReportPath(folderPath);
   const mapPath = appDynamicCueMapPath(folderPath);
   const currentReport = await readJsonFile(reportPath, null);
   const currentMap = await readJsonFile(mapPath, null);
+  const sourceReport = await cueReportFromSourceCueIntelligence(folderPath, slot);
+  if (
+    sourceReport
+    && (
+      currentReport?.songId !== slot.songId
+      || currentMap?.songId !== slot.songId
+      || currentReport?.sourceFingerprint !== sourceReport.sourceFingerprint
+    )
+  ) {
+    const settings = await loadSettings();
+    const timedReport = await cueReportWithSongTiming(sourceReport, folderPath, slot);
+    const dynamicCueMap = await buildDynamicCueMapFromCandidates(timedReport, settings.dynamicCue.folderPath);
+    await writeFile(reportPath, `${JSON.stringify(timedReport, null, 2)}\n`, "utf8");
+    await writeFile(mapPath, `${JSON.stringify(dynamicCueMap, null, 2)}\n`, "utf8");
+    return;
+  }
   if (
     currentReport?.songId === slot.songId
     && currentMap?.songId === slot.songId
     && currentReport.candidates?.length
     && Array.isArray(currentReport.regionCandidates)
   ) return;
+  if (!allowAnalysis) return;
 
   const settings = await loadSettings();
   const metadataDir = appSongMetadataDir(folderPath);
@@ -4240,6 +5903,7 @@ async function ensureSongCueAnalysis(slot, song) {
     songId: slot.songId,
     title: slot.title,
     sourceFolder: folderPath,
+    timeSignature: slot.timeSignature || "",
     recognizer: cueAnalysis.speechEngine?.cueRecognizer || cueAnalysis.speechEngine?.cueProvider || "vosk-closed-grammar",
     voskStatus: cueAnalysis.speechEngine?.voskStatus || "",
     status: cueAnalysis.status || raw.analysisStatus || "unknown",
@@ -4254,46 +5918,296 @@ async function ensureSongCueAnalysis(slot, song) {
   await writeFile(mapPath, `${JSON.stringify(dynamicCueMap, null, 2)}\n`, "utf8");
 }
 
+async function cueReportFromSourceCueIntelligence(folderPath, slot) {
+  const sourcePath = join(folderPath, "analysis", "cue-intelligence.json");
+  let source;
+  try {
+    source = await readJsonFile(sourcePath, null);
+  } catch {
+    return null;
+  }
+  if (!source || !Array.isArray(source.markers) || !source.markers.length) return null;
+  const sourceFingerprint = await fileSha1(sourcePath);
+  const candidates = source.markers
+    .filter((marker) => marker && (marker.label || marker.target || marker.normalizedText))
+    .map((marker, index) => ({
+      id: stringValue(marker.id || `cue_${index + 1}`),
+      rawTranscript: stringValue(marker.heardText || marker.rawTranscript || marker.label),
+      status: ["trusted", "verified"].includes(stringValue(marker.status)) ? "trusted" : stringValue(marker.status || "review"),
+      label: stringValue(marker.label || marker.target || marker.normalizedText),
+      normalizedPhrase: stringValue(marker.normalizedText || marker.label || marker.target),
+      command: stringValue(marker.command || marker.phraseRecognition?.command || "normal"),
+      confidence: positiveNumber(marker.confidence) || positiveNumber(marker.labelConfidence) || 0,
+      spokenAtSeconds: nonNegativeNumber(marker.heardTimeSeconds ?? marker.spokenAtSeconds),
+      sectionWordAtSeconds: nonNegativeNumber(marker.sectionWordAtSeconds),
+      targetMeasure: positiveNumber(marker.targetMeasure || marker.snappedMeasure),
+      targetBeat: positiveNumber(marker.targetBeatInMeasure || marker.targetBeat || marker.snappedBeatInMeasure),
+      snappedMeasure: positiveNumber(marker.snappedMeasure || marker.targetMeasure),
+      snappedBeat: positiveNumber(marker.snappedBeatInMeasure || marker.snappedBeat || marker.targetBeatInMeasure),
+      gridStatus: stringValue(marker.alignmentStatus || marker.status),
+      rejectionReasons: Array.isArray(marker.phraseRecognition?.rejectionReasons) ? marker.phraseRecognition.rejectionReasons.map(stringValue).filter(Boolean) : [],
+      words: []
+    }));
+  const regions = source.inferredRegions && Array.isArray(source.inferredRegions.regions) ? source.inferredRegions.regions : [];
+  const regionCandidates = regions.map((region, index) => ({
+    id: stringValue(region.id || `region_${index + 1}`),
+    sourceCueCandidateId: stringValue(region.sourceCueCandidateId || candidates[index]?.id || `cue_${index + 1}`),
+    sourceCueText: stringValue(region.name || candidates[index]?.label),
+    status: ["trusted", "verified", "draft"].includes(stringValue(region.status)) ? "verified" : stringValue(region.status || "review"),
+    cueMeasure: positiveNumber(candidates[index]?.targetMeasure),
+    cueBeat: positiveNumber(candidates[index]?.targetBeat),
+    startMeasure: positiveNumber(region.startMeasure || region.startBar),
+    startBeat: positiveNumber(region.startBeat),
+    leadInMeasures: 0,
+    gridBeats: positiveNumber(source.gridReference?.timeSignature?.gridBeatsPerMeasure),
+    reason: stringValue(region.source || "cue-intelligence")
+  })).filter((candidate) => candidate.id && candidate.startMeasure && candidate.startBeat);
+  return {
+    generatedAt: new Date().toISOString(),
+    slot: slot.slot,
+    songId: slot.songId,
+    analyzerSongId: stringValue(source.songId),
+    title: slot.title,
+    sourceFolder: folderPath,
+    sourceFile: "analysis/cue-intelligence.json",
+    sourceFingerprint,
+    recognizer: stringValue(source.speechEngine?.cueRecognizer || source.speechEngine?.cueProvider || "vosk-closed-grammar"),
+    voskStatus: stringValue(source.speechEngine?.voskStatus),
+    status: stringValue(source.status || "trusted"),
+    summary: source.summary || {},
+    gridReference: source.gridReference || null,
+    source: source.source || null,
+    candidates,
+    regionCandidates
+  };
+}
+
+async function rehydrateCurrentSetMetadata(options = {}) {
+  const includeWaveforms = options.includeWaveforms === true;
+  const setlist = await loadCurrentSetlist();
+  const filledSlots = (setlist.slots || []).filter((slot) => slot.songId);
+  const cleared = [];
+  for (const slot of filledSlots) {
+    const slotDir = join(SET_METADATA_DIR, `slot-${String(slot.slot).padStart(2, "0")}`);
+    const songDir = appSongMetadataDir(slot.folderPath);
+    const paths = [
+      join(slotDir, "cue-markers.json"),
+      join(slotDir, "regions.json"),
+      join(slotDir, "cue-recognition-report.json"),
+      join(slotDir, "dynamic-cue-map.json"),
+      join(slotDir, "slot-info.json"),
+      appDefaultCueMarkersPath(slot.folderPath),
+      appDefaultRegionsPath(slot.folderPath),
+      appCueRecognitionReportPath(slot.folderPath),
+      appDynamicCueMapPath(slot.folderPath)
+    ];
+    if (includeWaveforms) paths.push(join(slotDir, "waveform-summary.json"));
+    for (const filePath of paths) {
+      const current = await readJsonFile(filePath, null);
+      if (metadataMapIsOperatorApproved(current)) continue;
+      await rm(filePath, { force: true });
+      cleared.push(filePath);
+    }
+  }
+  await ensureSetMetadata(setlist, { allowAnalysis: false, includeWaveforms });
+  return {
+    ok: true,
+    rehydratedAt: new Date().toISOString(),
+    slotCount: filledSlots.length,
+    clearedCount: cleared.length,
+    cleared,
+    audit: await auditCurrentSetMetadata()
+  };
+}
+
+async function auditCurrentSetMetadata() {
+  const setlist = await loadCurrentSetlist();
+  const rows = [];
+  for (const slot of (setlist.slots || []).filter((item) => item.songId)) {
+    const slotDir = join(SET_METADATA_DIR, `slot-${String(slot.slot).padStart(2, "0")}`);
+    const rawSource = await readJsonFile(join(slot.folderPath, "analysis", "cue-intelligence.json"), null);
+    const source = rawSource ? await cueReportWithSongTiming(cueIntelligenceSourceToReport(rawSource, slot), slot.folderPath, slot) : null;
+    const appCueMap = await readJsonFile(join(slotDir, "cue-markers.json"), { cueMarkers: [] });
+    const appRegionMap = await readJsonFile(join(slotDir, "regions.json"), { regions: [] });
+    const appCues = appCueMap.cueMarkers || [];
+    const appRegions = appRegionMap.regions || [];
+    const approvedOverride = metadataMapIsOperatorApproved(appCueMap) || metadataMapIsOperatorApproved(appRegionMap);
+    const sourceCues = (source?.candidates || [])
+      .filter((candidate) => ["trusted", "review", "verified"].includes(stringValue(candidate.status)))
+      .map((candidate, index) => cueMarkerFromAnalysisCandidate(candidate, source, index));
+    const sourceRegions = buildDefaultRegionsFromReport(source || {}).regions || [];
+    const firstAppCue = appCues[0] || null;
+    const firstSourceCue = sourceCues[0] || null;
+    const firstAppRegion = appRegions[0] || null;
+    const firstSourceRegion = sourceRegions[0] || null;
+    const appCuePosition = firstAppCue ? `${firstAppCue.bar}.${firstAppCue.beat}` : "";
+    const sourceCuePosition = firstSourceCue ? `${firstSourceCue.bar}.${firstSourceCue.beat}` : "";
+    const appRegionPosition = firstAppRegion ? `${firstAppRegion.startBar}.${firstAppRegion.startBeat}-${firstAppRegion.endBar}.${firstAppRegion.endBeat}` : "";
+    const sourceRegionPosition = firstSourceRegion ? `${firstSourceRegion.startBar}.${firstSourceRegion.startBeat}-${firstSourceRegion.endBar}.${firstSourceRegion.endBeat}` : "";
+    const cueCountOk = appCues.length === sourceCues.length;
+    const regionCountOk = appRegions.length === sourceRegions.length;
+    const cuePositionOk = appCuePosition === sourceCuePosition;
+    const regionPositionOk = appRegionPosition === sourceRegionPosition;
+    const ok = Boolean(source && cueCountOk && regionCountOk && cuePositionOk && regionPositionOk);
+    rows.push({
+      slot: slot.slot,
+      songId: slot.songId,
+      title: slot.title,
+      status: ok ? "ok" : approvedOverride ? "approved-override" : "mismatch",
+      sourceExists: Boolean(source),
+      approvedOverride,
+      cueCountOk,
+      regionCountOk,
+      cuePositionOk,
+      regionPositionOk,
+      appCueCount: appCues.length,
+      sourceCueCount: sourceCues.length,
+      appRegionCount: appRegions.length,
+      sourceRegionCount: sourceRegions.length,
+      appFirstCue: appCuePosition,
+      sourceFirstCue: sourceCuePosition,
+      appFirstRegion: appRegionPosition,
+      sourceFirstRegion: sourceRegionPosition
+    });
+  }
+  const mismatches = rows.filter((row) => row.status === "mismatch");
+  const approvedOverrides = rows.filter((row) => row.status === "approved-override");
+  return {
+    ok: mismatches.length === 0,
+    checkedAt: new Date().toISOString(),
+    checked: rows.length,
+    mismatchCount: mismatches.length,
+    approvedOverrideCount: approvedOverrides.length,
+    rows,
+    mismatches,
+    approvedOverrides
+  };
+}
+
+function cueIntelligenceSourceToReport(source, slot = {}) {
+  if (!source || typeof source !== "object") return source;
+  if (Array.isArray(source.candidates)) return source;
+  const markers = Array.isArray(source.markers) ? source.markers : [];
+  return {
+    generatedAt: stringValue(source.generatedAt || source.updatedAt) || new Date().toISOString(),
+    slot: slot.slot,
+    songId: slot.songId || stringValue(source.songId),
+    analyzerSongId: stringValue(source.songId),
+    title: slot.title || stringValue(source.title),
+    sourceFolder: slot.folderPath || stringValue(source.sourceFolder),
+    sourceFile: "analysis/cue-intelligence.json",
+    sourceFingerprint: stringValue(source.sourceFingerprint || source.fingerprint) || createHash("sha1").update(JSON.stringify(markers)).digest("hex"),
+    recognizer: stringValue(source.speechEngine?.cueRecognizer || source.speechEngine?.cueProvider || source.recognizer || "vosk-closed-grammar"),
+    status: stringValue(source.status || "trusted"),
+    summary: source.summary || {},
+    gridReference: source.gridReference || null,
+    source: source.source || null,
+    inferredRegions: source.inferredRegions || null,
+    timeSignature: stringValue(source.timeSignature || source.gridReference?.timeSignature),
+    candidates: markers.map((marker, index) => ({
+      id: stringValue(marker.id || `cue_${index + 1}`),
+      rawTranscript: stringValue(marker.heardText || marker.rawTranscript || marker.label),
+      status: ["trusted", "verified"].includes(stringValue(marker.status)) ? "trusted" : stringValue(marker.status || "review"),
+      label: stringValue(marker.label || marker.target || marker.normalizedText),
+      normalizedPhrase: stringValue(marker.normalizedText || marker.label || marker.target),
+      command: stringValue(marker.command || marker.phraseRecognition?.command || "normal"),
+      confidence: positiveNumber(marker.confidence?.overall) || positiveNumber(marker.confidence) || positiveNumber(marker.labelConfidence) || 0,
+      spokenAtSeconds: nonNegativeNumber(marker.heardTimeSeconds ?? marker.spokenAtSeconds),
+      sectionWordAtSeconds: nonNegativeNumber(marker.sectionWordAtSeconds),
+      targetMeasure: positiveNumber(marker.targetMeasure || marker.snappedMeasure),
+      targetBeat: positiveNumber(marker.targetBeatInMeasure || marker.targetBeat || marker.snappedBeatInMeasure || marker.snappedBeat),
+      snappedMeasure: positiveNumber(marker.snappedMeasure || marker.targetMeasure),
+      snappedBeat: positiveNumber(marker.snappedBeatInMeasure || marker.snappedBeat || marker.targetBeatInMeasure || marker.targetBeat),
+      gridStatus: stringValue(marker.alignmentStatus || marker.status),
+      rejectionReasons: Array.isArray(marker.phraseRecognition?.rejectionReasons) ? marker.phraseRecognition.rejectionReasons.map(stringValue).filter(Boolean) : [],
+      words: []
+    })),
+    regionCandidates: []
+  };
+}
+
+async function triggerPanicRecoveryCue(liveSong, payload = {}) {
+  const recoveryRegion = recoveryRegionFromPayload(liveSong, payload);
+  const regionName = stringValue(recoveryRegion?.name || payload.regionName).trim();
+  if (!regionName) {
+    const result = { ok: false, regionName: "", error: "No recovery region was resolved." };
+    console.warn(`[panic-recovery] ${result.error}`);
+    return result;
+  }
+  const cueProgram = await recoveryCueCommandPayload(regionName);
+  if (!cueProgram.ok || !cueProgram.commands.length) {
+    const result = { ok: false, regionName, error: cueProgram.error || `No recovery cue WAV matched "${regionName}".` };
+    console.warn(`[panic-recovery] ${result.error}`);
+    return result;
+  }
+  const markResult = await requestNativePlaybackCommand("markDynamicCuesTriggeredNow", {}, { timeoutMs: 1200 });
+  if (!markResult.ok) {
+    const result = { ok: false, regionName, error: markResult.error || "Could not mark scheduled cues before recovery." };
+    console.warn(`[panic-recovery] ${result.error}`);
+    return result;
+  }
+  if (!payload.keepScheduledCuesSuppressed) {
+    await requestNativePlaybackCommand("setScheduledDynamicCuesSuppressed", { suppressed: false }, { timeoutMs: 1200 });
+  }
+  const mixerResult = await requestNativePlaybackCommand("updateDynamicMixer", {
+    dynamicClick: liveSong.dynamicClick || null,
+    dynamicCue: liveSong.dynamicCue || null,
+    dynamicPad: { ...(liveSong.dynamicPad || {}), active: true }
+  }, { timeoutMs: 1200 });
+  if (!mixerResult.ok) {
+    const result = { ok: false, regionName, error: mixerResult.error || "Could not route dynamic cue for recovery." };
+    console.warn(`[panic-recovery] ${result.error}`);
+    return result;
+  }
+  await sleep(80);
+  const triggered = [];
+  for (const command of cueProgram.commands) {
+    const result = await requestNativePlaybackCommand("triggerCue", command, { timeoutMs: 1500 });
+    if (!result.ok) {
+      const error = `cue failed: ${command.cueName || command.cueId || "unknown"} ${result.error || ""}`.trim();
+      console.warn(`[panic-recovery] ${error}`);
+      return { ok: false, regionName, triggered, error };
+    }
+    triggered.push(command.cueName || command.cueId || "cue");
+    await sleep(command.delayAfterMs ?? 450);
+  }
+  const restoreResult = await requestNativePlaybackCommand("updateDynamicMixer", {
+    dynamicClick: liveSong.dynamicClick || null,
+    dynamicCue: liveSong.dynamicCue || null,
+    dynamicPad: { ...(liveSong.dynamicPad || {}), active: true }
+  }, { timeoutMs: 1200 });
+  if (!restoreResult.ok) {
+    console.warn(`[panic-recovery] dynamic mixer restore failed: ${restoreResult.error || "unknown"}`);
+  }
+  console.log(`[panic-recovery] fired ${triggered.join(" + ")} for ${regionName}`);
+  return { ok: true, regionName, triggered };
+}
+
 async function migrateExistingSlotMetadataToSongDefaults(slot, files) {
-  const folderPath = slot.folderPath || "";
-  if (!folderPath) return;
-  const existingRegions = await readJsonFile(files.regions, null);
-  const existingCues = await readJsonFile(files.cues, null);
-  const defaultRegions = await readJsonFile(appDefaultRegionsPath(folderPath), null);
-  const defaultCues = await readJsonFile(appDefaultCueMarkersPath(folderPath), null);
-
-  if (existingRegions?.regions?.length && !defaultRegions?.regions?.length) {
-    await writeFile(appDefaultRegionsPath(folderPath), `${JSON.stringify({
-      regions: normalizeRegions(existingRegions.regions),
-      source: "migrated-from-current-set",
-      updatedAt: new Date().toISOString()
-    }, null, 2)}\n`, "utf8");
-  }
-
-  if (existingCues?.cueMarkers?.length && !defaultCues?.cueMarkers?.length) {
-    await writeFile(appDefaultCueMarkersPath(folderPath), `${JSON.stringify({
-      cueMarkers: normalizeCueMarkers(existingCues.cueMarkers),
-      dynamicCueMatching: existingCues.dynamicCueMatching || "fuzzy-name",
-      source: "migrated-from-current-set",
-      updatedAt: new Date().toISOString()
-    }, null, 2)}\n`, "utf8");
-  }
-
+  if (!slot.folderPath) return;
+  // Slot cue/region files are working cache. Only explicit operator approvals become reusable song defaults.
   await copyCueAnalysisIfSongMatches(slot, files);
 }
 
 async function readSongDefaultRegions(slot) {
   const folderPath = slot.folderPath || "";
+  const approved = await readJsonFile(appApprovedRegionsPath(slot.songId), null);
+  if (approved?.approved === true && approved?.regions?.length) return approved;
   return await readJsonFile(appDefaultRegionsPath(folderPath), { regions: [] });
 }
 
 async function readSongDefaultCueMarkers(slot) {
   const folderPath = slot.folderPath || "";
+  const approved = await readJsonFile(appApprovedCueMarkersPath(slot.songId), null);
+  if (approved?.approved === true && approved?.cueMarkers?.length) return approved;
   return await readJsonFile(appDefaultCueMarkersPath(folderPath), { cueMarkers: [], dynamicCueMatching: "fuzzy-name" });
 }
 
 async function buildDefaultCueMarkersFromAnalysis(folderPath, expectedSongId = "") {
-  const report = await readJsonFile(appCueRecognitionReportPath(folderPath), null);
+  const report = await cueReportWithSongTiming(
+    await readJsonFile(appCueRecognitionReportPath(folderPath), null),
+    folderPath
+  );
   if (expectedSongId && report?.songId !== expectedSongId) {
     return {
       cueMarkers: [],
@@ -4303,17 +6217,100 @@ async function buildDefaultCueMarkersFromAnalysis(folderPath, expectedSongId = "
   }
   const cueMarkers = (report?.candidates || [])
     .filter((candidate) => ["trusted", "review"].includes(candidate.status))
-    .map((candidate, index) => ({
-      id: `cue-${candidate.id || index + 1}`,
-      name: cueMarkerName(candidate, index),
-      bar: positiveNumber(candidate.snappedMeasure || candidate.targetMeasure) || 1,
-      beat: positiveNumber(candidate.snappedBeat || candidate.targetBeat) || 1
-    }))
+    .map((candidate, index) => cueMarkerFromAnalysisCandidate(candidate, report, index))
     .filter((cue) => cue.name && cue.bar > 0 && cue.beat > 0);
   return {
     cueMarkers,
     dynamicCueMatching: "fuzzy-name",
-    source: cueMarkers.length ? "dynamic-cue-analysis" : "empty-default"
+    source: cueMarkers.length ? "dynamic-cue-analysis" : "empty-default",
+    sourceFingerprint: cueMarkerDefaultsFingerprint(report),
+    updatedAt: new Date().toISOString()
+  };
+}
+
+function cueMarkerDefaultsFingerprint(report) {
+  const source = stringValue(report?.sourceFingerprint);
+  return source ? `${source}:${CUE_MARKER_RULE_VERSION}` : CUE_MARKER_RULE_VERSION;
+}
+
+async function cueReportWithSongTiming(report, folderPath, slot = {}) {
+  if (!report || typeof report !== "object") return report;
+  const currentSignature = cueReportTimeSignature(report);
+  if (currentSignature && currentSignature !== "4/4") return report;
+  const metadata = folderPath ? await readSongMetadata(folderPath) : {};
+  const timeSignature = stringValue(slot.timeSignature || metadata.timeSignature || report.timeSignature || currentSignature || "4/4");
+  return {
+    ...report,
+    sourceFolder: report.sourceFolder || folderPath || "",
+    timeSignature
+  };
+}
+
+function cueMarkerFromAnalysisCandidate(candidate, report, index) {
+  const timing = cueTimingContextForReport(report);
+  const position = sectionCuePositionFromReport(candidate, report, timing);
+  return {
+    id: `cue-${candidate.id || index + 1}`,
+    name: cueMarkerName(candidate, index),
+    bar: position.bar,
+    beat: position.beat
+  };
+}
+
+function sectionCuePositionFromReport(candidate, report, timing = cueTimingContextForReport(report)) {
+  return {
+    bar: positiveNumber(candidate.snappedMeasure || candidate.targetMeasure) || 1,
+    beat: positiveNumber(candidate.snappedBeat || candidate.targetBeat) || 1
+  };
+}
+
+function findRegionCandidateForCue(candidate, report) {
+  const cueId = stringValue(candidate?.id);
+  const regions = Array.isArray(report?.regionCandidates) ? report.regionCandidates : [];
+  return regions.find((region) => {
+    return region.status === "verified"
+      && region.startMeasure
+      && region.startBeat
+      && stringValue(region.sourceCueCandidateId || region.id) === cueId;
+  });
+}
+
+function cueTimingContextForReport(report) {
+  const signature = cueReportTimeSignature(report);
+  const beatsPerMeasure = beatsPerMeasureForTimeSignature(signature);
+  return {
+    timeSignature: signature,
+    beatsPerMeasure,
+    sectionCueLeadBeats: signature.startsWith("6/8") ? 6 : 4
+  };
+}
+
+function cueReportTimeSignature(report) {
+  const values = [
+    report?.timeSignature,
+    report?.gridReference?.timeSignature,
+    report?.summary?.timeSignature,
+    report?.metadata?.timeSignature
+  ];
+  for (const value of values) {
+    const display = displayTimeSignature(value);
+    if (display) return display;
+  }
+  return "4/4";
+}
+
+function beatsPerMeasureForTimeSignature(signature) {
+  const match = stringValue(signature || "4/4").match(/^(\d+)\s*\//);
+  return positiveNumber(match?.[1]) || 4;
+}
+
+function shiftBarBeatByBeats(bar, beat, beatOffset, beatsPerMeasure) {
+  const beatsInMeasure = positiveNumber(beatsPerMeasure) || 4;
+  const startIndex = ((positiveNumber(bar) || 1) - 1) * beatsInMeasure + ((positiveNumber(beat) || 1) - 1);
+  const shifted = Math.max(0, startIndex + beatOffset);
+  return {
+    bar: Math.floor(shifted / beatsInMeasure) + 1,
+    beat: (shifted % beatsInMeasure) + 1
   };
 }
 
@@ -4345,7 +6342,14 @@ async function copyIfMissing(targetPath, sourcePath) {
 
 async function hydrateSlotRegionsFromDefaults(filePath, defaults) {
   const current = await readJsonFile(filePath, null);
-  if (current?.regions?.length || !defaults?.regions?.length) {
+  if (metadataMapIsOperatorWorkingDraft(current)) {
+    return;
+  }
+  const needsRefresh = analyzerDefaultNeedsRefresh(current, stringValue(defaults?.sourceFingerprint));
+  if (current?.regions?.length && !needsRefresh) {
+    return;
+  }
+  if (!needsRefresh && (current?.regions?.length || !defaults?.regions?.length)) {
     await writeIfMissing(filePath, defaults || { regions: [] });
     return;
   }
@@ -4354,7 +6358,14 @@ async function hydrateSlotRegionsFromDefaults(filePath, defaults) {
 
 async function hydrateSlotCuesFromDefaults(filePath, defaults) {
   const current = await readJsonFile(filePath, null);
-  if (current?.cueMarkers?.length || !defaults?.cueMarkers?.length) {
+  if (metadataMapIsOperatorWorkingDraft(current)) {
+    return;
+  }
+  const needsRefresh = analyzerDefaultNeedsRefresh(current, stringValue(defaults?.sourceFingerprint));
+  if (current?.cueMarkers?.length && !needsRefresh) {
+    return;
+  }
+  if (!needsRefresh && (current?.cueMarkers?.length || !defaults?.cueMarkers?.length)) {
     await writeIfMissing(filePath, defaults || { cueMarkers: [], dynamicCueMatching: "fuzzy-name" });
     return;
   }
@@ -4404,8 +6415,18 @@ async function resetSlotMetadataIfNeeded(slot, files) {
     && current?.songId === slot.songId
     && current?.sourceMetadataFingerprint === sourceMetadataFingerprint
   ) return;
-  await rm(files.regions, { force: true });
-  await rm(files.cues, { force: true });
+  const currentRegions = await readJsonFile(files.regions, null);
+  const currentCues = await readJsonFile(files.cues, null);
+  if (metadataMapIsOperatorWorkingDraft(currentRegions)) {
+    await markWorkingDraftSourceChange(files.regions, currentRegions, current?.sourceMetadataFingerprint, sourceMetadataFingerprint);
+  } else {
+    await rm(files.regions, { force: true });
+  }
+  if (metadataMapIsOperatorWorkingDraft(currentCues)) {
+    await markWorkingDraftSourceChange(files.cues, currentCues, current?.sourceMetadataFingerprint, sourceMetadataFingerprint);
+  } else {
+    await rm(files.cues, { force: true });
+  }
   await rm(files.tempoMap, { force: true });
   await rm(files.mixer, { force: true });
   await rm(files.waveform, { force: true });
@@ -4413,14 +6434,40 @@ async function resetSlotMetadataIfNeeded(slot, files) {
   await rm(files.dynamicCueMap, { force: true });
 }
 
+async function markWorkingDraftSourceChange(filePath, current, previousFingerprint, currentFingerprint) {
+  if (!currentFingerprint || stringValue(previousFingerprint) === stringValue(currentFingerprint)) return;
+  await writeFile(filePath, `${JSON.stringify({
+    ...current,
+    sourceMetadataChangedUnderDraft: true,
+    previousSourceMetadataFingerprint: stringValue(previousFingerprint),
+    currentSourceMetadataFingerprint: stringValue(currentFingerprint),
+    sourceMetadataChangedAt: new Date().toISOString()
+  }, null, 2)}\n`, "utf8");
+}
+
 async function songMetadataFingerprintForSlot(slot) {
   if (!slot?.folderPath) return "";
-  try {
-    return await fileSha1(appSongMetadataPath(slot.folderPath));
-  } catch (error) {
-    if (error.code !== "ENOENT") throw error;
-    return "";
+  return sourceMetadataFingerprintForSongFolder(slot.folderPath);
+}
+
+async function sourceMetadataFingerprintForSongFolder(songFolder) {
+  const hash = createHash("sha1");
+  let found = false;
+  const sourceFiles = [
+    join(songFolder, "song-metadata.json"),
+    join(songFolder, "analysis", "cue-intelligence.json"),
+    join(songFolder, "analysis", "grid-analysis.json")
+  ];
+  for (const sourceFile of sourceFiles) {
+    try {
+      hash.update(sourceFile);
+      hash.update(await readFile(sourceFile));
+      found = true;
+    } catch (error) {
+      if (error.code !== "ENOENT") throw error;
+    }
   }
+  return found ? hash.digest("hex") : "";
 }
 
 async function ensureMixerMetadata(filePath, slot, library) {
@@ -4494,7 +6541,8 @@ async function clearAnalyzerDerivedSongDefaults(songFolder) {
     "",
     "empty-default",
     "dynamic-cue-analysis",
-    "derived-from-analyzer-region-candidates"
+    "derived-from-analyzer-region-candidates",
+    "analyzer-cue-phrase-marker-refresh"
   ]);
   for (const filePath of [appDefaultRegionsPath(songFolder), appDefaultCueMarkersPath(songFolder)]) {
     const current = await readJsonFile(filePath, null);
@@ -4731,22 +6779,74 @@ function setFingerprint(setlist) {
       ? slot.cachedStems.map((stem) => ({ id: stem.id, relativePath: stem.relativePath, cacheRelativePath: stem.cacheRelativePath }))
       : [],
     key: slot.key || "",
+    originalKey: slot.originalKey || slot.key || "",
+    selectedKey: slot.selectedKey || slot.key || "",
+    transposeCents: Number(slot.transposeCents || 0),
+    padKey: slot.padKey || slot.key || "",
     bpm: slot.bpm || null,
     timeSignature: slot.timeSignature || ""
   }));
-  return createHash("sha1").update(JSON.stringify(payload)).digest("hex");
+  const transitions = normalizeSetlistTransitions(setlist.transitions, setlist.slots)
+    .map((transition) => ({
+      fromSlot: transition.fromSlot,
+      toSlot: transition.toSlot,
+      mode: transition.mode,
+      padBehavior: transition.padBehavior,
+      continuePad: transition.continuePad,
+      durationSeconds: transition.durationSeconds
+  }));
+  return createHash("sha1").update(JSON.stringify({ slots: payload, transitions })).digest("hex");
 }
 
 function normalizeSetlist(value = {}) {
   value = value && typeof value === "object" ? value : {};
   const slots = Array.isArray(value.slots) ? value.slots : [];
   const slotCount = Math.max(10, slots.length);
+  const normalizedSlots = Array.from({ length: slotCount }, (_, index) => normalizeSetlistSlot(slots[index], index));
   return {
     id: "current",
     name: "Current Set",
     slotCount,
     updatedAt: new Date().toISOString(),
-    slots: Array.from({ length: slotCount }, (_, index) => normalizeSetlistSlot(slots[index], index))
+    slots: normalizedSlots,
+    transitions: normalizeSetlistTransitions(value.transitions, normalizedSlots)
+  };
+}
+
+function normalizeSetlistTransitions(value, slots = []) {
+  const filled = (slots || [])
+    .filter((slot) => slot?.songId)
+    .map((slot) => Number(slot.slot))
+    .filter(Boolean)
+    .sort((a, b) => a - b);
+  const adjacentPairs = [];
+  for (let index = 0; index < filled.length - 1; index += 1) {
+    adjacentPairs.push({ fromSlot: filled[index], toSlot: filled[index + 1] });
+  }
+  const existingByPair = new Map((Array.isArray(value) ? value : [])
+    .map((transition) => normalizeSetlistTransition(transition))
+    .filter(Boolean)
+    .map((transition) => [`${transition.fromSlot}:${transition.toSlot}`, transition]));
+  return adjacentPairs.map((pair) => normalizeSetlistTransition({
+    ...existingByPair.get(`${pair.fromSlot}:${pair.toSlot}`),
+    fromSlot: pair.fromSlot,
+    toSlot: pair.toSlot
+  }));
+}
+
+function normalizeSetlistTransition(value = {}) {
+  const fromSlot = positiveNumber(value.fromSlot);
+  const toSlot = positiveNumber(value.toSlot);
+  if (!fromSlot || !toSlot || fromSlot === toSlot) return null;
+  const mode = TRANSITION_MODES.has(value.mode) ? value.mode : "cue-next";
+  const padBehavior = TRANSITION_PAD_BEHAVIORS.has(value.padBehavior) ? value.padBehavior : "next-song-key";
+  return {
+    fromSlot,
+    toSlot,
+    mode,
+    padBehavior,
+    durationSeconds: positiveNumber(value.durationSeconds) || 5,
+    continuePad: value.continuePad !== false
   };
 }
 
@@ -4762,6 +6862,10 @@ function normalizeSetlistSlot(slot, index) {
     vendor: stringValue(slot.vendor),
     folderPath: stringValue(slot.folderPath),
     key: stringValue(slot.key),
+    originalKey: stringValue(slot.originalKey || slot.key),
+    selectedKey: stringValue(slot.selectedKey || slot.key),
+    transposeCents: Number.isFinite(Number(slot.transposeCents)) ? Number(slot.transposeCents) : 0,
+    padKey: stringValue(slot.padKey || slot.key),
     bpm: positiveNumber(slot.bpm),
     timeSignature: stringValue(slot.timeSignature),
     trackCount: positiveNumber(slot.trackCount),
@@ -4770,6 +6874,7 @@ function normalizeSetlistSlot(slot, index) {
     cacheFolder: stringValue(slot.cacheFolder),
     cachedTrackCount: positiveNumber(slot.cachedTrackCount),
     cachedAt: stringValue(slot.cachedAt),
+    keyChangeCache: slot.keyChangeCache && typeof slot.keyChangeCache === "object" ? slot.keyChangeCache : null,
     readinessState: stringValue(slot.readinessState),
     missingStems: Array.isArray(slot.missingStems) ? slot.missingStems.map(stringValue).filter(Boolean) : [],
     cachedStems: Array.isArray(slot.cachedStems) ? slot.cachedStems.map(normalizeCachedStem).filter(Boolean) : []
@@ -4789,7 +6894,11 @@ function syncSetlistWithLibrary(setlist, library) {
         title: song.title,
         vendor: song.vendor,
         folderPath: song.folderPath,
-        key: song.key,
+        key: canonicalMajorKey(slot.selectedKey || song.key) || song.key,
+        originalKey: canonicalMajorKey(song.key) || song.key,
+        selectedKey: canonicalMajorKey(slot.selectedKey || song.key) || song.key,
+        transposeCents: effectiveTransposeCents(song.key, slot.selectedKey || song.key, slot.transposeCents),
+        padKey: canonicalMajorKey(slot.selectedKey || song.padKey || song.key) || song.padKey || song.key,
         bpm: song.bpm,
         timeSignature: song.timeSignature,
         trackCount: song.trackCount,
@@ -4824,6 +6933,8 @@ function normalizeCachedStem(stem) {
     stemGroup: stringValue(stem.stemGroup),
     bus: stringValue(stem.bus),
     playLive: stem.playLive !== false,
+    transposeCached: Boolean(stem.transposeCached),
+    transposeCents: Number.isFinite(Number(stem.transposeCents)) ? Number(stem.transposeCents) : 0,
     durationMs: positiveNumber(stem.durationMs),
     sampleRate: positiveNumber(stem.sampleRate),
     channels: positiveNumber(stem.channels),
@@ -4868,15 +6979,21 @@ async function prepareSetlistCache(setlist, options = {}) {
     }
 
     try {
-      const cache = await cacheSongForSetlistSlot(song, slot.slot);
+      const cache = await cacheSongForSetlistSlot(song, slot);
       preparedSlots.push({
         ...slot,
         folderPath: song.folderPath,
+        key: cache.selectedKey || slot.key || song.key,
+        originalKey: cache.originalKey || slot.originalKey || song.key,
+        selectedKey: cache.selectedKey || slot.selectedKey || song.key,
+        transposeCents: Number(cache.transposeCents || 0),
+        padKey: cache.selectedKey || slot.padKey || song.padKey || song.key,
         trackCount: cache.expectedTrackCount,
         cacheStatus: cache.missingStems.length ? "cached-with-warnings" : "cached",
         readinessState: cache.missingStems.length ? "warning" : "ready",
         cacheFolder: cache.cacheFolder,
         cachedTrackCount: cache.cachedTrackCount,
+        keyChangeCache: cache.keyChangeCache,
         missingStems: cache.missingStems,
         cachedStems: cache.cachedStems,
         cachedAt: cache.cachedAt
@@ -4901,12 +7018,60 @@ async function prepareSetlistCache(setlist, options = {}) {
   };
 }
 
-async function cacheSongForSetlistSlot(song, slotNumber) {
+async function updateSetlistSlotKey(slotNumber, selectedKeyInput) {
+  if (!slotNumber) throw new Error("A setlist slot is required for key change.");
+  const playback = await loadPlaybackState();
+  if (playback.mode === "performance") {
+    throw new Error("Leave Performance Mode before changing a song key.");
+  }
+  const selectedKey = canonicalMajorKey(selectedKeyInput);
+  if (!selectedKey) throw new Error("Choose a valid song key.");
+  const setlist = await loadCurrentSetlist();
+  const library = await loadLibrary();
+  const slot = (setlist.slots || []).find((item) => Number(item.slot) === Number(slotNumber) && item.songId);
+  if (!slot) throw new Error(`Setlist slot ${slotNumber} is empty.`);
+  const song = (library.songs || []).find((item) => item.id === slot.songId);
+  if (!song) throw new Error("Song is no longer available in the library.");
+  const originalKey = canonicalMajorKey(slot.originalKey || song.key || slot.key);
+  const transposeCents = effectiveTransposeCents(originalKey, selectedKey);
+  const next = normalizeSetlist({
+    ...setlist,
+    slots: (setlist.slots || []).map((item) => Number(item.slot) === Number(slotNumber)
+      ? {
+          ...item,
+          key: selectedKey,
+          originalKey,
+          selectedKey,
+          transposeCents,
+          padKey: selectedKey
+        }
+      : item)
+  });
+  const prepared = await prepareSetlistCache(next, { slotNumbers: [slotNumber] });
+  await saveCurrentSetlist(prepared);
+  await ensureSetMetadata(prepared, { allowAnalysis: false });
+  await cleanupSetlistGeneratedArtifacts(prepared);
+  await markSetUnconfirmed(prepared);
+  await refreshEngineManifestForMixer();
+  return prepared;
+}
+
+async function cacheSongForSetlistSlot(song, slot) {
+  const slotNumber = positiveNumber(slot?.slot) || 1;
   const tracks = Array.isArray(song.tracks) ? song.tracks : [];
   if (!tracks.length) {
     throw new Error("No metadata WAV files found for song.");
   }
   const alignment = await readSongAudioAlignment(song.folderPath);
+  const originalKey = canonicalMajorKey(slot.originalKey || song.key || "");
+  const selectedKey = canonicalMajorKey(slot.selectedKey || slot.key || song.key || "") || originalKey;
+  const transposeCents = effectiveTransposeCents(originalKey, selectedKey, slot.transposeCents);
+  const keyChange = await prepareKeyChangeCacheForSong(song, {
+    originalKey,
+    selectedKey,
+    transposeCents,
+    sampleRate: positiveNumber((await loadSettings()).audioEngine?.sampleRate) || 48000
+  });
   const cacheFolder = resolve(CACHE_DIR, "current-setlist", `slot-${String(slotNumber).padStart(2, "0")}-${song.id}`);
   assertInsideCache(cacheFolder);
   await rm(cacheFolder, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
@@ -4916,10 +7081,12 @@ async function cacheSongForSetlistSlot(song, slotNumber) {
   const cachedStems = [];
   let cachedTrackCount = 0;
   for (const track of tracks) {
-    const sourcePath = resolve(song.folderPath, track.relativePath);
+    const keyChangedTrack = keyChange.tracksById.get(track.id) || keyChange.tracksById.get(track.relativePath) || null;
+    const sourcePath = keyChangedTrack?.filePath || resolve(song.folderPath, track.relativePath);
     const targetPath = resolve(cacheFolder, track.relativePath);
     try {
-      assertInsideRoot(sourcePath);
+      if (keyChangedTrack) assertInsideKeyCache(sourcePath);
+      else assertInsideRoot(sourcePath);
       assertInsideCache(targetPath);
       await mkdir(dirname(targetPath), { recursive: true });
       await copyFile(sourcePath, targetPath);
@@ -4927,6 +7094,8 @@ async function cacheSongForSetlistSlot(song, slotNumber) {
       cachedTrackCount += 1;
       cachedStems.push({
         ...trackSummary(track),
+        transposeCached: Boolean(keyChangedTrack),
+        transposeCents,
         cacheRelativePath: track.relativePath,
         cachePath: targetPath,
         durationMs: shifted ? Math.round(shifted.durationSeconds * 1000) : track.durationMs,
@@ -4945,12 +7114,244 @@ async function cacheSongForSetlistSlot(song, slotNumber) {
 
   return {
     cacheFolder,
+    originalKey,
+    selectedKey,
+    transposeCents,
+    keyChangeCache: keyChange.summary,
     expectedTrackCount: tracks.length,
     cachedTrackCount,
     missingStems,
     cachedStems,
     cachedAt: new Date().toISOString()
   };
+}
+
+async function prepareKeyChangeCacheForSong(song, context) {
+  const transposeCents = Number(context.transposeCents || 0);
+  const originalKey = canonicalMajorKey(context.originalKey || song.key || "");
+  const selectedKey = canonicalMajorKey(context.selectedKey || song.key || "") || originalKey;
+  const transposableTracks = (song.tracks || []).filter(shouldTransposeTrackForKeyChange);
+  if (!song.id || Math.abs(transposeCents) < 0.01 || !transposableTracks.length) {
+    return {
+      tracksById: new Map(),
+      summary: {
+        active: false,
+        reason: Math.abs(transposeCents) < 0.01 ? "original-key" : "no-transposable-stems",
+        originalKey,
+        selectedKey,
+        transposeCents
+      }
+    };
+  }
+
+  const ffmpeg = await firstExistingFile(FFMPEG_EXE_CANDIDATES);
+  if (!ffmpeg) throw new Error("FFmpeg with Rubber Band is required for key changes.");
+  const cacheFolder = resolve(KEY_CACHE_DIR, song.id, keyCacheFolderName(selectedKey, transposeCents));
+  assertInsideKeyCache(cacheFolder);
+  const manifestPath = join(cacheFolder, "preparation-manifest.json");
+  await mkdir(cacheFolder, { recursive: true });
+  const sourceManifest = await keyChangeSourceManifest(song, transposableTracks, context.sampleRate, originalKey, selectedKey, transposeCents);
+  const existing = await readJsonFile(manifestPath, null);
+  const tracksById = new Map();
+  if (existing?.fingerprint === sourceManifest.fingerprint && Array.isArray(existing.generatedFiles)) {
+    for (const file of existing.generatedFiles) {
+      const filePath = resolve(cacheFolder, file.relativePath);
+      assertInsideKeyCache(filePath);
+      try {
+        await stat(filePath);
+        tracksById.set(file.id, { filePath });
+        tracksById.set(file.relativePath, { filePath });
+      } catch {
+        tracksById.clear();
+        break;
+      }
+    }
+    if (tracksById.size) {
+      return {
+        tracksById,
+        summary: {
+          active: true,
+          reused: true,
+          originalKey,
+          selectedKey,
+          transposeCents,
+          cacheFolder,
+          manifestPath,
+          renderedCount: existing.generatedFiles.length
+        }
+      };
+    }
+  }
+
+  const tempFolder = `${cacheFolder}.generating`;
+  assertInsideKeyCache(tempFolder);
+  await rm(tempFolder, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+  await mkdir(tempFolder, { recursive: true });
+  const generatedFiles = [];
+  for (const track of transposableTracks) {
+    const sourcePath = resolve(song.folderPath, track.relativePath);
+    assertInsideRoot(sourcePath);
+    const relativePath = track.relativePath;
+    const outputPath = resolve(tempFolder, relativePath);
+    assertInsideKeyCache(outputPath);
+    await mkdir(dirname(outputPath), { recursive: true });
+    await renderTransposedWav({ ffmpeg, sourcePath, outputPath, sampleRate: context.sampleRate, transposeCents });
+    generatedFiles.push({
+      id: track.id,
+      relativePath,
+      sourceRelativePath: track.relativePath,
+      sha1: await fileSha1(outputPath)
+    });
+  }
+  const manifest = {
+    schema: "playback-v2-key-change-cache",
+    version: 1,
+    generator: KEY_CHANGE_CACHE_VERSION,
+    createdAt: new Date().toISOString(),
+    songId: song.id,
+    title: song.title,
+    originalKey,
+    selectedKey,
+    transposeCents,
+    sampleRate: context.sampleRate,
+    fingerprint: sourceManifest.fingerprint,
+    sources: sourceManifest.sources,
+    generatedFiles
+  };
+  await writeFile(join(tempFolder, "preparation-manifest.json"), `${JSON.stringify(manifest, null, 2)}\n`, "utf8");
+  await rm(cacheFolder, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+  await rename(tempFolder, cacheFolder);
+  for (const file of generatedFiles) {
+    const filePath = resolve(cacheFolder, file.relativePath);
+    tracksById.set(file.id, { filePath });
+    tracksById.set(file.relativePath, { filePath });
+  }
+  return {
+    tracksById,
+    summary: {
+      active: true,
+      reused: false,
+      generated: true,
+      originalKey,
+      selectedKey,
+      transposeCents,
+      cacheFolder,
+      manifestPath,
+      renderedCount: generatedFiles.length
+    }
+  };
+}
+
+function shouldTransposeTrackForKeyChange(track) {
+  const role = stringValue(track.playbackRole).toLowerCase();
+  const group = stringValue(track.stemGroup).toLowerCase();
+  const bus = canonicalBus(track.bus || "");
+  if (track.playLive === false) return false;
+  if (["click-reference", "cue-reference"].includes(role)) return false;
+  if (["click", "cues", "dynamiccue"].includes(bus.toLowerCase())) return false;
+  if (/\b(click|cue|cues|guide|guides|count|countoff|metronome|talkback|utility)\b/i.test(group)) return false;
+  return role === "music-stem" || bus === "tracks" || bus === "pads" || !bus;
+}
+
+async function keyChangeSourceManifest(song, tracks, sampleRate, originalKey, selectedKey, transposeCents) {
+  const sources = [];
+  for (const track of tracks) {
+    const sourcePath = resolve(song.folderPath, track.relativePath);
+    assertInsideRoot(sourcePath);
+    const sourceStat = await stat(sourcePath);
+    sources.push({
+      id: track.id,
+      relativePath: track.relativePath,
+      bytes: sourceStat.size,
+      mtimeMs: Math.round(sourceStat.mtimeMs),
+      sha1: track.sha256 || await fileSha1(sourcePath)
+    });
+  }
+  const fingerprint = createHash("sha1").update(JSON.stringify({
+    generator: KEY_CHANGE_CACHE_VERSION,
+    songId: song.id,
+    sampleRate,
+    originalKey,
+    selectedKey,
+    transposeCents,
+    sources
+  })).digest("hex");
+  return { fingerprint, sources };
+}
+
+async function renderTransposedWav({ ffmpeg, sourcePath, outputPath, sampleRate, transposeCents }) {
+  const ratio = Math.pow(2, Number(transposeCents || 0) / 1200);
+  const args = [
+    "-y",
+    "-i", sourcePath,
+    "-af", `rubberband=pitch=${ratio.toFixed(8)}`,
+    "-ar", String(sampleRate || 48000),
+    outputPath
+  ];
+  await new Promise((resolvePromise, rejectPromise) => {
+    const child = spawn(ffmpeg, args, { windowsHide: true });
+    let stderr = "";
+    child.stderr.on("data", (chunk) => { stderr += chunk.toString(); });
+    child.on("error", rejectPromise);
+    child.on("close", (code) => {
+      if (code === 0) resolvePromise();
+      else rejectPromise(new Error(`FFmpeg key change failed (${code}): ${stderr.trim()}`));
+    });
+  });
+}
+
+async function firstExistingFile(paths) {
+  for (const filePath of paths) {
+    try {
+      await stat(filePath);
+      return filePath;
+    } catch (error) {
+      if (error.code !== "ENOENT") throw error;
+    }
+  }
+  return "";
+}
+
+function keyCacheFolderName(selectedKey, transposeCents) {
+  return `${keyFolderNameForKey(selectedKey)}_${Math.round(Number(transposeCents || 0))}c`;
+}
+
+function keyFolderNameForKey(key) {
+  return canonicalMajorKey(key).replace(/b/g, "b").replace(/[^A-Gb]/g, "") || "Key";
+}
+
+function effectiveTransposeCents(originalKey, selectedKey, storedCents = 0) {
+  const computed = centsBetweenKeys(originalKey, selectedKey);
+  if (computed !== 0) return computed;
+  return Number.isFinite(Number(storedCents)) ? Number(storedCents) : 0;
+}
+
+function centsBetweenKeys(originalKey, selectedKey) {
+  const original = KEY_OPTIONS.indexOf(canonicalMajorKey(originalKey).replace(/m$/i, ""));
+  const selected = KEY_OPTIONS.indexOf(canonicalMajorKey(selectedKey).replace(/m$/i, ""));
+  if (original < 0 || selected < 0) return 0;
+  let delta = selected - original;
+  if (delta > 6) delta -= 12;
+  if (delta < -6) delta += 12;
+  return delta * 100;
+}
+
+function canonicalMajorKey(value) {
+  const normalized = stringValue(value).trim().replace(/♯/g, "#").replace(/♭/g, "b").replace(/\s+/g, "");
+  if (!normalized) return "";
+  const minor = /m$/i.test(normalized);
+  const root = normalized.charAt(0).toUpperCase();
+  const accidental = normalized.slice(1).replace(/m$/i, "");
+  const candidate = `${root}${accidental}`;
+  const aliases = {
+    "C#": "Db",
+    "D#": "Eb",
+    "F#": "Gb",
+    "G#": "Ab",
+    "A#": "Bb"
+  };
+  const canonical = aliases[candidate] || (KEY_OPTIONS.includes(candidate) ? candidate : "");
+  return canonical ? `${canonical}${minor ? "m" : ""}` : "";
 }
 
 async function scanLibrary(options = {}) {
@@ -5010,6 +7411,7 @@ async function scanLibrary(options = {}) {
         gridStatus: metadata.gridStatus,
         cueStatus: metadata.cueStatus,
         key: metadata.key,
+        padKey: metadata.padKey || metadata.key,
         bpm: metadata.bpm,
         timeSignature: metadata.timeSignature,
         tempoMap: metadata.tempoMap,
@@ -5182,11 +7584,13 @@ async function importSongMetadata(songFolder, options = {}) {
 
     const metadataDir = appSongMetadataDir(songFolder);
     await mkdir(metadataDir, { recursive: true });
-    const sourceFingerprint = createHash("sha1").update(raw).digest("hex");
+    const sourceFingerprint = await sourceMetadataFingerprintForSongFolder(songFolder);
     const sourceManifestPath = join(metadataDir, "source-manifest.json");
     const previousSource = await readJsonFile(sourceManifestPath, null);
     if (previousSource?.fingerprint && previousSource.fingerprint !== sourceFingerprint) {
       await clearAnalyzerDerivedSongDefaults(songFolder);
+      await rm(appCueRecognitionReportPath(songFolder), { force: true });
+      await rm(appDynamicCueMapPath(songFolder), { force: true });
       await cleanupGeneratedArtifactsForSong(songId(songFolder));
     }
     await writeFile(appSongMetadataPath(songFolder), raw, "utf8");
@@ -5417,6 +7821,7 @@ async function parseSongMetadata(songFolder, parsed, metadataDir) {
     .filter(Boolean)
     .filter((track) => track.playLive === true);
   const key = stringValue(musical.key || parsed.key || parsed.defaultKey || parsed.originalKey);
+  const padKey = stringValue(musical.padKey || parsed.padKey || key);
   const bpm = positiveNumber(gridAnalysis?.bpm) || positiveNumber(musical.displayBpm ?? musical.bpm ?? parsed.bpm ?? parsed.defaultBpm ?? parsed.originalBpm);
   const timeSignature = displayTimeSignature(gridAnalysis?.timeSignature) || displayTimeSignature(musical.timeSignature || parsed.timeSignature || parsed.click?.timeSignature);
   return {
@@ -5427,6 +7832,7 @@ async function parseSongMetadata(songFolder, parsed, metadataDir) {
     gridStatus: stringValue(gridAnalysis?.status || parsed.gridStatus || parsed.gridAnalysis?.status),
     cueStatus: stringValue(parsed.cueStatus || parsed.cueIntelligence?.status),
     key,
+    padKey,
     bpm,
     timeSignature,
     dynamicClick: normalizeSongDynamicClick(parsed.dynamicClick),
@@ -5717,6 +8123,18 @@ function appDefaultCueMarkersPath(songFolder) {
   return join(appSongMetadataDir(songFolder), "default-cue-markers.json");
 }
 
+function appSongOverridesDir(songIdValue) {
+  return join(SONG_OVERRIDES_DIR, stringValue(songIdValue) || "unknown-song");
+}
+
+function appApprovedRegionsPath(songIdValue) {
+  return join(appSongOverridesDir(songIdValue), "regions.approved.json");
+}
+
+function appApprovedCueMarkersPath(songIdValue) {
+  return join(appSongOverridesDir(songIdValue), "cue-markers.approved.json");
+}
+
 function appAudioAlignmentPath(songFolder) {
   return join(appSongMetadataDir(songFolder), "audio-alignment.json");
 }
@@ -5815,6 +8233,8 @@ function trackSummary(track) {
     stemGroup: track.stemGroup || "",
     bus: canonicalBus(track.bus || ""),
     playLive: track.playLive !== false,
+    transposeCached: Boolean(track.transposeCached),
+    transposeCents: Number.isFinite(Number(track.transposeCents)) ? Number(track.transposeCents) : 0,
     durationMs: positiveNumber(track.durationMs),
     sampleRate: positiveNumber(track.sampleRate),
     channels: positiveNumber(track.channels),
@@ -5914,6 +8334,14 @@ function assertInsideCache(filePath) {
   }
 }
 
+function assertInsideKeyCache(filePath) {
+  const normalizedCache = resolve(KEY_CACHE_DIR).toLowerCase();
+  const normalizedFile = resolve(filePath).toLowerCase();
+  if (normalizedFile !== normalizedCache && !normalizedFile.startsWith(`${normalizedCache}\\`)) {
+    throw new Error("Key change cache path is not allowed.");
+  }
+}
+
 function assertInsideData(filePath) {
   const normalizedData = resolve(DATA_DIR).toLowerCase();
   const normalizedFile = resolve(filePath).toLowerCase();
@@ -5945,7 +8373,12 @@ async function serveStatic(pathname, res) {
   try {
     const fileStat = await stat(filePath);
     if (!fileStat.isFile()) return json(res, { error: "Not found." }, 404);
-    res.writeHead(200, { "Content-Type": mimeTypes[extname(filePath).toLowerCase()] || "application/octet-stream" });
+    res.writeHead(200, {
+      "Content-Type": mimeTypes[extname(filePath).toLowerCase()] || "application/octet-stream",
+      "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+      "Pragma": "no-cache",
+      "Expires": "0"
+    });
     return createReadStream(filePath).pipe(res);
   } catch (error) {
     if (error.code === "ENOENT") return json(res, { error: "Not found." }, 404);

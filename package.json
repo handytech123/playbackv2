@@ -9,7 +9,9 @@
   "scripts": {
     "start": "node server.js",
     "electron": "electron .",
-    "check": "node --check server.js && node --check public/app.js && node --check public/remote.js && node --check electron/main.cjs",
+    "check": "node --check server.js && node --check public/app.js && node --check public/remote.js && node --check electron/main.cjs && node scripts/verify-architecture-alignment.mjs && node scripts/validate-pad-panic.mjs && node scripts/validate-transitions.mjs && node scripts/smoke-live-command-plans.mjs",
+    "check:pad-panic": "node scripts/validate-pad-panic.mjs",
+    "check:transitions": "node scripts/validate-transitions.mjs",
     "build:win": "electron-builder --win portable",
     "build:win:installer": "electron-builder --win nsis"
   },

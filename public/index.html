@@ -39,9 +39,10 @@
             <button class="transport-icon" data-command="pause" type="button" aria-label="Pause" title="Pause">&#9208;</button>
             <button class="transport-icon" data-command="stop" type="button" aria-label="Stop" title="Stop">&#9209;</button>
             <button class="transport-icon" data-command="fadeOut" type="button" aria-label="Fade out" title="Fade out">&#9706;</button>
+            <button class="transport-icon pad-command" data-command="togglePad" type="button" aria-label="Toggle pad" title="Toggle pad">Pad</button>
             <button class="transport-icon danger-command panic-command hidden" data-command="panic" type="button" aria-label="Panic" title="Panic">!</button>
             <button id="exitPanicButton" class="transport-icon panic-exit-command hidden" type="button" aria-label="Exit panic" title="Exit panic at next measure">OK</button>
-            <button class="transport-icon" data-command="nextSong" type="button" aria-label="Next song" title="Next song">&#9197;</button>
+            <button class="transport-icon" data-command="songTransition" type="button" aria-label="Cue next song" title="Cue next song">&#9197;</button>
           </section>
           <div class="setlist-toolbar">
             <button id="quickConfirmSetButton" class="quick-confirm-button" type="button">Confirm Set</button>
@@ -130,6 +131,7 @@
                     <option value="Click Section"></option>
                   </datalist>
                 </label>
+                <button id="regionSplitButton" type="button">Split At Playhead</button>
                 <button id="regionRenameButton" type="button">Rename</button>
                 <button id="regionTrimButton" type="button">Trim</button>
                 <button id="regionRemoveGapButton" type="button">Remove + Close Gap</button>
@@ -139,6 +141,20 @@
           </section>
 
           <section id="editorPanel" class="editor-panel hidden">
+            <div class="editor-card playback-key-card">
+              <div class="panel-title">
+                <strong>Playback Key</strong>
+                <span id="playbackKeyStatus">Selected song key and matching dynamic pad.</span>
+              </div>
+              <div class="inline-form playback-key-form">
+                <label>Setlist Key
+                  <select id="playbackKeySelect"></select>
+                </label>
+                <span id="playbackKeyOriginal">Original: --</span>
+                <span id="playbackKeyTranspose">Transpose: 0 cents</span>
+              </div>
+            </div>
+
             <div class="editor-card">
               <div class="panel-title">
                 <strong>Tempo Map</strong>
@@ -149,6 +165,7 @@
                 <label>BPM <input id="tempoBpmInput" type="number" min="1" step="0.01"></label>
                 <label>Time Sig <input id="tempoTimeSignatureInput" type="text" placeholder="4/4"></label>
                 <button id="saveMetadataButton" type="button">Save Draft</button>
+                <button id="approveMetadataButton" type="button">Approve Cue/Regions</button>
               </div>
               <div class="inline-form audio-align-form">
                 <button id="alignAudioStartButton" type="button">Move Audio Start Here</button>
@@ -176,6 +193,8 @@
                     <span id="arrangementEnabledLabel">Arrangement On</span>
                   </label>
                   <button id="undoArrangementButton" type="button" disabled>Undo Arrangement</button>
+                  <button id="trimSongStartButton" type="button">Trim Start To Playhead</button>
+                  <button id="trimSongEndButton" type="button">Trim End To Playhead</button>
                   <button id="saveArrangementButton" type="button">Save Arrangement Now</button>
                   <button id="clearArrangementButton" type="button">Clear Arrangement</button>
                 </div>
@@ -272,6 +291,7 @@
           <button class="settings-tab active" type="button" data-settings-tab="librarySettings">Library</button>
           <button class="settings-tab" type="button" data-settings-tab="audioSettings">Audio</button>
           <button class="settings-tab" type="button" data-settings-tab="routingSettings">Routing</button>
+          <button class="settings-tab" type="button" data-settings-tab="remoteSettings">Remote</button>
           <button class="settings-tab" type="button" data-settings-tab="playbackSettings">Playback</button>
           <button class="settings-tab" type="button" data-settings-tab="advancedSettings">Advanced</button>
         </div>
@@ -338,6 +358,27 @@
                 <button type="button" data-folder-picker="padsFolderInput">Browse</button>
               </span>
             </label>
+            <label class="setting-checkbox">
+              <input id="padsDefaultEnabledInput" type="checkbox">
+              <span>Pad Enabled By Default</span>
+            </label>
+            <label class="setting-checkbox">
+              <input id="padsStartWithSongInput" type="checkbox">
+              <span>Start Pad With Song</span>
+            </label>
+            <label class="setting-checkbox">
+              <input id="padsContinueBetweenSongsInput" type="checkbox">
+              <span>Continue Pad Between Songs</span>
+            </label>
+            <label>Pad Default Volume
+              <input id="padsDefaultVolumeInput" type="number" min="0" max="100" step="1">
+            </label>
+            <label>Pad Fade In Ms
+              <input id="padsFadeInInput" type="number" min="0" step="100">
+            </label>
+            <label>Pad Fade Out Ms
+              <input id="padsFadeOutInput" type="number" min="0" step="100">
+            </label>
             <label>Dynamic Click WAV
               <span class="path-picker">
                 <input id="dynamicClickSoundInput" type="text" placeholder="Path to normal click WAV">
@@ -362,6 +403,24 @@
           </div>
         </section>
 
+        <section id="remoteSettings" class="settings-section">
+          <div class="settings-grid">
+            <div class="settings-readout">
+              <span>Remote Status</span>
+              <strong id="remoteStatusReadout">Ready</strong>
+            </div>
+            <div class="settings-readout">
+              <span>Stage Remote</span>
+              <strong id="remotePrimaryUrl">--</strong>
+            </div>
+            <div class="remote-actions">
+              <button id="openRemoteButton" type="button">Open Remote</button>
+              <button id="copyRemoteUrlButton" type="button">Copy URL</button>
+            </div>
+            <div id="remoteUrlList" class="remote-url-list"></div>
+          </div>
+        </section>
+
         <section id="playbackSettings" class="settings-section">
           <div class="settings-grid">
             <button id="confirmSetButton" type="button">Confirm Set</button>
@@ -377,10 +436,13 @@
         <section id="advancedSettings" class="settings-section">
           <div class="settings-grid">
             <button id="runSystemCheckButton" type="button">Run Error Check</button>
+            <button id="auditMetadataButton" type="button">Audit Cue/Region Cache</button>
+            <button id="rehydrateMetadataButton" type="button">Rehydrate Cue/Region Cache</button>
             <div id="systemCheckResult" class="settings-readout">
               <span>Error Check</span>
               <strong>Not run</strong>
             </div>
+            <pre id="metadataAuditReport" class="settings-report hidden"></pre>
             <details class="engine-manifest">
               <summary>Engine Snapshot</summary>
               <pre id="engineManifestPreview">Confirm Set to create the engine snapshot.</pre>
@@ -390,6 +452,6 @@
       </section>
     </main>
 
-    <script src="/app.js" type="module"></script>
+    <script src="/app.js?v=20260726-sync-9" type="module"></script>
   </body>
 </html>

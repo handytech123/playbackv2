@@ -32,7 +32,7 @@ button {
 .remote-shell {
   min-height: 100vh;
   display: grid;
-  grid-template-rows: auto auto auto minmax(190px, 1fr) auto minmax(120px, 0.75fr) auto;
+  grid-template-rows: auto auto auto minmax(250px, 1fr) auto auto;
   gap: 8px;
   padding: 10px;
   overflow: hidden;
@@ -146,13 +146,35 @@ button {
 }
 
 .panic-panel {
-  display: flex;
-  justify-content: space-between;
+  display: grid;
+  grid-template-columns: minmax(180px, 1fr) auto;
+  align-items: center;
   gap: 10px;
   padding: 10px 12px;
   border-color: var(--red);
   background: #2a1010;
   color: #fff4f4;
+}
+
+.panic-panel div:first-child {
+  display: grid;
+  gap: 2px;
+}
+
+.panic-recover-next {
+  min-height: 42px;
+  border: 1px solid var(--blue);
+  border-radius: 8px;
+  background: #0b2638;
+  color: #fff;
+  font-weight: 900;
+  padding: 0 14px;
+}
+
+#panicRecoveryTarget {
+  min-width: 160px;
+  text-align: right;
+  font-weight: 800;
 }
 
 .hidden {
@@ -180,6 +202,27 @@ button {
   overflow-x: auto;
   padding: 6px 0 2px;
   scrollbar-width: thin;
+}
+
+.transition-readout {
+  display: grid;
+  grid-template-columns: minmax(160px, 1fr) auto auto;
+  gap: 10px;
+  align-items: center;
+  margin-top: 4px;
+  padding: 7px 9px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 8px;
+  background: rgba(7, 10, 13, 0.72);
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.transition-readout strong {
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .song-card {
@@ -228,6 +271,10 @@ button {
   background: #20282c;
 }
 
+.wave-panel.region-playing {
+  border-color: var(--blue);
+}
+
 .wave-status {
   position: absolute;
   z-index: 4;
@@ -250,7 +297,8 @@ button {
   display: block;
   width: 100%;
   height: 100%;
-  min-height: 190px;
+  min-height: 250px;
+  cursor: pointer;
 }
 
 .wave-playhead {
@@ -291,6 +339,29 @@ button {
   text-overflow: ellipsis;
 }
 
+.wave-recovery-bar {
+  position: absolute;
+  z-index: 6;
+  left: 12px;
+  right: 12px;
+  bottom: 10px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 8px;
+  border: 1px solid var(--yellow);
+  border-radius: 8px;
+  background: rgba(42, 24, 3, 0.92);
+  color: #ffe7a4;
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.28);
+}
+
+.wave-recovery-bar #panicRecoveryTarget {
+  min-width: 0;
+  text-align: left;
+}
+
 .command-grid {
   display: grid;
   grid-template-columns: repeat(5, 1fr);
@@ -319,9 +390,7 @@ button {
 }
 
 .sections-panel {
-  min-height: 120px;
-  padding: 10px;
-  overflow: auto;
+  padding: 8px;
 }
 
 .panel-title {
@@ -349,8 +418,21 @@ button {
 }
 
 .region-button.current {
-  border-color: var(--green);
-  box-shadow: 0 0 0 2px rgba(39, 212, 125, 0.24) inset;
+  border-color: var(--blue);
+  background: #0c2130;
+  color: #fff;
+  box-shadow: 0 0 0 2px rgba(66, 183, 255, 0.7) inset;
+}
+
+.region-button.recovery-target {
+  border-color: var(--yellow);
+  background: #2b2107;
+  color: #fff3bf;
+  box-shadow: 0 0 0 2px rgba(245, 189, 66, 0.65) inset;
+}
+
+.region-button.panic-select {
+  border-color: #805f18;
 }
 
 .remote-footer {
@@ -371,7 +453,7 @@ button {
 
 @media (max-width: 760px) {
   .remote-shell {
-    grid-template-rows: auto auto auto minmax(150px, 1fr) auto minmax(110px, 0.8fr) auto;
+    grid-template-rows: auto auto auto minmax(190px, 1fr) auto auto;
     padding: 8px;
   }
 
@@ -386,8 +468,22 @@ button {
     grid-column: span 1;
   }
 
+  .panic-panel {
+    grid-template-columns: 1fr;
+  }
+
   .setlist-cards {
     grid-auto-columns: minmax(138px, 52vw);
+  }
+
+  .wave-recovery-bar {
+    left: 8px;
+    right: 8px;
+    bottom: 8px;
+  }
+
+  .panic-recover-next {
+    min-width: 128px;
   }
 
   .command-grid {

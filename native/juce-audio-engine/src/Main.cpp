@@ -7,6 +7,7 @@
 #include <cmath>
 #include <iostream>
 #include <memory>
+#include <mutex>
 #include <utility>
 #include <vector>
 
@@ -270,7 +271,8 @@ void sendDevices(const juce::String& requestId)
 void sendDeviceProbe(const juce::String& requestId,
                      const juce::String& deviceName,
                      const juce::String& deviceType,
-                     int requestedOutputs)
+                     int requestedOutputs,
+                     double requestedSampleRate)
 {
     juce::AudioDeviceManager manager;
     juce::OwnedArray<juce::AudioIODeviceType> types;
@@ -295,7 +297,10 @@ void sendDeviceProbe(const juce::String& requestId,
         juce::BigInteger inputs;
         const auto sampleRates = device->getAvailableSampleRates();
         const auto bufferSizes = device->getAvailableBufferSizes();
-        const auto sampleRate = sampleRates.contains(48000.0) ? 48000.0 : (sampleRates.isEmpty() ? 0.0 : sampleRates[0]);
+        const auto preferredSampleRate = requestedSampleRate > 0.0 ? requestedSampleRate : 48000.0;
+        const auto sampleRate = sampleRates.contains(preferredSampleRate)
+            ? preferredSampleRate
+            : (sampleRates.contains(48000.0) ? 48000.0 : (sampleRates.isEmpty() ? 0.0 : sampleRates[0]));
         const auto bufferSize = bufferSizes.contains(256) ? 256 : (bufferSizes.contains(480) ? 480 : (bufferSizes.isEmpty() ? 0 : bufferSizes[0]));
         const auto error = device->open(inputs, outputs, sampleRate, bufferSize);
 
@@ -426,6 +431,7 @@ struct DynamicCueEvent
     double triggerTimeSeconds = 0.0;
     double position = -1.0;
     bool triggered = false;
+    bool oneShot = false;
 };
 
 juce::Array<int> readOutputChannels(juce::DynamicObject* object, const juce::Array<int>& fallback);
@@ -435,8 +441,11 @@ float gainFromMixerObject(juce::DynamicObject* object);
 class RoutedPlaybackSource final : public juce::AudioSource
 {
 public:
+    std::mutex audioMutex;
+
     void setSources(std::vector<std::unique_ptr<StemSource>>* nextSources)
     {
+        std::lock_guard<std::mutex> lock(audioMutex);
         sources = nextSources;
     }
 
@@ -483,11 +492,48 @@ public:
         dynamicPadActive = false;
     }
 
+    void setDynamicPadSample(ClickSample nextSample)
+    {
+        dynamicPadSample = std::move(nextSample);
+        dynamicPadPosition = 0.0;
+    }
+
     void triggerDynamicCueNow(DynamicCueEvent cue)
     {
+        cue.oneShot = true;
         cue.triggered = true;
         cue.position = 0.0;
         dynamicCues.push_back(std::move(cue));
+    }
+
+    void markDynamicCuesTriggeredBefore(double seconds)
+    {
+        for (auto& cue : dynamicCues)
+        {
+            if (cue.triggerTimeSeconds <= seconds)
+                cue.triggered = true;
+        }
+    }
+
+    void markDynamicCuesTriggeredBetween(double startSeconds, double endSeconds)
+    {
+        const auto start = juce::jmin(startSeconds, endSeconds);
+        const auto end = juce::jmax(startSeconds, endSeconds);
+        for (auto& cue : dynamicCues)
+        {
+            if (cue.triggerTimeSeconds >= start && cue.triggerTimeSeconds <= end)
+                cue.triggered = true;
+        }
+    }
+
+    void setScheduledDynamicCuesSuppressed(bool shouldSuppress)
+    {
+        suppressScheduledDynamicCues = shouldSuppress;
+    }
+
+    void allowScheduledDynamicCuePrefix(const juce::String& cueIdPrefix)
+    {
+        allowedScheduledCuePrefix = cueIdPrefix;
     }
 
     void updateDynamicMixer(const juce::Array<int>& nextClickOutputs,
@@ -562,6 +608,7 @@ public:
             return;
 
         output->clear(bufferToFill.startSample, bufferToFill.numSamples);
+        std::lock_guard<std::mutex> lock(audioMutex);
 
         if (paused)
             return;
@@ -709,6 +756,15 @@ private:
             {
                 if (! cue.triggered && currentTimeSeconds >= cue.triggerTimeSeconds)
                 {
+                    const auto allowedWhileSuppressed = allowedScheduledCuePrefix.isNotEmpty()
+                        && cue.id.startsWith(allowedScheduledCuePrefix);
+                    if (suppressScheduledDynamicCues && ! cue.oneShot && ! allowedWhileSuppressed)
+                    {
+                        cue.triggered = true;
+                        cue.position = -1.0;
+                        continue;
+                    }
+
                     cue.triggered = true;
                     cue.position = 0.0;
                 }
@@ -729,6 +785,11 @@ private:
                     output.addSample(zeroBasedOutput, startSample + sample, level);
             }
         }
+
+        dynamicCues.erase(std::remove_if(dynamicCues.begin(), dynamicCues.end(), [] (const DynamicCueEvent& cue)
+        {
+            return cue.oneShot && cue.position < 0.0;
+        }), dynamicCues.end());
     }
 
     void addDynamicPad(juce::AudioBuffer<float>& output, int startSample, int numSamples)
@@ -848,6 +909,8 @@ private:
     float clickGain = 0.8f;
     float dynamicCueGain = 0.8f;
     float dynamicPadGain = 0.8f;
+    bool suppressScheduledDynamicCues = false;
+    juce::String allowedScheduledCuePrefix;
     std::atomic<float> dynamicClickPeakLevel { 0.0f };
     std::atomic<float> dynamicCuePeakLevel { 0.0f };
     std::atomic<float> dynamicPadPeakLevel { 0.0f };
@@ -953,6 +1016,26 @@ struct PlaybackSession
         return true;
     }
 
+    void markDynamicCuesTriggeredBefore(double seconds)
+    {
+        routedSource.markDynamicCuesTriggeredBefore(seconds);
+    }
+
+    void markDynamicCuesTriggeredBetween(double startSeconds, double endSeconds)
+    {
+        routedSource.markDynamicCuesTriggeredBetween(startSeconds, endSeconds);
+    }
+
+    void setScheduledDynamicCuesSuppressed(bool shouldSuppress)
+    {
+        routedSource.setScheduledDynamicCuesSuppressed(shouldSuppress);
+    }
+
+    void allowScheduledDynamicCuePrefix(const juce::String& cueIdPrefix)
+    {
+        routedSource.allowScheduledDynamicCuePrefix(cueIdPrefix);
+    }
+
     double currentPositionSeconds() const
     {
         if (sources.empty() || sources.front()->transport == nullptr)
@@ -1015,6 +1098,16 @@ struct PlaybackSession
                                         readOutputChannels(dynamicPad, defaultPadOutputs),
                                         gainFromMixerObject(dynamicPad),
                                         dynamicPad != nullptr && static_cast<bool>(dynamicPad->getProperty("active")));
+    }
+
+    bool applyDynamicPadSample(const juce::String& filePath)
+    {
+        auto sample = loadClickSample(formatManager, filePath);
+        if (! sample.isReady())
+            return false;
+
+        routedSource.setDynamicPadSample(std::move(sample));
+        return true;
     }
 
     void startFadeOut(int durationMs)
@@ -1279,9 +1372,12 @@ void sendPlaybackResult(PlaybackSession& session,
                         int slot,
                         const juce::String& deviceName,
                         const juce::String& deviceType,
-                        double startSeconds)
+                        double startSeconds,
+                        double requestedSampleRate)
 {
-    session.stop();
+    const bool reuseRunningSession = session.active && session.manager.getCurrentAudioDevice() != nullptr;
+    if (! reuseRunningSession)
+        session.stop();
     const auto playbackStartSeconds = juce::jmax(0.0, startSeconds);
     const juce::File manifestFile(manifestPath);
 
@@ -1323,20 +1419,26 @@ void sendPlaybackResult(PlaybackSession& session,
     const auto dynamicCueGain = gainFromMixerObject(dynamicCue);
     const auto dynamicPadGain = gainFromMixerObject(dynamicPad);
 
-    juce::AudioDeviceManager::AudioDeviceSetup setup;
-    setup.outputDeviceName = deviceName;
     const auto requiredOutputs = juce::jmax(maxOutputChannelFromStemRoutes(stems),
                                             juce::jmax(maxChannelInRoute(dynamicPadOutputs),
                                                        juce::jmax(maxChannelInRoute(clickOutputs), maxChannelInRoute(dynamicCueOutputs))));
     const auto requestedOutputs = requestedOutputCountForDevice(deviceName, requiredOutputs);
-    configureOutputChannels(setup, requestedOutputs);
 
-    auto error = openManagedDevice(session.manager, setup, deviceType, requestedOutputs);
-
-    if (error.isNotEmpty())
+    if (! reuseRunningSession)
     {
-        sendRejected(requestId, "Audio device open failed: " + error);
-        return;
+        juce::AudioDeviceManager::AudioDeviceSetup setup;
+        setup.outputDeviceName = deviceName;
+        if (requestedSampleRate > 0.0)
+            setup.sampleRate = requestedSampleRate;
+        configureOutputChannels(setup, requestedOutputs);
+
+        auto error = openManagedDevice(session.manager, setup, deviceType, requestedOutputs);
+
+        if (error.isNotEmpty())
+        {
+            sendRejected(requestId, "Audio device open failed: " + error);
+            return;
+        }
     }
 
     auto* currentDevice = session.manager.getCurrentAudioDevice();
@@ -1348,6 +1450,8 @@ void sendPlaybackResult(PlaybackSession& session,
     }
 
     bool anySolo = false;
+
+    std::vector<std::unique_ptr<StemSource>> nextSources;
 
     for (auto& stemValue : *stems)
     {
@@ -1386,14 +1490,16 @@ void sendPlaybackResult(PlaybackSession& session,
         source->readerSource = std::make_unique<juce::AudioFormatReaderSource>(reader.release(), true);
         source->transport = std::make_unique<juce::AudioTransportSource>();
         source->transport->setSource(source->readerSource.get(), 32768, &session.readAheadThread, sourceSampleRate);
+        if (reuseRunningSession)
+            source->transport->prepareToPlay(currentDevice->getCurrentBufferSizeSamples(), currentDevice->getCurrentSampleRate());
         source->transport->setGain(source->baseGain);
         if (playbackStartSeconds > 0.0)
             source->transport->setPosition(playbackStartSeconds);
         source->transport->start();
-        session.sources.push_back(std::move(source));
+        nextSources.push_back(std::move(source));
     }
 
-    if (session.sources.empty())
+    if (nextSources.empty())
     {
         sendRejected(requestId, "No readable cached stems were available for playback.");
         return;
@@ -1403,15 +1509,31 @@ void sendPlaybackResult(PlaybackSession& session,
     auto accentSample = loadClickSample(session.formatManager, readDynamicClickPath(song, juce::Identifier("accentSoundPath")));
     auto dynamicPadSample = loadClickSample(session.formatManager, readDynamicPadPath(song));
 
-    session.routedSource.setSources(&session.sources);
-    session.routedSource.setDynamicClick(readSongBpm(song), clickOutputs, clickGain, readSongClickGrid(song), std::move(clickSample), std::move(accentSample));
-    session.routedSource.setDynamicCues(readSongDynamicCues(song, session.formatManager), dynamicCueOutputs, dynamicCueGain);
-    session.routedSource.setDynamicPad(dynamicPadOutputs, dynamicPadGain, std::move(dynamicPadSample));
-    session.routedSource.setPaused(false);
-    session.sourcePlayer.setSource(&session.routedSource);
-    if (playbackStartSeconds > 0.0)
-        session.routedSource.seekTo(playbackStartSeconds);
-    session.manager.addAudioCallback(&session.sourcePlayer);
+    if (reuseRunningSession)
+    {
+        std::lock_guard<std::mutex> lock(session.routedSource.audioMutex);
+        for (auto& source : session.sources)
+            source->transport->stop();
+        session.sources = std::move(nextSources);
+        session.routedSource.setDynamicClick(readSongBpm(song), clickOutputs, clickGain, readSongClickGrid(song), std::move(clickSample), std::move(accentSample));
+        session.routedSource.setDynamicCues(readSongDynamicCues(song, session.formatManager), dynamicCueOutputs, dynamicCueGain);
+        session.routedSource.setPaused(false);
+        if (playbackStartSeconds > 0.0)
+            session.routedSource.seekTo(playbackStartSeconds);
+    }
+    else
+    {
+        session.sources = std::move(nextSources);
+        session.routedSource.setSources(&session.sources);
+        session.routedSource.setDynamicClick(readSongBpm(song), clickOutputs, clickGain, readSongClickGrid(song), std::move(clickSample), std::move(accentSample));
+        session.routedSource.setDynamicCues(readSongDynamicCues(song, session.formatManager), dynamicCueOutputs, dynamicCueGain);
+        session.routedSource.setDynamicPad(dynamicPadOutputs, dynamicPadGain, std::move(dynamicPadSample));
+        session.routedSource.setPaused(false);
+        session.sourcePlayer.setSource(&session.routedSource);
+        if (playbackStartSeconds > 0.0)
+            session.routedSource.seekTo(playbackStartSeconds);
+        session.manager.addAudioCallback(&session.sourcePlayer);
+    }
     session.active = true;
     session.paused = false;
     session.slot = slot;
@@ -1429,6 +1551,7 @@ void sendPlaybackResult(PlaybackSession& session,
     response->setProperty("slot", slot);
     response->setProperty("title", session.title);
     response->setProperty("stemCount", session.stemCount);
+    response->setProperty("currentPositionSeconds", playbackStartSeconds);
     writeJsonLine(juce::var(response.get()));
 }
 
@@ -1448,6 +1571,7 @@ void sendSessionAccepted(const juce::String& requestId, const juce::String& type
     response->setProperty("title", session.title);
     response->setProperty("stemCount", session.stemCount);
     response->setProperty("paused", session.paused);
+    response->setProperty("currentPositionSeconds", session.currentPositionSeconds());
     writeJsonLine(juce::var(response.get()));
 }
 
@@ -1457,6 +1581,7 @@ void sendMeterSnapshot(const juce::String& requestId, PlaybackSession& session)
     response->setProperty("nativeAudioActive", session.active);
     response->setProperty("slot", session.slot);
     response->setProperty("title", session.title);
+    response->setProperty("currentPositionSeconds", session.currentPositionSeconds());
     juce::Array<juce::var> stems;
     for (const auto& meter : session.routedSource.readStemMeters())
     {
@@ -1510,7 +1635,8 @@ int runCommand(PlaybackSession& session, const juce::String& line)
         const auto deviceName = object->getProperty("deviceName").toString();
         const auto deviceType = object->getProperty("deviceType").toString();
         const auto requestedOutputs = juce::jlimit(1, 64, static_cast<int>(object->getProperty("requestedOutputChannels")));
-        sendDeviceProbe(requestId, deviceName, deviceType, requestedOutputs);
+        const auto requestedSampleRate = juce::jmax(0.0, static_cast<double>(object->getProperty("sampleRate")));
+        sendDeviceProbe(requestId, deviceName, deviceType, requestedOutputs, requestedSampleRate);
         return 0;
     }
 
@@ -1521,7 +1647,8 @@ int runCommand(PlaybackSession& session, const juce::String& line)
         const auto deviceType = object->getProperty("deviceType").toString();
         const auto slot = juce::jmax(1, static_cast<int>(object->getProperty("slot")));
         const auto startSeconds = juce::jmax(0.0, static_cast<double>(object->getProperty("startSeconds")));
-        sendPlaybackResult(session, requestId, manifestPath, slot, deviceName, deviceType, startSeconds);
+        const auto requestedSampleRate = juce::jmax(0.0, static_cast<double>(object->getProperty("sampleRate")));
+        sendPlaybackResult(session, requestId, manifestPath, slot, deviceName, deviceType, startSeconds, requestedSampleRate);
         return 0;
     }
 
@@ -1561,6 +1688,44 @@ int runCommand(PlaybackSession& session, const juce::String& line)
         return 0;
     }
 
+    if (type == "markDynamicCuesTriggeredBefore")
+    {
+        const auto seconds = juce::jmax(0.0, static_cast<double>(object->getProperty("seconds")));
+        session.markDynamicCuesTriggeredBefore(seconds);
+        sendSessionAccepted(requestId, "dynamicCuesMarkedTriggered", session);
+        return 0;
+    }
+
+    if (type == "markDynamicCuesTriggeredNow")
+    {
+        session.markDynamicCuesTriggeredBefore(session.currentPositionSeconds());
+        sendSessionAccepted(requestId, "dynamicCuesMarkedTriggered", session);
+        return 0;
+    }
+
+    if (type == "markDynamicCuesTriggeredBetween")
+    {
+        const auto startSeconds = juce::jmax(0.0, static_cast<double>(object->getProperty("startSeconds")));
+        const auto endSeconds = juce::jmax(startSeconds, static_cast<double>(object->getProperty("endSeconds")));
+        session.markDynamicCuesTriggeredBetween(startSeconds, endSeconds);
+        sendSessionAccepted(requestId, "dynamicCuesMarkedTriggered", session);
+        return 0;
+    }
+
+    if (type == "setScheduledDynamicCuesSuppressed")
+    {
+        session.setScheduledDynamicCuesSuppressed(static_cast<bool>(object->getProperty("suppressed")));
+        sendSessionAccepted(requestId, "dynamicCueScheduleSuppressionUpdated", session);
+        return 0;
+    }
+
+    if (type == "allowScheduledDynamicCuePrefix")
+    {
+        session.allowScheduledDynamicCuePrefix(object->getProperty("cueIdPrefix").toString());
+        sendSessionAccepted(requestId, "dynamicCueScheduleAllowanceUpdated", session);
+        return 0;
+    }
+
     if (type == "updateMixer")
     {
         session.applyMixer(object->getProperty("stems").getArray());
@@ -1574,6 +1739,19 @@ int runCommand(PlaybackSession& session, const juce::String& line)
                                   object->getProperty("dynamicCue").getDynamicObject(),
                                   object->getProperty("dynamicPad").getDynamicObject());
         sendSessionAccepted(requestId, "dynamicMixerUpdated", session);
+        return 0;
+    }
+
+    if (type == "updateDynamicPadSample")
+    {
+        const auto ok = session.applyDynamicPadSample(object->getProperty("filePath").toString());
+        if (! ok)
+        {
+            sendRejected(requestId, "Dynamic pad sample could not be loaded.");
+            return 0;
+        }
+
+        sendSessionAccepted(requestId, "dynamicPadSampleUpdated", session);
         return 0;
     }
 

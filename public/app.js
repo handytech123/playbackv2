@@ -4,6 +4,9 @@
   search: "",
   loadedSong: null,
   setlist: Array(10).fill(null),
+  setlistTransitions: [],
+  setlistFingerprint: "",
+  playbackSetFingerprint: "",
   selectedSetlistIndex: null,
   addSongTargetIndex: null,
   saveTimer: null,
@@ -31,24 +34,29 @@
   movingTransportSlot: null,
   regionSketch: null,
   renderedLiveRegionId: "",
-  repeatActionInFlight: false,
   arrangementSkipInFlight: false,
   arrangementPlayback: null,
   editorLoopTest: null,
   editorLoopActionInFlight: false,
   liveRepeatStateKey: "",
-  liveRepeatCueTriggerKey: "",
+  openTransitionFromSlot: null,
   mixerMeters: null,
   playbackCommandPending: false,
+  playbackCommandPendingSince: 0,
+  lastPanicButtonPressAt: 0,
   liveMixerInFlight: false,
   liveMixerPending: false,
+  playbackStateStream: null,
   mixerMeterStream: null,
-  panicRecoveryPending: null,
   scrubBySlot: {},
+  waveformLoadInFlight: new Set(),
   userTimelineScrollActiveUntil: 0,
   timelineAutoScrolling: false,
-  mixerPanelHeight: null
+  mixerPanelHeight: null,
+  playbackKeyInteractionUntil: 0
 };
+
+window.playbackAppState = state;
 
 const DANTE_ROUTING_ROWS = [
   { key: "tracks", label: "Tracks", hint: "Music stems" },
@@ -102,6 +110,7 @@ const els = {
   regionNameSelect: document.querySelector("#regionNameSelect"),
   regionRename: document.querySelector("#regionRenameButton"),
   regionTrim: document.querySelector("#regionTrimButton"),
+  regionSplit: document.querySelector("#regionSplitButton"),
   regionRemoveGap: document.querySelector("#regionRemoveGapButton"),
   regionDelete: document.querySelector("#regionDeleteButton"),
   cueLane: document.querySelector("#cueLane"),
@@ -125,6 +134,10 @@ const els = {
   editorStop: document.querySelector("#editorStopButton"),
   editorPause: document.querySelector("#editorPauseButton"),
   editorTransportStatus: document.querySelector("#editorTransportStatus"),
+  playbackKeySelect: document.querySelector("#playbackKeySelect"),
+  playbackKeyStatus: document.querySelector("#playbackKeyStatus"),
+  playbackKeyOriginal: document.querySelector("#playbackKeyOriginal"),
+  playbackKeyTranspose: document.querySelector("#playbackKeyTranspose"),
   createRegionFromSelection: document.querySelector("#createRegionFromSelectionButton"),
   undoCueMove: document.querySelector("#undoCueMoveButton"),
   timelineSnap: document.querySelector("#timelineSnapSelect"),
@@ -135,12 +148,15 @@ const els = {
   resetAudioAlignment: document.querySelector("#resetAudioAlignmentButton"),
   audioAlignmentStatus: document.querySelector("#audioAlignmentStatus"),
   saveMetadata: document.querySelector("#saveMetadataButton"),
+  approveMetadata: document.querySelector("#approveMetadataButton"),
   addRegion: document.querySelector("#addRegionButton"),
   removeRegion: document.querySelector("#removeRegionButton"),
   reorderRegions: document.querySelector("#reorderRegionsButton"),
   arrangementEnabled: document.querySelector("#arrangementEnabledToggle"),
   arrangementEnabledLabel: document.querySelector("#arrangementEnabledLabel"),
   undoArrangement: document.querySelector("#undoArrangementButton"),
+  trimSongStart: document.querySelector("#trimSongStartButton"),
+  trimSongEnd: document.querySelector("#trimSongEndButton"),
   saveArrangement: document.querySelector("#saveArrangementButton"),
   clearArrangement: document.querySelector("#clearArrangementButton"),
   addCue: document.querySelector("#addCueButton"),
@@ -178,17 +194,31 @@ const els = {
   sampleRate: document.querySelector("#sampleRateSelect"),
   routingPreset: document.querySelector("#routingPresetSelect"),
   routingStructure: document.querySelector("#routingStructure"),
+  remoteStatus: document.querySelector("#remoteStatusReadout"),
+  remotePrimaryUrl: document.querySelector("#remotePrimaryUrl"),
+  remoteUrlList: document.querySelector("#remoteUrlList"),
+  openRemote: document.querySelector("#openRemoteButton"),
+  copyRemoteUrl: document.querySelector("#copyRemoteUrlButton"),
   cacheReport: document.querySelector("#cacheReport"),
   cueAnalyzerStatus: document.querySelector("#cueAnalyzerStatus"),
   cueRecognitionReport: document.querySelector("#cueRecognitionReport"),
   dynamicCueFolder: document.querySelector("#dynamicCueFolderInput"),
   padsFolder: document.querySelector("#padsFolderInput"),
+  padsDefaultEnabled: document.querySelector("#padsDefaultEnabledInput"),
+  padsStartWithSong: document.querySelector("#padsStartWithSongInput"),
+  padsContinueBetweenSongs: document.querySelector("#padsContinueBetweenSongsInput"),
+  padsDefaultVolume: document.querySelector("#padsDefaultVolumeInput"),
+  padsFadeIn: document.querySelector("#padsFadeInInput"),
+  padsFadeOut: document.querySelector("#padsFadeOutInput"),
   dynamicClickSound: document.querySelector("#dynamicClickSoundInput"),
   dynamicClickAccent: document.querySelector("#dynamicClickAccentInput"),
   wavPathButtons: [...document.querySelectorAll("[data-wav-picker]")],
   folderPathButtons: [...document.querySelectorAll("[data-folder-picker]")],
   engineManifestPreview: document.querySelector("#engineManifestPreview"),
   runSystemCheck: document.querySelector("#runSystemCheckButton"),
+  auditMetadata: document.querySelector("#auditMetadataButton"),
+  rehydrateMetadata: document.querySelector("#rehydrateMetadataButton"),
+  metadataAuditReport: document.querySelector("#metadataAuditReport"),
   systemCheckResult: document.querySelector("#systemCheckResult"),
   settingsMenu: document.querySelector("#settingsMenuButton"),
   closeSettings: document.querySelector("#closeSettingsButton"),
@@ -199,12 +229,16 @@ const els = {
   modalBackdrop: document.querySelector("[data-close-add-song]")
 };
 
-init();
+init().catch((error) => {
+  console.error("App startup failed", error);
+  els.status.textContent = "Startup failed.";
+  setAlert(`Startup failed: ${error.message}`);
+});
 
 async function init() {
   loadSavedMixerHeight();
+  populatePlaybackKeySelect();
   wireEvents();
-  await loadLibrary();
   await loadSystemInfo();
   await loadCurrentSetlist();
   await loadSettings();
@@ -213,18 +247,58 @@ async function init() {
   await loadCacheReport();
   await loadEngineManifestPreview();
   await loadPlaybackState();
-  await loadSetMetadata();
   window.setInterval(refreshPlaybackReadiness, 1000);
+  openPlaybackStateStream();
   startMixerMeterStream();
+  loadSetMetadata().catch((error) => {
+    setAlert(`Set metadata load failed: ${error.message}`);
+  });
+  loadLibrary().catch((error) => {
+    els.status.textContent = "Library unavailable.";
+    setAlert(`Library load failed: ${error.message}`);
+  });
 }
 
 async function refreshPlaybackReadiness() {
   try {
-    state.playbackState = await api("/api/playback/state");
+    const playback = await api("/api/playback/state");
+    await reconcileSetlistForPlayback(playback);
+    state.playbackState = playback;
     renderPlaybackState();
   } catch {
     // Readiness polling should not interrupt the operator during live use.
   }
+}
+
+function openPlaybackStateStream() {
+  if (typeof EventSource === "undefined") return;
+  if (state.playbackStateStream) state.playbackStateStream.close();
+  state.playbackStateStream = new EventSource("/api/playback/state-stream");
+  state.playbackStateStream.addEventListener("state", async (event) => {
+    try {
+      const playback = JSON.parse(event.data);
+      await reconcileSetlistForPlayback(playback);
+      state.playbackState = playback;
+      renderPlaybackState();
+    } catch {
+      // Polling remains the fallback.
+    }
+  });
+  state.playbackStateStream.onerror = () => {
+    if (state.playbackStateStream?.readyState === EventSource.CLOSED) {
+      state.playbackStateStream = null;
+    }
+  };
+}
+
+async function reconcileSetlistForPlayback(playback) {
+  const fingerprint = playback?.currentFingerprint || "";
+  const slotNumber = Number(playback?.currentSlot || 0);
+  const missingCurrentSong = slotNumber > 0 && !state.setlist[slotNumber - 1];
+  if (!fingerprint || (fingerprint === state.playbackSetFingerprint && !missingCurrentSong)) return;
+  await loadCurrentSetlist({ render: false });
+  await loadSetMetadata();
+  state.playbackSetFingerprint = fingerprint;
 }
 
 function wireEvents() {
@@ -233,6 +307,8 @@ function wireEvents() {
   }
   els.refresh.addEventListener("click", refreshLibrary);
   els.reloadData.addEventListener("click", reloadAppData);
+  els.openRemote?.addEventListener("click", openRemoteWindow);
+  els.copyRemoteUrl?.addEventListener("click", copyRemoteUrl);
   els.clearSetlist.addEventListener("click", clearSetlist);
   els.confirmSet.addEventListener("click", confirmSet);
   els.quickConfirmSet?.addEventListener("click", confirmSet);
@@ -266,8 +342,19 @@ function wireEvents() {
   els.timelineSnap.addEventListener("change", () => {
     state.timelineSnap = currentTimelineSnap();
   });
+  els.playbackKeySelect?.addEventListener("change", () => {
+    if (state.selectedSetlistIndex === null) return;
+    holdPlaybackKeyEditor();
+    updateSetlistSongKey(state.selectedSetlistIndex, els.playbackKeySelect.value);
+  });
+  els.playbackKeySelect?.addEventListener("pointerdown", holdPlaybackKeyEditor);
+  els.playbackKeySelect?.addEventListener("focus", holdPlaybackKeyEditor);
+  els.playbackKeySelect?.addEventListener("blur", () => {
+    state.playbackKeyInteractionUntil = 0;
+  });
   els.timelineRuler?.addEventListener("pointerdown", beginRulerGesture);
   els.timelineSurface.addEventListener("pointerdown", beginTimelineScrub);
+  els.timelineSurface.addEventListener("contextmenu", openTimelineRegionContextMenu);
   els.timelineSurface.addEventListener("scroll", markManualTimelineScroll, { passive: true });
   els.regionLane.addEventListener("pointerdown", beginRegionSketch);
   els.createRegionFromSelection.addEventListener("click", createRegionFromSketchSelection);
@@ -299,9 +386,11 @@ function wireEvents() {
     els.regionNameSelect.select();
   });
   els.regionTrim.addEventListener("click", trimSelectedRegion);
+  els.regionSplit?.addEventListener("click", splitSelectedRegionAtPlayhead);
   els.regionRemoveGap?.addEventListener("click", removeSelectedRegionAndCloseGap);
   els.regionDelete.addEventListener("click", deleteSelectedRegion);
   els.saveMetadata.addEventListener("click", saveSelectedMetadata);
+  els.approveMetadata?.addEventListener("click", approveSelectedMetadata);
   els.alignAudioStart?.addEventListener("click", alignAudioStartToPlayhead);
   els.resetAudioAlignment?.addEventListener("click", resetAudioAlignment);
   els.addRegion.addEventListener("click", addRegionDraft);
@@ -309,6 +398,8 @@ function wireEvents() {
   els.reorderRegions?.addEventListener("click", reorderRegionsByTimeline);
   els.arrangementEnabled?.addEventListener("change", toggleArrangementEnabled);
   els.undoArrangement?.addEventListener("click", undoArrangementEdit);
+  els.trimSongStart?.addEventListener("click", trimSongStartToPlayhead);
+  els.trimSongEnd?.addEventListener("click", trimSongEndToPlayhead);
   els.saveArrangement?.addEventListener("click", saveArrangementNow);
   els.clearArrangement?.addEventListener("click", clearArrangement);
   els.reorderCues?.addEventListener("click", reorderCuesByTimeline);
@@ -321,22 +412,37 @@ function wireEvents() {
     state.selectedMetadataSlot = slotNumber;
     state.selectedSetlistIndex = slotNumber ? slotNumber - 1 : null;
     state.selectedRegionIndex = null;
-    state.selectedCueIndex = null;
-    state.regionSketch = null;
-    state.arrangementUndoStack = [];
-    renderSelectedMetadata();
-    renderSetlist();
-  });
+  state.selectedCueIndex = null;
+  state.regionSketch = null;
+  state.arrangementUndoStack = [];
+  syncSelectedSlotToPlayback(slotNumber);
+  renderSelectedMetadata();
+  renderSetlist();
+});
   for (const button of els.commandButtons) {
-    button.addEventListener("click", () => sendPlaybackCommand(button.dataset.command));
+    if (button.dataset.command === "panic") {
+      button.addEventListener("pointerup", async (event) => {
+        event.preventDefault();
+        await handlePanicCommandClick(button);
+      });
+    }
+    button.addEventListener("click", async () => {
+      if (button.dataset.command === "panic") {
+        await handlePanicCommandClick(button);
+        return;
+      }
+      sendPlaybackCommand(button.dataset.command);
+    });
   }
-  els.exitPanic?.addEventListener("click", queuePanicExitRecovery);
+  els.exitPanic?.addEventListener("click", () => sendPlaybackCommand("exitPanic"));
   for (const tab of els.operatorTabs) {
     tab.addEventListener("click", () => showOperatorPanel(tab.dataset.operatorPanel));
   }
   for (const tab of els.settingsTabs) {
     tab.addEventListener("click", () => showSettingsSection(tab.dataset.settingsTab));
   }
+  els.auditMetadata?.addEventListener("click", auditMetadataCache);
+  els.rehydrateMetadata?.addEventListener("click", rehydrateMetadataCache);
   els.search.addEventListener("input", () => {
     state.search = els.search.value;
     renderSongs();
@@ -347,6 +453,10 @@ function wireEvents() {
   els.select.addEventListener("dblclick", addSelectedSongToSet);
   document.addEventListener("keydown", handleKeyboardShortcuts);
   document.addEventListener("click", (event) => {
+    if (!event.target.closest(".transition-tile") && !event.target.closest(".transition-editor")) {
+      state.openTransitionFromSlot = null;
+      document.querySelectorAll(".transition-tile.editing").forEach((item) => item.classList.remove("editing"));
+    }
     if (!event.target.closest("#regionMenu") && !event.target.closest(".timeline-region")) {
       hideRegionMenu();
     }
@@ -404,6 +514,7 @@ async function refreshLibrary() {
   await loadCacheReport();
   await loadPlaybackState();
   await loadSetMetadata();
+  await runSystemCheck();
   closeSettingsDrawer();
 }
 
@@ -427,6 +538,7 @@ async function reloadAppData() {
     await loadPlaybackState();
     await loadSetMetadata();
     renderSelectedMetadata();
+    await runSystemCheck();
     els.playbackStatus.textContent = "Saved metadata reloaded.";
   } catch (error) {
     els.status.textContent = previousStatus;
@@ -455,10 +567,12 @@ async function flushPendingAppSaves() {
   if (hadMixerSave) await saveSelectedMixer();
 }
 
-async function loadCurrentSetlist() {
+async function loadCurrentSetlist(options = {}) {
   const setlist = await api("/api/setlist/current");
   state.setlist = setlist.slots.map((slot) => slot.songId ? setlistSongFromSlot(slot) : null);
-  renderSetlist();
+  state.setlistTransitions = normalizeClientTransitions(setlist.transitions || []);
+  state.setlistFingerprint = setFingerprintClient(setlist);
+  if (options.render !== false) renderSetlist();
 }
 
 async function loadSettings() {
@@ -635,7 +749,13 @@ async function saveSettings() {
         folderPath: els.dynamicCueFolder.value
       },
       pads: {
-        folderPath: els.padsFolder.value
+        folderPath: els.padsFolder.value,
+        defaultEnabled: els.padsDefaultEnabled?.checked,
+        startWithSong: els.padsStartWithSong?.checked,
+        continueBetweenSongs: els.padsContinueBetweenSongs?.checked,
+        defaultVolume: Math.max(0, Math.min(1, Number(els.padsDefaultVolume?.value || 65) / 100)),
+        fadeInMs: Number(els.padsFadeIn?.value || 1500),
+        fadeOutMs: Number(els.padsFadeOut?.value || 2500)
       },
       dynamicClick: {
         clickSoundPath: els.dynamicClickSound.value,
@@ -731,6 +851,12 @@ function renderSettings() {
   els.sampleRate.value = String(settings.audioEngine.sampleRate || 48000);
   els.dynamicCueFolder.value = settings.dynamicCue.folderPath || "";
   els.padsFolder.value = settings.pads?.folderPath || "";
+  if (els.padsDefaultEnabled) els.padsDefaultEnabled.checked = settings.pads?.defaultEnabled !== false;
+  if (els.padsStartWithSong) els.padsStartWithSong.checked = settings.pads?.startWithSong !== false;
+  if (els.padsContinueBetweenSongs) els.padsContinueBetweenSongs.checked = settings.pads?.continueBetweenSongs !== false;
+  if (els.padsDefaultVolume) els.padsDefaultVolume.value = String(Math.round(Number(settings.pads?.defaultVolume ?? 0.65) * 100));
+  if (els.padsFadeIn) els.padsFadeIn.value = String(settings.pads?.fadeInMs ?? 1500);
+  if (els.padsFadeOut) els.padsFadeOut.value = String(settings.pads?.fadeOutMs ?? 2500);
   els.dynamicClickSound.value = settings.dynamicClick.clickSoundPath || settings.dynamicClick.soundFolderPath || "";
   els.dynamicClickAccent.value = settings.dynamicClick.accentSoundPath || "";
   els.routingPreset.replaceChildren();
@@ -746,7 +872,52 @@ function renderSettings() {
     : "No default device saved";
   renderAudioDevices();
   renderRoutingStructure();
+  renderRemoteSettings();
   renderFoundationPanels();
+}
+
+function renderRemoteSettings() {
+  if (!els.remotePrimaryUrl) return;
+  const urls = remoteUrls();
+  const primary = primaryRemoteUrl();
+  els.remotePrimaryUrl.textContent = primary;
+  if (els.remoteStatus) {
+    els.remoteStatus.textContent = state.playbackState?.mode === "performance"
+      ? "Performance remote active"
+      : "Available in Edit and Performance";
+  }
+  if (!els.remoteUrlList) return;
+  els.remoteUrlList.replaceChildren();
+  for (const url of urls) {
+    const item = document.createElement("button");
+    item.type = "button";
+    item.className = "remote-url-item";
+    item.textContent = url;
+    item.addEventListener("click", async () => {
+      await navigator.clipboard?.writeText(url);
+      els.settingsStatus.textContent = "Remote URL copied.";
+    });
+    els.remoteUrlList.append(item);
+  }
+}
+
+function remoteUrls() {
+  const urls = Array.isArray(state.systemInfo?.remoteUrls) ? state.systemInfo.remoteUrls : [];
+  return urls.length ? urls : [`${window.location.origin}/remote`];
+}
+
+function primaryRemoteUrl() {
+  const urls = remoteUrls();
+  return urls.find((url) => !url.includes("127.0.0.1")) || urls[0] || `${window.location.origin}/remote`;
+}
+
+function openRemoteWindow() {
+  window.open(primaryRemoteUrl(), "_blank", "noopener");
+}
+
+async function copyRemoteUrl() {
+  await navigator.clipboard?.writeText(primaryRemoteUrl());
+  els.settingsStatus.textContent = "Remote URL copied.";
 }
 
 function renderAudioDevices() {
@@ -790,8 +961,8 @@ function renderReadinessSummary() {
     ["Readiness", titleCase(readiness.state || "blocked"), readiness.state === "ready" ? "ready" : readiness.state === "warning" ? "warning" : "failed"],
     ["Cache", readiness.cacheReady ? "Ready" : "Needs Confirm Set", readiness.cacheReady ? "ready" : "warning"],
     ["Device", readiness.audioDevice?.state === "ready" ? readiness.audioDevice.selectedDeviceName || "Ready" : "Missing", readiness.audioDevice?.state === "ready" ? "ready" : "failed"],
-    ["Engine", engineStatusLabel(engine.state || "offline"), engine.state === "ready" && engine.heartbeatFresh !== false ? "ready" : "warning"],
-    ["Heartbeat", engine.heartbeatFresh ? "Fresh" : "Waiting", engine.heartbeatFresh ? "ready" : "warning"],
+    ["Engine", engineStatusLabel(engine.state || "offline"), engine.state === "ready" ? "ready" : "warning"],
+    ["Heartbeat", engine.heartbeatRequired ? (engine.heartbeatFresh ? "Fresh" : "Waiting") : "Standby", engine.heartbeatRequired && !engine.heartbeatFresh ? "warning" : "ready"],
     ["Set", playback.confirmed ? "Confirmed" : "Unconfirmed", playback.confirmed ? "ready" : "warning"]
   ];
   els.readinessSummary.replaceChildren(...items.map(([label, value, status]) => statusPill(label, value, status)));
@@ -1135,7 +1306,6 @@ function renderPlaybackState() {
   const repeatStateKey = `${playback.currentSlot || ""}:${repeat.mode || ""}:${repeat.regionId || ""}:${repeat.releaseRequested ? "release" : ""}:${repeat.releaseAfterNextPass ? "defer" : ""}`;
   if (state.liveRepeatStateKey !== repeatStateKey) {
     state.liveRepeatStateKey = repeatStateKey;
-    state.liveRepeatCueTriggerKey = "";
   }
   const isPerformance = playback.mode === "performance";
   if (isPerformance && state.editorLoopTest) {
@@ -1148,8 +1318,14 @@ function renderPlaybackState() {
   }
   const readiness = playback.readiness || {};
   const engineState = readiness.engine?.state || "offline";
-  const displayEngineState = engineState === "ready" && readiness.engine?.heartbeatFresh === false ? "heartbeat-stale" : engineState;
+  const heartbeatRequired = readiness.engine?.heartbeatRequired === true;
+  const displayEngineState = engineState === "ready" && heartbeatRequired && readiness.engine?.heartbeatFresh === false ? "heartbeat-stale" : engineState;
   const currentSong = playback.currentSlot ? state.setlist[playback.currentSlot - 1] : null;
+  const visualSlot = playbackVisualSlot(playback);
+  if (visualSlot && state.setlist[visualSlot - 1]) {
+    state.selectedSetlistIndex = visualSlot - 1;
+    state.selectedMetadataSlot = visualSlot;
+  }
   els.appModeStatus.textContent = isPerformance ? "Performance mode" : "Edit mode";
   els.playbackModeTitle.textContent = isPerformance ? "Performance Mode" : "Edit Mode";
   els.playbackStatus.textContent = playback.lastMessage || readiness.performanceBlockers?.join(" ") || (playback.confirmed ? "Set confirmed." : "Confirm the set before Performance.");
@@ -1173,27 +1349,40 @@ function renderPlaybackState() {
     els.quickConfirmSet.classList.toggle("hidden", isPerformance);
   }
   const panicActive = playback.panic?.active === true;
-  els.panicCommand.classList.toggle("hidden", !isPerformance);
-  els.exitPanic?.classList.toggle("hidden", !isPerformance || !panicActive);
+  els.panicCommand.classList.remove("hidden");
+  els.exitPanic?.classList.toggle("hidden", !panicActive);
   els.panicRecoveryPanel?.classList.toggle("hidden", !panicActive);
   if (els.panicRecoveryStatus) {
-    els.panicRecoveryStatus.textContent = state.panicRecoveryPending
-      ? "Recovery queued at next measure"
-      : (playback.panic?.detail || "Tracks Down / Click Alive");
+    const backendRecovery = playback.panic?.recoveryTarget?.pending ? playback.panic.recoveryTarget : null;
+    els.panicRecoveryStatus.textContent = backendRecovery
+      ? backendRecovery.message || "Panic release queued at next region"
+      : (playback.panic?.detail || "Tracks Down / Click Alive / Scheduled Cues Suppressed");
   }
   renderCommandButtons(playback.transport);
   syncTransportClock();
   setPlanningLocked(isPerformance);
   renderSetlist();
   renderFoundationPanels();
+  renderLoadedSong();
   renderSelectedMetadata();
   renderEditorTransport(selectedMetadata());
+}
+
+function playbackVisualSlot(playback = state.playbackState || {}) {
+  const slot = Number(playback?.currentSlot || 0);
+  if (!slot || !state.setlist[slot - 1]) return 0;
+  if (playback.mode === "performance") return slot;
+  if (["playing", "paused", "panic"].includes(playback.transport)) return slot;
+  if (playback.pad?.active || playback.transition?.active || playback.transition?.pending) return slot;
+  if (state.selectedSetlistIndex === null || state.selectedSetlistIndex === undefined) return slot;
+  return 0;
 }
 
 function renderCommandButtons(transport) {
   for (const button of els.commandButtons) {
     const command = button.dataset.command;
     const active = (state.playbackState?.panic?.active && command === "panic")
+      || (state.playbackState?.pad?.active && command === "togglePad")
       || (transport === "playing" && command === "play")
       || (transport === "paused" && command === "pause")
       || (transport === "stopped" && command === "stop")
@@ -1232,8 +1421,6 @@ function renderLiveTransportPosition() {
   if (playbackSlot) {
     serviceArrangementBlocks(playbackSlot);
     serviceArrangementCuts(playbackSlot);
-    serviceRegionRepeat(playbackSlot);
-    servicePanicRecovery(playbackSlot);
   }
 }
 
@@ -1265,6 +1452,7 @@ function setPlanningLocked(locked) {
   els.refresh.disabled = false;
   els.setlistSlots.classList.toggle("locked", locked);
   els.saveMetadata.disabled = locked || !selectedMetadata();
+  if (els.approveMetadata) els.approveMetadata.disabled = locked || !selectedMetadata();
   els.addRegion.disabled = locked || !selectedMetadata();
   els.addCue.disabled = locked || !selectedMetadata();
   updateCueUndoControl();
@@ -1272,14 +1460,22 @@ function setPlanningLocked(locked) {
 }
 
 async function sendPlaybackCommand(command, extra = {}) {
-  if (!extra.systemAction && state.playbackState?.transport === "playing" && isPlaybackInterruptCommand(command)) {
+  const action = operatorPlaybackCommand(command, extra);
+  const explicitEditStart = command === "play"
+    && state.playbackState?.mode === "edit"
+    && Number.isFinite(Number(extra.startSeconds));
+  if (!extra.systemAction && !explicitEditStart && state.playbackState?.transport === "playing" && isPlaybackInterruptCommand(action)) {
     return;
   }
-  if (state.playbackCommandPending) return;
+  if (state.playbackCommandPending && Date.now() - Number(state.playbackCommandPendingSince || 0) < 2000) return;
+  if (state.playbackCommandPending) {
+    state.playbackCommandPending = false;
+  }
   state.playbackCommandPending = true;
+  state.playbackCommandPendingSince = Date.now();
   setTransportControlsDisabled(true);
   try {
-    const commandPayload = playbackCommandPayload(command, extra);
+    const commandPayload = playbackCommandPayload(action, command === action ? extra : { ...extra, fromSlot: transitionCommandFromSlot(extra) });
     const result = await api("/api/playback/command", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -1296,6 +1492,7 @@ async function sendPlaybackCommand(command, extra = {}) {
     setAlert(error.message);
   } finally {
     state.playbackCommandPending = false;
+    state.playbackCommandPendingSince = 0;
     setTransportControlsDisabled(false);
   }
 }
@@ -1307,20 +1504,49 @@ function setTransportControlsDisabled(disabled) {
 }
 
 function shouldDisablePlaybackCommand(command) {
-  return state.playbackState?.transport === "playing" && isPlaybackInterruptCommand(command);
+  if (command === "panic") {
+    return state.playbackState?.panic?.active !== true && state.playbackState?.transport !== "playing";
+  }
+  return state.playbackState?.transport === "playing" && isPlaybackInterruptCommand(operatorPlaybackCommand(command));
 }
 
 function isPlaybackInterruptCommand(command) {
   return ["play", "restart", "nextSong", "previousSong", "fadeOut", "seek"].includes(command);
 }
 
+function operatorPlaybackCommand(command, extra = {}) {
+  if (command !== "nextSong") return command;
+  return transitionForOperatorNext(extra) ? "songTransition" : command;
+}
+
+function transitionCommandFromSlot(extra = {}) {
+  return positiveClientNumber(extra.fromSlot)
+    || positiveClientNumber(extra.slot)
+    || positiveClientNumber(state.playbackState?.currentSlot)
+    || positiveClientNumber(state.selectedMetadataSlot)
+    || positiveClientNumber(state.selectedSetlistIndex === null ? null : state.selectedSetlistIndex + 1);
+}
+
+function transitionForOperatorNext(extra = {}) {
+  const fromSlot = transitionCommandFromSlot(extra);
+  return fromSlot ? transitionAfterSlot(fromSlot) : null;
+}
+
+function positiveClientNumber(value) {
+  const number = Number(value);
+  return Number.isFinite(number) && number > 0 ? number : null;
+}
+
 function playbackCommandPayload(command, extra = {}) {
   const payload = { command, slot: state.selectedMetadataSlot, ...extra };
+  if (command === "songTransition" && payload.fromSlot === undefined) {
+    payload.fromSlot = transitionCommandFromSlot(extra);
+  }
   if (command === "seek" && payload.seconds === undefined) {
     payload.seconds = 0;
     payload.slot = state.playbackState?.currentSlot || state.selectedMetadataSlot;
   }
-  if (command !== "play" || state.playbackState?.mode === "performance" || payload.startSeconds !== undefined) {
+  if (command !== "play" || payload.startSeconds !== undefined) {
     return payload;
   }
   const selected = selectedMetadata();
@@ -1382,6 +1608,7 @@ async function loadSetMetadata() {
   }
   renderMetadataSlotOptions();
   renderSelectedMetadata();
+  ensureSelectedWaveform();
 }
 
 function renderMetadataSlotOptions() {
@@ -1396,8 +1623,13 @@ function renderMetadataSlotOptions() {
 }
 
 function selectedMetadata() {
-  const tileSlot = state.selectedSetlistIndex === null ? null : state.selectedSetlistIndex + 1;
   const slots = state.setMetadata?.slots || [];
+  const playbackSlot = playbackVisualSlot();
+  if (playbackSlot && state.setlist[playbackSlot - 1]) {
+    const selected = slots.find((slot) => slot.slot === playbackSlot);
+    if (selected) return selected;
+  }
+  const tileSlot = state.selectedSetlistIndex === null ? null : state.selectedSetlistIndex + 1;
   if (tileSlot && state.setlist[state.selectedSetlistIndex]) {
     const selected = slots.find((slot) => slot.slot === tileSlot);
     if (selected) return selected;
@@ -1423,6 +1655,8 @@ function renderSelectedMetadata() {
   if (els.reorderCues) els.reorderCues.disabled = locked || !selected || (selected.cues?.cueMarkers || []).length < 2;
   syncArrangementControls(selected, locked);
   if (els.undoArrangement) els.undoArrangement.disabled = locked || !selected || !state.arrangementUndoStack.length;
+  if (els.trimSongStart) els.trimSongStart.disabled = locked || !selected;
+  if (els.trimSongEnd) els.trimSongEnd.disabled = locked || !selected;
   if (els.saveArrangement) els.saveArrangement.disabled = locked || !selected;
   if (els.clearArrangement) els.clearArrangement.disabled = locked || !selected || !arrangementHasCuts(selected);
   els.addCue.disabled = locked || !selected;
@@ -1442,6 +1676,7 @@ function renderSelectedMetadata() {
     els.playbackKey.textContent = "--";
     els.playbackTempo.textContent = "--";
     els.playbackTime.textContent = "--";
+    renderPlaybackKeyEditor(null);
     els.regionLane.replaceChildren();
     els.cueLane.replaceChildren();
     els.sectionLane.replaceChildren();
@@ -1471,6 +1706,7 @@ function renderSelectedMetadata() {
   els.tempoKey.value = tempo.key || "";
   els.tempoBpm.value = tempo.bpm || "";
   els.tempoTimeSignature.value = tempo.timeSignature || "";
+  renderPlaybackKeyEditor(selected);
   if (els.audioAlignmentStatus) {
     els.audioAlignmentStatus.textContent = `Audio shift: ${Number(selected.audioAlignment?.shiftSeconds || 0).toFixed(3)}s`;
   }
@@ -1479,6 +1715,35 @@ function renderSelectedMetadata() {
   renderMetadataEditors(selected, locked);
   renderMixerStrip(selected);
   renderFoundationPanels();
+  ensureSelectedWaveform(selected);
+}
+
+function slotHasWaveformPeaks(slot) {
+  return Boolean(
+    slot?.arrangementCache?.waveform?.peaks?.length
+    || slot?.waveform?.peaks?.length
+  );
+}
+
+async function ensureSelectedWaveform(selected = selectedMetadata()) {
+  if (!selected || slotHasWaveformPeaks(selected)) return;
+  const slotNumber = Number(selected.slot || 0);
+  if (!slotNumber || state.waveformLoadInFlight.has(slotNumber)) return;
+  state.waveformLoadInFlight.add(slotNumber);
+  try {
+    const waveform = await api(`/api/set-metadata/current/slot/${slotNumber}/waveform?buckets=1800`);
+    const slot = (state.setMetadata?.slots || []).find((item) => Number(item.slot) === slotNumber);
+    if (slot) {
+      slot.waveform = waveform;
+      if (Number(selectedMetadata()?.slot) === slotNumber) {
+        renderTimeline(slot);
+      }
+    }
+  } catch (error) {
+    console.warn("Waveform refresh failed", error);
+  } finally {
+    state.waveformLoadInFlight.delete(slotNumber);
+  }
 }
 
 function renderTransportReadout(fallbackSelected = null) {
@@ -1521,12 +1786,13 @@ function renderTimeline(slot) {
     const item = document.createElement("div");
     item.className = "timeline-region";
     const isCurrentLiveRegion = Boolean(locked && liveRegion?.region?.id === region.id);
-    const showPerformanceActions = Boolean(locked && performanceControlRegion?.region?.id === region.id);
+    const panicActive = state.playbackState?.panic?.active === true;
+    const showPerformanceActions = Boolean(locked && (panicActive || performanceControlRegion?.region?.id === region.id));
     const isQueuedRepeat = Boolean(liveRepeat.regionId === region.id && liveRepeat.queued && !liveRepeat.releaseRequested);
     item.classList.toggle("current-live-region", isCurrentLiveRegion);
     item.classList.toggle("performance-action-region", showPerformanceActions);
     item.classList.toggle("repeat-queued", isQueuedRepeat);
-    item.classList.toggle("selected-region", state.selectedRegionIndex === index);
+    item.classList.toggle("selected-region", selectedArrangedEntryMatches(index, entry.blockId));
     item.dataset.regionIndex = String(index);
     const start = Number(region.startBar || 1);
     const end = Math.max(start + 0.25, Number(region.endBar || start + 1));
@@ -1541,7 +1807,9 @@ function renderTimeline(slot) {
       rawStartBar: Number(entry.rawRegion?.startBar || slot.regions?.regions?.[index]?.startBar || start),
       rawStartBeat: Number(entry.rawRegion?.startBeat || slot.regions?.regions?.[index]?.startBeat || region.startBeat || 1),
       rawEndBar: Number(entry.rawRegion?.endBar || slot.regions?.regions?.[index]?.endBar || end),
-      rawEndBeat: Number(entry.rawRegion?.endBeat || slot.regions?.regions?.[index]?.endBeat || region.endBeat || 1)
+      rawEndBeat: Number(entry.rawRegion?.endBeat || slot.regions?.regions?.[index]?.endBeat || region.endBeat || 1),
+      rawStartSeconds: Number(entry.block?.rawStartSeconds || 0),
+      rawEndSeconds: Number(entry.block?.rawEndSeconds || 0)
     };
     const startTime = timeForBarBeat(slot, start, Number(region.startBeat || 1));
     const endTime = timeForBarBeat(slot, end, Number(region.endBeat || 1));
@@ -1552,7 +1820,7 @@ function renderTimeline(slot) {
     item.innerHTML = `
       ${locked ? "" : "<span class=\"region-resize region-resize-left\" data-resize=\"start\"></span>"}
       <strong>${escapeHtml(region.name)}</strong>
-      ${showPerformanceActions ? regionLiveActions(region, liveRepeat) : ""}
+      ${showPerformanceActions ? regionLiveActions(region, liveRepeat, panicActive) : ""}
       ${locked ? "" : "<span class=\"region-resize region-resize-right\" data-resize=\"end\"></span>"}
     `;
     item.querySelectorAll("[data-region-command]").forEach((button) => {
@@ -1560,6 +1828,10 @@ function renderTimeline(slot) {
         event.stopPropagation();
         state.selectedRegionIndex = index;
         const command = button.dataset.regionCommand;
+        if (command === "recoverPanicRegion" || (command === "jumpRegion" && state.playbackState?.panic?.active === true)) {
+          sendPlaybackCommand("jumpRegion", { slot: slot.slot, regionId: region.id, regionName: region.name });
+          return;
+        }
         const timing = liveRegionActionTiming(slot, region);
         if (command === "goOnRegion") {
           sendPlaybackCommand(command, { slot: slot.slot, regionId: region.id, regionName: region.name, deferRelease: !timing.safe });
@@ -1618,7 +1890,16 @@ function renderTimeline(slot) {
   });
 }
 
-function regionLiveActions(region, liveRepeat) {
+function selectedArrangedEntryMatches(index, blockId = "") {
+  if (state.selectedRegionIndex !== index) return false;
+  const selectedBlockId = state.selectedArrangedRegionRange?.blockId || "";
+  return !selectedBlockId || !blockId || selectedBlockId === blockId;
+}
+
+function regionLiveActions(region, liveRepeat, panicActive = false) {
+  if (panicActive) {
+    return "<div class=\"region-live-actions\"><button data-region-command=\"recoverPanicRegion\" type=\"button\">Recover</button></div>";
+  }
   if (liveRepeat.mode === "loop" && liveRepeat.regionId === region.id) {
     return "<div class=\"region-live-actions\"><button data-region-command=\"goOnRegion\" type=\"button\">Go On</button></div>";
   }
@@ -1675,35 +1956,27 @@ function liveActionDeadlineSeconds(slot, regionEndSeconds) {
   return Number(beatGrid[targetIndex]?.timeSeconds || -1);
 }
 
-function liveActionSafeGridBeats(slot) {
-  return String(slot?.tempoMap?.timeSignature || "").trim().startsWith("6/8") ? 18 : 14;
-}
-
-function queuePanicExitRecovery() {
-  const slot = currentPlaybackMetadata();
-  if (!slot || state.playbackState?.panic?.active !== true) return;
-  const targetSeconds = nextMeasureBoundarySeconds(slot, currentTransportSeconds());
-  state.panicRecoveryPending = {
-    type: "exitPanic",
-    slot: slot.slot,
-    targetSeconds
-  };
-  if (els.panicRecoveryStatus) {
-    els.panicRecoveryStatus.textContent = `Recovery queued at ${formatSeconds(targetSeconds)}`;
-  }
-}
-
-async function servicePanicRecovery(slot) {
-  const pending = state.panicRecoveryPending;
-  if (!pending || pending.slot !== slot?.slot) return;
-  if (state.playbackState?.panic?.active !== true || state.playbackState?.transport !== "playing") {
-    state.panicRecoveryPending = null;
+async function handlePanicCommandClick(button = null) {
+  const now = Date.now();
+  if (now - state.lastPanicButtonPressAt < 350) return;
+  state.lastPanicButtonPressAt = now;
+  if (state.playbackCommandPending) return;
+  try {
+    state.playbackState = await api("/api/playback/state");
+    renderPlaybackState();
+  } catch (error) {
+    setAlert(error.message);
     return;
   }
-  const current = currentTransportSeconds();
-  if (current < Number(pending.targetSeconds || 0) - 0.035) return;
-  state.panicRecoveryPending = null;
-  await sendPlaybackCommand("exitPanic", { slot: slot.slot, systemAction: true });
+  if (state.playbackState?.panic?.active === true) {
+    sendPlaybackCommand("panic");
+    return;
+  }
+  sendPlaybackCommand("panic");
+}
+
+function liveActionSafeGridBeats(slot) {
+  return String(slot?.tempoMap?.timeSignature || "").trim().startsWith("6/8") ? 18 : 14;
 }
 
 function nextMeasureBoundarySeconds(slot, currentSeconds) {
@@ -1715,61 +1988,6 @@ function nextMeasureBoundarySeconds(slot, currentSeconds) {
     return beatNumber === 1 && time > current + 0.25;
   });
   return Number(next?.timeSeconds ?? current);
-}
-
-async function serviceRegionRepeat(slot) {
-  const repeat = state.playbackState?.liveRepeat || {};
-  if (!repeat.mode || state.repeatActionInFlight || state.playbackState?.transport !== "playing") return;
-  if (state.playbackState?.currentSlot !== slot?.slot) return;
-  const region = (arrangedRegionEntries(slot).map((entry) => entry.region)).find((item) => item.id === repeat.regionId);
-  if (!region) return;
-
-  const startTime = timeForBarBeat(slot, Number(region.startBar || 1), Number(region.startBeat || 1));
-  const endTime = timeForBarBeat(slot, Number(region.endBar || region.startBar || 1), Number(region.endBeat || 1));
-  const currentTime = currentTransportSeconds();
-  await serviceRepeatCueTrigger(slot, region, currentTime);
-  if (currentTime < Math.max(startTime + 0.1, endTime) - 0.08) return;
-
-  state.repeatActionInFlight = true;
-  try {
-    if (repeat.mode === "loop" && repeat.releaseRequested) {
-      await sendPlaybackCommand("clearRegionRepeat", { regionId: region.id, regionName: region.name });
-      return;
-    }
-    if (repeat.mode === "loop" && repeat.releaseAfterNextPass) {
-      await sendPlaybackCommand("seek", { slot: slot.slot, seconds: startTime, regionId: region.id, regionName: region.name, systemAction: true });
-      await sendPlaybackCommand("goOnRegion", { slot: slot.slot, regionId: region.id, regionName: region.name, systemAction: true });
-      return;
-    }
-    await sendPlaybackCommand("seek", { slot: slot.slot, seconds: startTime, regionId: region.id, regionName: region.name, systemAction: true });
-    if (repeat.mode === "once") {
-      await sendPlaybackCommand("clearRegionRepeat", { regionId: region.id, regionName: region.name });
-    }
-  } finally {
-    window.setTimeout(() => {
-      state.repeatActionInFlight = false;
-    }, 250);
-  }
-}
-
-async function serviceRepeatCueTrigger(slot, region, currentTime) {
-  const repeat = state.playbackState?.liveRepeat || {};
-  if (!["once", "loop"].includes(repeat.mode) || repeat.releaseRequested) return;
-  const beatGrid = visualBeatGrid(slot);
-  if (!beatGrid.length) return;
-  const endIndex = beatGrid.findIndex((beat) => Number(beat.timeSeconds || 0) >= timeForBarBeat(slot, Number(region.endBar || 1), Number(region.endBeat || 1)) - 0.0001);
-  const repeatCueIndex = (endIndex < 0 ? beatGrid.length : endIndex) - repeatCueLeadGridBeats(slot);
-  if (repeatCueIndex < 0) return;
-  const triggerTime = Number(beatGrid[repeatCueIndex]?.timeSeconds || 0);
-  const triggerKey = `${slot.slot}:${region.id}:${repeat.mode}:${repeat.releaseAfterNextPass ? "defer" : "active"}:${Math.round(triggerTime * 1000)}`;
-  if (state.liveRepeatCueTriggerKey === triggerKey) return;
-  if (currentTime < triggerTime || currentTime > triggerTime + 0.45) return;
-  state.liveRepeatCueTriggerKey = triggerKey;
-  await sendPlaybackCommand("triggerRepeatCue", { slot: slot.slot, regionId: region.id, regionName: region.name, systemAction: true });
-}
-
-function repeatCueLeadGridBeats(slot) {
-  return String(slot?.tempoMap?.timeSignature || "").trim().startsWith("6/8") ? 14 : 10;
 }
 
 async function serviceArrangementBlocks(slot) {
@@ -1924,6 +2142,7 @@ async function applyAudioAlignment(slot, seconds) {
       body: JSON.stringify({ seconds: markerSeconds })
     });
     state.setlist = result.setlist.slots.map((item) => item.songId ? setlistSongFromSlot(item) : null);
+    state.setlistTransitions = normalizeClientTransitions(result.setlist.transitions || state.setlistTransitions);
     state.setMetadata = result.metadata;
     const updated = (state.setMetadata?.slots || []).find((item) => item.slot === slot.slot);
     if (updated) {
@@ -1952,7 +2171,11 @@ async function playEditorFromTransport() {
   if (editorTransportLocked(slot)) return;
   clearEditorRegionLoopTest();
   renderEditorTransport(slot);
-  await sendPlaybackCommand("play", { slot: slot.slot });
+  const point = currentScrubPoint(slot);
+  await sendPlaybackCommand("play", {
+    slot: slot.slot,
+    startSeconds: Number(point?.timeSeconds || 0)
+  });
 }
 
 async function toggleEditorSelectionLoop() {
@@ -2279,7 +2502,7 @@ function updateWaveformReadout(slot = null) {
 
 function beginTimelineScrub(event) {
   const selected = selectedMetadata();
-  if (!selected || state.playbackState?.mode === "performance") return;
+  if (!selected) return;
   if (event.target.closest(".timeline-ruler") || event.target.closest(".region-lane") || event.target.closest(".timeline-region") || event.target.closest(".timeline-cue") || event.target.closest("#regionMenu")) return;
   event.preventDefault();
   state.movingTransportSlot = selected.slot;
@@ -2298,12 +2521,17 @@ function beginTimelineScrub(event) {
 
 function beginRulerGesture(event) {
   const selected = selectedMetadata();
-  if (!selected || state.playbackState?.mode === "performance" || event.button !== 0) return;
+  if (!selected || event.button !== 0) return;
   if (event.target.closest("#regionMenu")) return;
   const startPoint = snappedBeatFromPointer(event, selected);
   if (!startPoint) return;
   event.preventDefault();
   event.stopPropagation();
+  if (state.playbackState?.mode === "performance") {
+    setTimelineTransportPoint(selected, startPoint, { seekPlayback: true });
+    renderSelectedMetadata();
+    return;
+  }
   hideRegionMenu();
   state.selectedRegionIndex = null;
   state.selectedCueIndex = null;
@@ -2480,7 +2708,7 @@ function setTimelineTransportPoint(slot, point, options = {}) {
 
 function seekPlaybackToPoint(slot, point) {
   const playback = state.playbackState || {};
-  if (playback.currentSlot !== slot?.slot || !["playing", "paused"].includes(playback.transport)) return;
+  if (playback.currentSlot !== slot?.slot) return;
   sendPlaybackCommand("seek", { seconds: Number(point.timeSeconds || 0) });
 }
 
@@ -2492,6 +2720,10 @@ function snappedBeatFromPointer(event, slot) {
   const x = Math.max(0, Math.min(timelineWidth, event.clientX - rect.left + els.timelineSurface.scrollLeft));
   const duration = slotWaveformDuration(slot);
   const targetSeconds = (x / timelineWidth) * duration;
+  const lastBeat = beatGrid.at(-1);
+  if (lastBeat && targetSeconds > Number(lastBeat.timeSeconds || 0)) {
+    return transportPointFromGridBeat(lastBeat, targetSeconds);
+  }
   return nearestTransportSnap(beatGrid, targetSeconds);
 }
 
@@ -2628,6 +2860,8 @@ function gridGlobalBeat(gridBeat, fallbackIndex) {
 
 function currentTransportSeconds() {
   const playback = state.playbackState || {};
+  const meterTime = activeMeterTransportSeconds(playback.currentSlot);
+  if (meterTime !== null) return meterTime;
   const anchor = Number(playback.transportAnchorSeconds ?? playback.currentTimeSeconds ?? 0) || 0;
   if (playback.transport !== "playing" || !playback.transportStartedAt) {
     return Number(playback.currentTimeSeconds ?? anchor) || 0;
@@ -2635,6 +2869,14 @@ function currentTransportSeconds() {
   const startedAt = Date.parse(playback.transportStartedAt);
   if (!Number.isFinite(startedAt)) return Number(playback.currentTimeSeconds || anchor) || 0;
   return Math.max(0, anchor + ((Date.now() - startedAt) / 1000));
+}
+
+function activeMeterTransportSeconds(slotNumber) {
+  const meters = state.mixerMeters || {};
+  if (state.playbackState?.transport !== "playing" || !meters.active) return null;
+  if (Number(meters.slot) !== Number(slotNumber)) return null;
+  const time = Number(meters.currentTimeSeconds);
+  return Number.isFinite(time) && time >= 0 ? time : null;
 }
 
 function renderScrubPlayhead(slot) {
@@ -2959,13 +3201,16 @@ function openRegionMenu(index, item, options = {}) {
   state.selectedCueIndex = null;
   els.regionNameSelect.value = region.name || "";
   highlightSelectedRegionEditorRow(index, { scroll: false });
-  const maxLeft = Math.max(12, window.innerWidth - 372);
-  const maxTop = Math.max(12, window.innerHeight - 260);
-  const left = Math.min(maxLeft, Math.max(12, pointerLeft ?? itemRect.left));
-  const top = Math.min(maxTop, Math.max(12, pointerTop ?? (itemRect.top + itemRect.height + 8)));
+  els.regionMenu.style.left = "12px";
+  els.regionMenu.style.top = "12px";
+  els.regionMenu.classList.remove("hidden");
+  const menuRect = els.regionMenu.getBoundingClientRect();
+  const desiredLeft = pointerLeft ?? itemRect.left;
+  const desiredTop = pointerTop ?? (itemRect.top + itemRect.height + 8);
+  const left = clamp(desiredLeft, 12, Math.max(12, window.innerWidth - menuRect.width - 12));
+  const top = clamp(desiredTop, 12, Math.max(12, window.innerHeight - menuRect.height - 12));
   els.regionMenu.style.left = `${left}px`;
   els.regionMenu.style.top = `${top}px`;
-  els.regionMenu.classList.remove("hidden");
   els.regionLane.querySelectorAll(".timeline-region").forEach((regionItem) => {
     regionItem.classList.toggle("selected-region", Number(regionItem.dataset.regionIndex) === index);
   });
@@ -2976,6 +3221,63 @@ function openRegionMenu(index, item, options = {}) {
       els.regionNameSelect.select();
     }, 0);
   }
+}
+
+function openTimelineRegionContextMenu(event) {
+  if (state.playbackState?.mode === "performance") return;
+  if (event.target.closest("#regionMenu") || event.target.closest(".timeline-region")) return;
+  const selected = selectedMetadata();
+  const match = regionEntryFromTimelinePointer(event, selected);
+  if (!match) return;
+  event.preventDefault();
+  event.stopPropagation();
+  const item = {
+    getBoundingClientRect: () => ({
+      left: event.clientX,
+      top: event.clientY,
+      height: 0
+    })
+  };
+  openRegionMenu(match.index, item, {
+    focusName: false,
+    event,
+    arrangedRange: match.arrangedRange
+  });
+}
+
+function regionEntryFromTimelinePointer(event, slot) {
+  if (!slot) return null;
+  const duration = slotWaveformDuration(slot);
+  if (!duration) return null;
+  const rect = els.timelineSurface.getBoundingClientRect();
+  const timelineWidth = Math.max(1, els.timelineSurface.clientWidth * state.timelineZoom);
+  const x = Math.max(0, Math.min(timelineWidth, event.clientX - rect.left + els.timelineSurface.scrollLeft));
+  const pointerTime = (x / timelineWidth) * duration;
+  const entries = arrangedRegionEntries(slot);
+  for (const entry of entries) {
+    const region = entry.region;
+    const start = timeForBarBeat(slot, Number(region.startBar || 1), Number(region.startBeat || 1));
+    const end = timeForBarBeat(slot, Number(region.endBar || region.startBar || 1), Number(region.endBeat || 1));
+    if (pointerTime < start || pointerTime > Math.max(start + 0.1, end)) continue;
+    const index = entry.sourceIndex;
+    return {
+      index,
+      arrangedRange: {
+        slot: slot.slot,
+        index,
+        blockId: entry.blockId || "",
+        startBar: Number(region.startBar || 1),
+        startBeat: Number(region.startBeat || 1),
+        endBar: Number(region.endBar || region.startBar || 1),
+        endBeat: Number(region.endBeat || 1),
+        rawStartBar: Number(entry.rawRegion?.startBar || slot.regions?.regions?.[index]?.startBar || region.startBar || 1),
+        rawStartBeat: Number(entry.rawRegion?.startBeat || slot.regions?.regions?.[index]?.startBeat || region.startBeat || 1),
+        rawEndBar: Number(entry.rawRegion?.endBar || slot.regions?.regions?.[index]?.endBar || region.endBar || 1),
+        rawEndBeat: Number(entry.rawRegion?.endBeat || slot.regions?.regions?.[index]?.endBeat || region.endBeat || 1)
+      }
+    };
+  }
+  return null;
 }
 
 function hideRegionMenu() {
@@ -3003,6 +3305,57 @@ function trimSelectedRegion() {
   region.endBar = Math.max(start + 1, Number(region.endBar || start + 2) - 1);
   renderSelectedMetadata();
   scheduleMetadataAutosave();
+}
+
+function splitSelectedRegionAtPlayhead() {
+  const selected = selectedMetadata();
+  if (!selected || state.playbackState?.mode === "performance") return;
+  const point = currentScrubPoint(selected);
+  if (!point) return;
+  const splitSeconds = Number(point.timeSeconds || 0);
+  const blocks = ensureArrangementBlocks(selected, { initializeFullSong: true });
+  const blockIndex = blocks.findIndex((block) => {
+    const region = (selected.regions?.regions || []).find((item) => item.id === block.regionId);
+    if (!region) return false;
+    const start = Number(block.trimStartSeconds ?? sourceTimeForBarBeat(selected, Number(block.trimStartBar || region.startBar || 1), Number(block.trimStartBeat || region.startBeat || 1)));
+    const end = Number(block.trimEndSeconds ?? sourceTimeForBarBeat(selected, Number(block.trimEndBar || region.endBar || Number(region.startBar || 1) + 1), Number(block.trimEndBeat || region.endBeat || 1)));
+    return splitSeconds > start + 0.05 && splitSeconds < end - 0.05;
+  });
+  if (blockIndex < 0) {
+    setAlert("Move the playhead inside a region block before splitting.");
+    return;
+  }
+  pushArrangementUndo("Split at playhead");
+  const block = blocks[blockIndex];
+  const region = (selected.regions?.regions || []).find((item) => item.id === block.regionId);
+  const leftId = `${block.id || `block-${block.regionId}`}-a-${Date.now()}`;
+  const rightId = `${block.id || `block-${block.regionId}`}-b-${Date.now()}`;
+  const left = {
+    ...block,
+    id: leftId,
+    trimStartSeconds: Number(block.trimStartSeconds ?? sourceTimeForBarBeat(selected, Number(block.trimStartBar || region.startBar || 1), Number(block.trimStartBeat || region.startBeat || 1))),
+    trimEndSeconds: splitSeconds
+  };
+  const right = {
+    ...block,
+    id: rightId,
+    trimStartSeconds: splitSeconds,
+    trimEndSeconds: Number(block.trimEndSeconds ?? sourceTimeForBarBeat(selected, Number(block.trimEndBar || region.endBar || Number(region.startBar || 1) + 1), Number(block.trimEndBeat || region.endBeat || 1)))
+  };
+  blocks.splice(blockIndex, 1, left, right);
+  selected.arrangementCache = null;
+  hideRegionMenu();
+  state.selectedRegionIndex = (selected.regions?.regions || []).findIndex((item) => item.id === block.regionId);
+  state.selectedArrangedRegionRange = {
+    slot: selected.slot,
+    index: state.selectedRegionIndex,
+    blockId: rightId,
+    rawStartSeconds: right.trimStartSeconds,
+    rawEndSeconds: right.trimEndSeconds
+  };
+  renderSelectedMetadata();
+  scheduleMetadataAutosave();
+  setAlert("Split created. The right side is selected; press Delete to remove it and close the gap.");
 }
 
 function deleteSelectedRegion() {
@@ -3653,12 +4006,20 @@ function arrangementEnabled(slot) {
   if (!slot?.arrangement || typeof slot.arrangement !== "object") return false;
   const hasCuts = Array.isArray(slot.arrangement.cuts) && slot.arrangement.cuts.length;
   const hasBlocks = Array.isArray(slot.arrangement.blocks) && slot.arrangement.blocks.length;
-  return slot.arrangement.enabled !== false && Boolean(hasCuts || hasBlocks);
+  const hasSongTrim = Number(slot.arrangement.trimStartBar || 1) > 1
+    || Number(slot.arrangement.trimEndBar || 0) > 0
+    || Number(slot.arrangement.trimStartSeconds || 0) > 0
+    || Number(slot.arrangement.trimEndSeconds || 0) > 0;
+  return slot.arrangement.enabled !== false && Boolean(hasCuts || hasBlocks || hasSongTrim);
 }
 
 function arrangementHasCuts(slot) {
   return Boolean(slot && ((Array.isArray(slot.arrangement?.cuts) && slot.arrangement.cuts.length)
-    || (Array.isArray(slot.arrangement?.blocks) && slot.arrangement.blocks.length)));
+    || (Array.isArray(slot.arrangement?.blocks) && slot.arrangement.blocks.length)
+    || Number(slot.arrangement?.trimStartBar || 1) > 1
+    || Number(slot.arrangement?.trimEndBar || 0) > 0
+    || Number(slot.arrangement?.trimStartSeconds || 0) > 0
+    || Number(slot.arrangement?.trimEndSeconds || 0) > 0));
 }
 
 function ensureArrangementBlocks(slot, options = {}) {
@@ -3683,6 +4044,66 @@ function ensureArrangementBlocks(slot, options = {}) {
   arrangement.blocks = current;
   arrangement.enabled = true;
   return arrangement.blocks;
+}
+
+function trimSongStartToPlayhead() {
+  const selected = selectedMetadata();
+  if (!selected || state.playbackState?.mode === "performance") return;
+  const point = currentScrubPoint(selected);
+  if (!point) return;
+  const maxBar = songTrimMaxBar(selected);
+  const trimStartBar = clamp(Number(point.measure || 1), 1, Math.max(1, maxBar - 1));
+  const arrangement = ensureArrangement(selected);
+  const trimEndBar = Number(arrangement.trimEndBar || maxBar);
+  const trimStartSeconds = Number(point.timeSeconds || 0);
+  const trimEndSeconds = Number(arrangement.trimEndSeconds || slotWaveformDuration(selected));
+  if (trimStartBar >= trimEndBar || trimStartSeconds >= trimEndSeconds) {
+    setAlert("Start trim must be before the end trim.");
+    return;
+  }
+  pushArrangementUndo("Trim song start");
+  arrangement.trimStartBar = trimStartBar;
+  arrangement.trimStartBeat = Number(point.beat || 1);
+  arrangement.trimStartSeconds = trimStartSeconds;
+  arrangement.enabled = true;
+  selected.arrangementCache = null;
+  renderSelectedMetadata();
+  scheduleMetadataAutosave();
+  setAlert(`Song start trimmed to ${trimStartBar}.${Number(point.beat || 1)}.`);
+}
+
+function trimSongEndToPlayhead() {
+  const selected = selectedMetadata();
+  if (!selected || state.playbackState?.mode === "performance") return;
+  const point = currentScrubPoint(selected);
+  if (!point) return;
+  const maxBar = songTrimMaxBar(selected);
+  const trimEndBar = clamp(Number(point.measure || maxBar), 2, maxBar);
+  const arrangement = ensureArrangement(selected);
+  const trimStartBar = Number(arrangement.trimStartBar || 1);
+  const trimEndSeconds = Number(point.timeSeconds || 0);
+  const trimStartSeconds = Number(arrangement.trimStartSeconds || 0);
+  if (trimEndBar <= trimStartBar || trimEndSeconds <= trimStartSeconds + 0.05) {
+    setAlert("End trim must be after the start trim.");
+    return;
+  }
+  pushArrangementUndo("Trim song end");
+  arrangement.trimEndBar = trimEndBar;
+  arrangement.trimEndBeat = Number(point.beat || 1);
+  arrangement.trimEndSeconds = trimEndSeconds;
+  arrangement.enabled = true;
+  selected.arrangementCache = null;
+  renderSelectedMetadata();
+  scheduleMetadataAutosave();
+  setAlert(`Song end trimmed to ${trimEndBar}.${Number(point.beat || 1)}.`);
+}
+
+function songTrimMaxBar(slot) {
+  const regions = slot?.regions?.regions || [];
+  const regionMax = regions.reduce((max, region) => Math.max(max, Number(region.endBar || region.startBar || 1)), 1);
+  const grid = visualBeatGrid(slot);
+  const gridMax = grid.reduce((max, beat) => Math.max(max, Number(beat.measure || 1)), 1);
+  return Math.max(regionMax, gridMax, 2);
 }
 
 function arrangedRegionEntries(slot) {
@@ -3806,6 +4227,10 @@ function arrangedBlocks(slot) {
   const waveformDuration = Number(slot?.waveform?.durationSeconds || 0);
   const savedBlocks = Array.isArray(slot?.arrangement?.blocks) ? slot.arrangement.blocks : [];
   const sourceBlocks = savedBlocks.length ? savedBlocks : regions.map((region) => ({ regionId: region.id }));
+  const trimStartBar = Number(slot?.arrangement?.trimStartBar || 1);
+  const trimEndBar = Number(slot?.arrangement?.trimEndBar || 0);
+  const trimStartSeconds = Number(slot?.arrangement?.trimStartSeconds || 0);
+  const trimEndSeconds = Number(slot?.arrangement?.trimEndSeconds || 0);
   let cursor = 1;
   let arrangedSeconds = 0;
   return sourceBlocks
@@ -3814,11 +4239,24 @@ function arrangedBlocks(slot) {
       if (!region) return null;
       const regionStartBar = Number(region.startBar || 1);
       const regionEndBar = Math.max(regionStartBar + 1, Number(region.endBar || regionStartBar + 1));
-      const rawStartBar = Math.max(regionStartBar, Number(block.trimStartBar || regionStartBar));
-      const rawEndBar = Math.min(regionEndBar, Math.max(rawStartBar + 1, Number(block.trimEndBar || regionEndBar)));
+      const rawStartBar = Math.max(regionStartBar, trimStartBar, Number(block.trimStartBar || regionStartBar));
+      const useMeasureEndTrim = trimEndBar > 0 && !trimEndSeconds;
+      const rawEndBar = Math.min(regionEndBar, useMeasureEndTrim ? trimEndBar : regionEndBar, Math.max(rawStartBar + 1, Number(block.trimEndBar || regionEndBar)));
+      if (rawEndBar <= rawStartBar) return null;
       const length = Math.max(1, rawEndBar - rawStartBar);
-      const rawStartSeconds = sourceTimeForBarBeat(slot, rawStartBar, Number(region.startBeat || 1));
-      const rawEndSeconds = sourceTimeForBarBeat(slot, rawEndBar, Number(region.endBeat || 1));
+      const blockStartSeconds = sourceTimeForBarBeat(slot, rawStartBar, Number(region.startBeat || 1));
+      const blockEndSeconds = waveformDuration > 0
+        ? Math.min(waveformDuration, sourceTimeForBarBeat(slot, rawEndBar, Number(region.endBeat || 1)))
+        : sourceTimeForBarBeat(slot, rawEndBar, Number(region.endBeat || 1));
+      const blockTrimStartSeconds = Number(block.trimStartSeconds || 0);
+      const blockTrimEndSeconds = Number(block.trimEndSeconds || 0);
+      const rawStartSeconds = Math.max(blockStartSeconds, trimStartSeconds, blockTrimStartSeconds || 0);
+      const rawEndSeconds = Math.min(
+        blockEndSeconds,
+        trimEndSeconds > 0 ? trimEndSeconds : blockEndSeconds,
+        blockTrimEndSeconds > 0 ? blockTrimEndSeconds : blockEndSeconds
+      );
+      if (rawEndSeconds <= rawStartSeconds) return null;
       const blockDuration = Math.max(0, rawEndSeconds - rawStartSeconds);
       const arranged = {
         id: String(block.id || `block-${region.id || index}`),
@@ -3833,7 +4271,7 @@ function arrangedBlocks(slot) {
         rawEndBar,
         rawEndBeat: Number(region.endBeat || 1),
         rawStartSeconds,
-        rawEndSeconds: waveformDuration > 0 ? Math.min(waveformDuration, rawEndSeconds) : rawEndSeconds,
+        rawEndSeconds,
         arrangedStartSeconds: arrangedSeconds,
         arrangedEndSeconds: arrangedSeconds + blockDuration
       };
@@ -3939,7 +4377,13 @@ function clearArrangement() {
   selected.arrangement = {
     ...ensureArrangement(selected),
     cuts: [],
-    blocks: []
+    blocks: [],
+    trimStartBar: null,
+    trimStartBeat: null,
+    trimEndBar: null,
+    trimEndBeat: null,
+    trimStartSeconds: null,
+    trimEndSeconds: null
   };
   selected.arrangementCache = null;
   renderSelectedMetadata();
@@ -4300,6 +4744,73 @@ async function saveSelectedMetadata() {
   }
 }
 
+async function approveSelectedMetadata() {
+  const selected = selectedMetadata();
+  if (!selected) return;
+  await saveSelectedMetadata();
+  try {
+    const result = await api(`/api/set-metadata/current/slot/${selected.slot}/approve`, { method: "POST" });
+    setAlert(`Approved cue/regions for slot ${result.slot}.`);
+    await auditMetadataCache();
+  } catch (error) {
+    setAlert(`Approval failed: ${error.message}`);
+  }
+}
+
+async function auditMetadataCache() {
+  if (els.settingsStatus) els.settingsStatus.textContent = "Auditing cue/region cache...";
+  try {
+    const result = await api("/api/set-metadata/current/audit");
+    renderMetadataAuditReport(result);
+    if (els.settingsStatus) {
+      els.settingsStatus.textContent = result.mismatchCount
+        ? `Cue/region audit found ${result.mismatchCount} mismatch(es).`
+        : `Cue/region audit clean: ${result.checked} song(s).`;
+    }
+    return result;
+  } catch (error) {
+    renderMetadataAuditReport({ ok: false, error: error.message });
+    if (els.settingsStatus) els.settingsStatus.textContent = `Cue/region audit failed: ${error.message}`;
+    return null;
+  }
+}
+
+async function rehydrateMetadataCache() {
+  if (els.settingsStatus) els.settingsStatus.textContent = "Rehydrating cue/region cache from analyzer files...";
+  try {
+    const result = await api("/api/set-metadata/current/rehydrate", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ includeWaveforms: false })
+    });
+    state.setMetadata = null;
+    state.waveformLoadInFlight.clear();
+    await loadSetMetadata();
+    renderMetadataAuditReport(result.audit || result);
+    if (els.settingsStatus) {
+      els.settingsStatus.textContent = `Rehydrated ${result.slotCount || 0} song(s), cleared ${result.clearedCount || 0} generated file(s).`;
+    }
+    return result;
+  } catch (error) {
+    renderMetadataAuditReport({ ok: false, error: error.message });
+    if (els.settingsStatus) els.settingsStatus.textContent = `Rehydrate failed: ${error.message}`;
+    return null;
+  }
+}
+
+function renderMetadataAuditReport(result) {
+  if (!els.metadataAuditReport) return;
+  els.metadataAuditReport.classList.remove("hidden");
+  const mismatches = Array.isArray(result?.mismatches) ? result.mismatches.slice(0, 12) : [];
+  els.metadataAuditReport.textContent = JSON.stringify({
+    ok: Boolean(result?.ok),
+    checked: result?.checked || 0,
+    mismatchCount: result?.mismatchCount || 0,
+    error: result?.error || "",
+    mismatches
+  }, null, 2);
+}
+
 function metadataInputHasFocus() {
   const active = document.activeElement;
   return Boolean(active instanceof HTMLInputElement && (active.dataset.regionField || active.dataset.cueField));
@@ -4526,7 +5037,194 @@ function renderSetlist() {
     }
 
     els.setlistSlots.append(slot);
+    const transition = transitionAfterSlot(index + 1);
+    if (transition) {
+      els.setlistSlots.append(transitionTile(transition));
+    }
   });
+  if (state.openTransitionFromSlot !== null) {
+    window.requestAnimationFrame(() => {
+      const tile = els.setlistSlots.querySelector(`.transition-tile[data-from-slot="${state.openTransitionFromSlot}"]`);
+      const editor = tile?.querySelector(".transition-editor");
+      if (tile && editor) {
+        tile.classList.add("editing");
+        positionTransitionEditor(tile, editor);
+      }
+    });
+  }
+}
+
+function transitionAfterSlot(fromSlot) {
+  return (state.setlistTransitions || []).find((transition) => Number(transition.fromSlot) === Number(fromSlot)) || null;
+}
+
+function transitionTile(transition) {
+  const tile = document.createElement("article");
+  tile.className = `transition-tile transition-${transition.mode}`;
+  tile.dataset.fromSlot = String(transition.fromSlot);
+  const locked = state.playbackState?.mode === "performance";
+  const summary = document.createElement("button");
+  summary.type = "button";
+  summary.className = "transition-summary";
+  summary.disabled = locked;
+  summary.innerHTML = `
+    <strong>${escapeHtml(transitionModeLabel(transition.mode))}</strong>
+    <span>${escapeHtml(transitionPadSummary(transition))}</span>
+    ${transitionDurationRelevant(transition.mode) ? `<small>${Number(transition.durationSeconds || 5)}s</small>` : ""}
+  `;
+  summary.addEventListener("click", (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    if (locked) return;
+    const fromSlot = Number(transition.fromSlot);
+    const willOpen = Number(state.openTransitionFromSlot) !== fromSlot;
+    state.openTransitionFromSlot = willOpen ? fromSlot : null;
+    document.querySelectorAll(".transition-tile.editing").forEach((item) => {
+      if (item !== tile) item.classList.remove("editing");
+    });
+    tile.classList.toggle("editing", willOpen);
+    if (willOpen) {
+      window.requestAnimationFrame(() => positionTransitionEditor(tile, editor));
+    }
+  });
+
+  const editor = document.createElement("div");
+  editor.className = "transition-editor";
+  const mode = selectControl("Mode", transition.mode, [
+    ["cue-next", "Cue Next"],
+    ["stay", "Stay"],
+    ["autolink", "AutoLink"],
+    ["crossfade", "Crossfade"],
+    ["overlap", "Overlap"]
+  ]);
+  const continuePad = document.createElement("label");
+  continuePad.className = "transition-toggle";
+  continuePad.innerHTML = `<input type="checkbox" ${transition.continuePad !== false ? "checked" : ""}> <span>Pad</span>`;
+  const pad = selectControl("Pad", transition.padBehavior, [
+    ["off", "Off"],
+    ["hold-current-key", "Hold Current"],
+    ["next-song-key", "Next Key"],
+    ["crossfade-to-next-key", "Pad Xfade"]
+  ]);
+  const duration = document.createElement("label");
+  duration.textContent = "Seconds";
+  const durationInput = document.createElement("input");
+  durationInput.type = "number";
+  durationInput.min = "1";
+  durationInput.max = "30";
+  durationInput.step = "1";
+  durationInput.value = String(Number(transition.durationSeconds || 5));
+  duration.append(durationInput);
+  editor.append(mode.label, continuePad, pad.label, duration);
+  editor.addEventListener("pointerdown", (event) => event.stopPropagation());
+  editor.addEventListener("click", (event) => event.stopPropagation());
+  const saveTransition = () => {
+    updateTransition(transition.fromSlot, {
+      mode: mode.select.value,
+      continuePad: continuePad.querySelector("input").checked,
+      padBehavior: pad.select.value,
+      durationSeconds: Number(durationInput.value || 5)
+    });
+  };
+  [mode.select, pad.select, durationInput, continuePad.querySelector("input")].forEach((control) => {
+    control.addEventListener("change", saveTransition);
+    control.addEventListener("click", (event) => event.stopPropagation());
+  });
+  tile.append(summary, editor);
+  return tile;
+}
+
+function positionTransitionEditor(tile, editor) {
+  if (!tile || !editor) return;
+  const rect = tile.getBoundingClientRect();
+  const width = editor.offsetWidth || 260;
+  const height = editor.offsetHeight || 210;
+  const left = Math.min(window.innerWidth - width - 12, Math.max(12, rect.left));
+  const below = rect.bottom + 8;
+  const above = rect.top - height - 8;
+  const top = below + height <= window.innerHeight - 12
+    ? below
+    : Math.max(12, above);
+  editor.style.left = `${left}px`;
+  editor.style.top = `${top}px`;
+}
+
+function selectControl(labelText, value, options) {
+  const label = document.createElement("label");
+  label.textContent = labelText;
+  const select = document.createElement("select");
+  for (const [optionValue, text] of options) {
+    const option = document.createElement("option");
+    option.value = optionValue;
+    option.textContent = text;
+    select.append(option);
+  }
+  select.value = value;
+  label.append(select);
+  return { label, select };
+}
+
+function updateTransition(fromSlot, patch) {
+  state.openTransitionFromSlot = Number(fromSlot);
+  state.setlistTransitions = normalizeClientTransitions(state.setlistTransitions.map((transition) => {
+    if (Number(transition.fromSlot) !== Number(fromSlot)) return transition;
+    return { ...transition, ...patch };
+  }));
+  renderSetlist();
+  scheduleSetlistSave();
+}
+
+function transitionModeLabel(mode) {
+  return {
+    "cue-next": "Cue Next",
+    stay: "Stay",
+    autolink: "AutoLink",
+    crossfade: "Crossfade",
+    overlap: "Overlap"
+  }[mode] || "Cue Next";
+}
+
+function transitionPadSummary(transition) {
+  if (transition.continuePad === false || transition.padBehavior === "off") return "Pad Off";
+  return {
+    "hold-current-key": "Pad Holds",
+    "next-song-key": "Pad -> Next",
+    "crossfade-to-next-key": "Pad Xfade"
+  }[transition.padBehavior] || "Pad -> Next";
+}
+
+function transitionDurationRelevant(mode) {
+  return ["crossfade", "overlap"].includes(mode);
+}
+
+function normalizeClientTransitions(transitions) {
+  return (Array.isArray(transitions) ? transitions : []).map((transition) => ({
+    fromSlot: Number(transition.fromSlot || 0),
+    toSlot: Number(transition.toSlot || 0),
+    mode: ["cue-next", "stay", "autolink", "crossfade", "overlap"].includes(transition.mode) ? transition.mode : "cue-next",
+    padBehavior: ["off", "hold-current-key", "next-song-key", "crossfade-to-next-key"].includes(transition.padBehavior) ? transition.padBehavior : "next-song-key",
+    durationSeconds: Number(transition.durationSeconds || 5),
+    continuePad: transition.continuePad !== false
+  })).filter((transition) => transition.fromSlot && transition.toSlot);
+}
+
+function setFingerprintClient(setlist) {
+  const slots = (setlist?.slots || []).map((slot) => ({
+    slot: Number(slot.slot || 0),
+    songId: slot.songId || "",
+    key: slot.selectedKey || slot.key || "",
+    bpm: slot.bpm || "",
+    timeSignature: slot.timeSignature || ""
+  }));
+  const transitions = normalizeClientTransitions(setlist?.transitions || []).map((transition) => ({
+    fromSlot: transition.fromSlot,
+    toSlot: transition.toSlot,
+    mode: transition.mode,
+    padBehavior: transition.padBehavior,
+    durationSeconds: transition.durationSeconds,
+    continuePad: transition.continuePad
+  }));
+  return JSON.stringify({ slots, transitions });
 }
 
 function selectSetlistSong(index, songId) {
@@ -4539,10 +5237,40 @@ function selectSetlistSong(index, songId) {
   state.selectedRegionIndex = null;
   state.selectedCueIndex = null;
   state.regionSketch = null;
-  loadSong(songId);
+  if (state.playbackState?.mode === "performance") {
+    setAlert("");
+    state.loadedSong = null;
+  } else {
+    loadSong(songId);
+  }
+  syncSelectedSlotToPlayback(index + 1);
   renderMetadataSlotOptions();
   renderSelectedMetadata();
   renderSetlist();
+}
+
+async function syncSelectedSlotToPlayback(slotNumber) {
+  const selectedSlot = Number(slotNumber || 0);
+  if (!selectedSlot || state.playbackState?.currentSlot === selectedSlot) return;
+  try {
+    const result = await api("/api/playback/command", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        command: "selectSlot",
+        slot: selectedSlot,
+        source: "main-app-selection"
+      })
+    });
+    state.playbackState = result.state;
+    if (!result.accepted) {
+      setAlert(result.reason || "Song selection was not accepted.");
+      return;
+    }
+    renderPlaybackState();
+  } catch (error) {
+    setAlert(`Selection sync failed: ${error.message}`);
+  }
 }
 
 function setlistSelectionLocked(index) {
@@ -4561,13 +5289,13 @@ function songActionMenu(index, song) {
     selectSetlistSong(index, song.id);
   });
 
-  const keyTempo = document.createElement("button");
-  keyTempo.type = "button";
-  keyTempo.textContent = "Key / BPM";
-  keyTempo.addEventListener("click", (event) => {
+  const playbackKey = document.createElement("button");
+  playbackKey.type = "button";
+  playbackKey.textContent = "Playback Key";
+  playbackKey.addEventListener("click", (event) => {
     event.stopPropagation();
     selectSetlistSong(index, song.id);
-    els.tempoKey.focus();
+    els.playbackKeySelect?.focus();
   });
 
   const remove = document.createElement("button");
@@ -4580,7 +5308,7 @@ function songActionMenu(index, song) {
     scheduleSetlistSave();
   });
 
-  menu.append(edit, keyTempo, remove);
+  menu.append(edit, playbackKey, remove);
   return menu;
 }
 
@@ -4675,6 +5403,10 @@ function setlistSongFromLoadedSong(song) {
     vendor: song.vendor,
     folderPath: song.folderPath,
     key: song.key || "",
+    originalKey: song.key || "",
+    selectedKey: canonicalKey(song.key || ""),
+    transposeCents: 0,
+    padKey: canonicalKey(song.padKey || song.key || ""),
     bpm: song.bpm || null,
     timeSignature: song.timeSignature || "",
     trackCount: song.trackCount || null,
@@ -4735,9 +5467,87 @@ function removeSongAt(index) {
 }
 
 function setlistMetaText(song) {
-  const key = song.key || "--";
+  const key = canonicalKey(song.selectedKey || song.key || "") || "--";
   const bpm = song.bpm ? `${song.bpm} BPM` : "-- BPM";
   return `${key} | ${bpm}`;
+}
+
+function keyOptions() {
+  return ["C", "Db", "D", "Eb", "E", "F", "Gb", "G", "Ab", "A", "Bb", "B"];
+}
+
+function populatePlaybackKeySelect() {
+  if (!els.playbackKeySelect) return;
+  els.playbackKeySelect.replaceChildren();
+  for (const key of keyOptions()) {
+    const option = document.createElement("option");
+    option.value = key;
+    option.textContent = key;
+    els.playbackKeySelect.append(option);
+  }
+}
+
+function holdPlaybackKeyEditor() {
+  state.playbackKeyInteractionUntil = Date.now() + 5000;
+}
+
+function playbackKeyEditorHeld() {
+  return document.activeElement === els.playbackKeySelect || Date.now() < state.playbackKeyInteractionUntil;
+}
+
+function renderPlaybackKeyEditor(selected) {
+  if (!els.playbackKeySelect) return;
+  const setlistSong = selected?.slot ? state.setlist[Number(selected.slot) - 1] : null;
+  const key = canonicalKey(setlistSong?.selectedKey || setlistSong?.key || selected?.tempoMap?.key || "");
+  const originalKey = canonicalKey(setlistSong?.originalKey || selected?.tempoMap?.key || key || "");
+  const transposeCents = Number(setlistSong?.transposeCents || 0);
+  const held = playbackKeyEditorHeld();
+  if (!held) {
+    els.playbackKeySelect.value = keyOptions().includes(key) ? key : "";
+  }
+  const disabled = !selected || state.playbackState?.mode === "performance";
+  if (!held || disabled) {
+    els.playbackKeySelect.disabled = disabled;
+  }
+  if (els.playbackKeyOriginal) els.playbackKeyOriginal.textContent = `Original: ${originalKey || "--"}`;
+  if (els.playbackKeyTranspose) els.playbackKeyTranspose.textContent = `Transpose: ${transposeCents} cents`;
+  if (els.playbackKeyStatus) {
+    const padKey = canonicalKey(setlistSong?.padKey || key || "");
+    els.playbackKeyStatus.textContent = selected
+      ? `Dynamic pad follows ${padKey || "--"}. Confirm set after a key change.`
+      : "Select a song to change playback key.";
+  }
+}
+
+function canonicalKey(value) {
+  const normalized = String(value || "").trim().replace(/\u266d/g, "b").replace(/\u266f/g, "#");
+  const aliases = { "C#": "Db", "D#": "Eb", "F#": "Gb", "G#": "Ab", "A#": "Bb" };
+  return aliases[normalized] || normalized;
+}
+
+async function updateSetlistSongKey(index, selectedKey) {
+  const song = state.setlist[index];
+  if (!song || state.playbackState?.mode === "performance") return;
+  try {
+    setAlert(`Preparing ${song.title} in ${selectedKey}...`);
+    const saved = await api(`/api/setlist/slot/${index + 1}/key`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ key: selectedKey })
+    });
+    state.setlist = saved.slots.map((slot) => slot.songId ? setlistSongFromSlot(slot) : null);
+    state.setlistTransitions = normalizeClientTransitions(saved.transitions || state.setlistTransitions);
+    await loadPlaybackState();
+    await loadCacheReport();
+    await loadSetMetadata();
+    renderSetlist();
+    renderSelectedMetadata();
+    renderLoadedSong();
+    setAlert(`Prepared ${song.title} in ${selectedKey}. Confirm set before Performance.`);
+  } catch (error) {
+    setAlert(`Key change failed: ${error.message}`);
+    renderSetlist();
+  }
 }
 
 function renderMixerStrip(selected) {
@@ -4828,6 +5638,7 @@ async function refreshMixerMeters() {
 }
 
 function startMixerMeterStream() {
+  if (typeof EventSource === "undefined") return;
   if (state.mixerMeterStream) return;
   state.mixerMeterStream = new EventSource("/api/playback/meter-stream");
   state.mixerMeterStream.addEventListener("meters", (event) => {
@@ -5052,10 +5863,17 @@ function handleKeyboardShortcuts(event) {
     undoLastCueMove();
     return;
   }
+  if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "s") {
+    event.preventDefault();
+    splitSelectedRegionAtPlayhead();
+    return;
+  }
   if (event.key === "Escape") {
     closeAddSongModal();
     closeSettingsDrawer();
     hideRegionMenu();
+    state.openTransitionFromSlot = null;
+    document.querySelectorAll(".transition-tile.editing").forEach((item) => item.classList.remove("editing"));
     state.selectedCueIndex = null;
     renderSelectedMetadata();
     return;
@@ -5068,7 +5886,8 @@ function handleKeyboardShortcuts(event) {
     }
     if (state.selectedRegionIndex !== null) {
       event.preventDefault();
-      deleteSelectedRegion();
+      if (event.key === "Delete" && state.selectedArrangedRegionRange?.blockId) removeSelectedRegionAndCloseGap();
+      else deleteSelectedRegion();
       return;
     }
   }
@@ -5100,6 +5919,7 @@ function scheduleSetlistSave() {
 async function saveCurrentSetlist() {
   clearTimeout(state.saveTimer);
   state.saveTimer = null;
+  if (state.playbackState?.mode === "performance") return;
   if (state.setlistSaveInFlight) {
     state.setlistSavePending = true;
     return;
@@ -5114,6 +5934,10 @@ async function saveCurrentSetlist() {
       vendor: song.vendor,
       folderPath: song.folderPath,
       key: song.key || "",
+      originalKey: song.originalKey || song.key || "",
+      selectedKey: canonicalKey(song.selectedKey || song.key || ""),
+      transposeCents: Number(song.transposeCents || 0),
+      padKey: canonicalKey(song.padKey || song.selectedKey || song.key || ""),
       bpm: song.bpm || null,
       timeSignature: song.timeSignature || "",
       trackCount: song.trackCount || null
@@ -5124,9 +5948,10 @@ async function saveCurrentSetlist() {
     const saved = await api("/api/setlist/current", {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ slots })
+      body: JSON.stringify({ slots, transitions: state.setlistTransitions })
     });
     state.setlist = saved.slots.map((slot) => slot.songId ? setlistSongFromSlot(slot) : null);
+    state.setlistTransitions = normalizeClientTransitions(saved.transitions || []);
     await loadPlaybackState();
     await loadCacheReport();
     await loadSetMetadata();
@@ -5148,6 +5973,10 @@ function setlistSongFromSlot(slot) {
     vendor: slot.vendor || "",
     folderPath: slot.folderPath || "",
     key: slot.key || "",
+    originalKey: slot.originalKey || slot.key || "",
+    selectedKey: canonicalKey(slot.selectedKey || slot.key || ""),
+    transposeCents: Number(slot.transposeCents || 0),
+    padKey: canonicalKey(slot.padKey || slot.selectedKey || slot.key || ""),
     bpm: slot.bpm || null,
     timeSignature: slot.timeSignature || "",
     trackCount: slot.trackCount || null,
@@ -5155,6 +5984,7 @@ function setlistSongFromSlot(slot) {
     cacheFolder: slot.cacheFolder || "",
     cachedTrackCount: slot.cachedTrackCount || null,
     cachedAt: slot.cachedAt || "",
+    keyChangeCache: slot.keyChangeCache || null,
     readinessState: slot.readinessState || "",
     missingStems: slot.missingStems || [],
     cachedStems: slot.cachedStems || []
@@ -5217,7 +6047,7 @@ function renderSkippedFolders() {
 }
 
 function renderLoadedSong() {
-  const song = state.loadedSong;
+  const { song, setlistSong } = displaySongContext();
   if (!song) {
     els.songTitle.textContent = "None";
     els.songMeta.textContent = "Choose a song from the setlist.";
@@ -5226,10 +6056,9 @@ function renderLoadedSong() {
     setAlert("");
     return;
   }
-  const setlistSong = state.selectedSetlistIndex === null ? null : state.setlist[state.selectedSetlistIndex];
   const trackCount = song.trackCount || setlistSong?.trackCount || setlistSong?.cachedTrackCount || 0;
   els.songTitle.textContent = song.title;
-  const timeSignature = song.timeSignature || "--";
+  const timeSignature = song.timeSignature || setlistSong?.timeSignature || "--";
   els.songMeta.textContent = `${setlistMetaText(song)} | ${timeSignature} | ${trackCount} WAV file${trackCount === 1 ? "" : "s"}`;
   renderSongDetails(song);
 
@@ -5241,8 +6070,21 @@ function renderLoadedSong() {
 
 }
 
+function displaySongContext() {
+  const visualSlot = playbackVisualSlot();
+  const selectedIndex = visualSlot
+    ? visualSlot - 1
+    : state.selectedSetlistIndex;
+  const setlistSong = selectedIndex === null || selectedIndex === undefined ? null : state.setlist[selectedIndex] || null;
+  return {
+    song: setlistSong || state.loadedSong,
+    setlistSong
+  };
+}
+
 function renderSongDetails(song) {
-  const setlistSong = state.selectedSetlistIndex === null ? null : state.setlist[state.selectedSetlistIndex];
+  const context = displaySongContext();
+  const setlistSong = context.setlistSong;
   const selected = selectedMetadata();
   const metadataVersion = selected?.metadataVersion || setlistSong?.metadataVersionInfo || song.metadataVersionInfo || {};
   const details = [
@@ -5331,7 +6173,7 @@ function escapeHtml(value) {
 }
 
 async function api(path, options = {}) {
-  const response = await fetch(path, options);
+  const response = await fetch(path, { cache: "no-store", ...options });
   const payload = await response.json();
   if (!response.ok) {
     throw new Error(payload.error || "Request failed.");
