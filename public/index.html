@@ -21,9 +21,9 @@
 
     <main id="setlistView" class="app view active">
       <section class="live-surface">
-        <header class="setlist-command-bar">
+        <header class="setlist-command-bar layout-section command-section">
           <div class="setlist-readout">
-            <span id="setlistCount">0/10 songs</span>
+            <span id="setlistCount">0/6 songs</span>
             <strong>Current Set</strong>
             <span id="libraryStatus">Loading library...</span>
             <span id="engineStatus" class="engine-status">JUCE offline</span>
@@ -51,30 +51,32 @@
           </div>
         </header>
 
-        <div class="setlist-row-shell">
+        <section class="setlist-row-shell layout-section" aria-label="Current set">
           <div id="setlistSlots" class="setlist-slots" aria-label="Setlist slots"></div>
-        </div>
+        </section>
 
         <section class="selected-song-surface">
-          <div class="song-header">
-            <div>
-              <p class="eyebrow">Selected Song</p>
-              <h2 id="songTitle">None</h2>
-              <p id="songMeta">Choose a song from the setlist.</p>
-              <div id="songDetails" class="song-detail-grid hidden"></div>
+          <section class="selected-song-summary layout-section" aria-label="Selected song summary">
+            <div class="song-header">
+              <div>
+                <p class="eyebrow">Selected Song</p>
+                <h2 id="songTitle">None</h2>
+                <p id="songMeta">Choose a song from the setlist.</p>
+                <div id="songDetails" class="song-detail-grid hidden"></div>
+              </div>
+              <div class="playback-mode-status">
+                <strong id="playbackModeTitle">Edit Mode</strong>
+                <span id="playbackStatus">Confirm the set before Performance.</span>
+              </div>
             </div>
-            <div class="playback-mode-status">
-              <strong id="playbackModeTitle">Edit Mode</strong>
-              <span id="playbackStatus">Confirm the set before Performance.</span>
-            </div>
-          </div>
 
-          <div id="alertBox" class="alert hidden"></div>
-          <div id="panicRecoveryPanel" class="panic-recovery-panel hidden">
-            <strong>Panic Active</strong>
-            <span id="panicRecoveryStatus">Tracks Down / Click Alive</span>
-          </div>
-          <section id="timelinePanel" class="timeline-panel hidden">
+            <div id="alertBox" class="alert hidden"></div>
+            <div id="panicRecoveryPanel" class="panic-recovery-panel hidden">
+              <strong>Panic Active</strong>
+              <span id="panicRecoveryStatus">Tracks Down / Click Alive</span>
+            </div>
+          </section>
+          <section id="timelinePanel" class="timeline-panel layout-section hidden">
             <div class="timeline-toolbar">
               <div class="timeline-status-line">
                 <span id="timelineStatus">Select a setlist song to edit regions and cues.</span>
@@ -140,7 +142,7 @@
             </div>
           </section>
 
-          <section id="editorPanel" class="editor-panel hidden">
+          <section id="editorPanel" class="editor-panel layout-section hidden">
             <div class="editor-card playback-key-card">
               <div class="panel-title">
                 <strong>Playback Key</strong>
@@ -217,7 +219,7 @@
             </div>
           </section>
 
-          <section class="operator-lower-panel mixer-first" id="mixerLowerPanel">
+          <section class="operator-lower-panel mixer-first layout-section" id="mixerLowerPanel">
             <div id="mixerResizeHandle" class="mixer-resize-handle" role="separator" aria-orientation="horizontal" aria-label="Resize mixer"></div>
             <div class="operator-tabbar">
               <button class="operator-tab active" type="button" data-operator-panel="mixerPanel">Tracks</button>

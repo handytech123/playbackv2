@@ -69,6 +69,7 @@ let latestPlaybackMeters = {
 const meterStreamClients = new Set();
 let meterStreamTimer = null;
 let meterStreamInFlight = false;
+let runtimeShutdownRequested = false;
 const PANIC_TRACK_FADE_DOWN_MS = 1000;
 const PANIC_RECOVERY_FADE_MS = 4000;
 const PANIC_TRACK_TARGET_DB = -60;
@@ -82,6 +83,7 @@ const KEY_CHANGE_CACHE_VERSION = "rubberband-key-cache-v1";
 const KEY_OPTIONS = ["C", "Db", "D", "Eb", "E", "F", "Gb", "G", "Ab", "A", "Bb", "B"];
 const TRANSITION_MODES = new Set(["cue-next", "stay", "autolink", "crossfade", "overlap"]);
 const TRANSITION_PAD_BEHAVIORS = new Set(["off", "hold-current-key", "next-song-key", "crossfade-to-next-key"]);
+const DEFAULT_SETLIST_SLOT_COUNT = 6;
 
 const mimeTypes = {
   ".html": "text/html; charset=utf-8",
@@ -95,9 +97,32 @@ initializeRuntimeOnStartup().catch((error) => {
   console.error(`Startup runtime init failed: ${error.message}`);
 });
 
-createServer(async (req, res) => {
+const httpServer = createServer(async (req, res) => {
   try {
     const url = new URL(req.url, `http://${req.headers.host}`);
+
+    if (req.method === "POST" && url.pathname === "/api/runtime/shutdown") {
+      if (!runtimeShutdownRequested) {
+        runtimeShutdownRequested = true;
+        await stopNativePlayback();
+      }
+      json(res, { ok: true, juceStopped: !activePlaybackProcess });
+      setTimeout(() => {
+        if (meterStreamTimer) clearTimeout(meterStreamTimer);
+        meterStreamTimer = null;
+        for (const client of meterStreamClients) {
+          try {
+            client.end();
+          } catch {
+            // The process is shutting down.
+          }
+        }
+        meterStreamClients.clear();
+        httpServer.close(() => process.exit(0));
+        setTimeout(() => process.exit(0), 1000).unref();
+      }, 25);
+      return;
+    }
 
     if (req.method === "GET" && url.pathname === "/api/library") {
       return json(res, await loadLibrary());
@@ -297,7 +322,9 @@ createServer(async (req, res) => {
   } catch (error) {
     return json(res, { error: error.message }, 500);
   }
-}).listen(PORT, () => {
+});
+
+httpServer.listen(PORT, () => {
   console.log(`Playback App V2 running at http://localhost:${PORT}`);
   startLiveSupervisor();
 });
@@ -827,7 +854,11 @@ async function loadCurrentSetlist() {
   try {
     const raw = await readJsonFile(SETLIST_FILE, null);
     const normalized = normalizeSetlist(raw);
-    if (JSON.stringify(raw?.transitions || []) !== JSON.stringify(normalized.transitions || [])) {
+    if (
+      Number(raw?.slotCount || 0) !== normalized.slotCount
+      || (Array.isArray(raw?.slots) ? raw.slots.length : 0) !== normalized.slots.length
+      || JSON.stringify(raw?.transitions || []) !== JSON.stringify(normalized.transitions || [])
+    ) {
       await saveCurrentSetlist(normalized);
     }
     return normalized;
@@ -2863,6 +2894,7 @@ async function buildEngineManifest(confirmedSet) {
     const dynamicClickMixer = matchMixerStem({ id: "dynamic-click" }, slotMetadata.mixer);
     const dynamicCueMixer = matchMixerStem({ id: "dynamic-cue" }, slotMetadata.mixer);
     const dynamicPadMixer = matchMixerStem({ id: "dynamic-pad" }, slotMetadata.mixer);
+    const soloActive = mixerHasActiveSolo(slotMetadata.mixer, playbackStems);
     const dynamicClickRouting = routeForStem(canonicalBus(dynamicClickMixer?.routeBus || "click"), 0, routingPreset);
     const dynamicCueRouting = routeForStem(canonicalBus(dynamicCueMixer?.routeBus || "dynamicCue"), 0, routingPreset);
     const manifestTempoMap = arrangementCache
@@ -2879,7 +2911,8 @@ async function buildEngineManifest(confirmedSet) {
       songKey: slotMetadata.padKey || slotMetadata.tempoMap.key || slot.key,
       mixer: dynamicPadMixer,
       routingPreset,
-      settings: confirmedSet.settings.pads
+      settings: confirmedSet.settings.pads,
+      soloActive
     });
     songs.push({
       slot: slot.slot,
@@ -2917,13 +2950,15 @@ async function buildEngineManifest(confirmedSet) {
         clickEvents: Array.isArray(slotMetadata.dynamicClick?.clickEvents) ? slotMetadata.dynamicClick.clickEvents : [],
         confidence: positiveNumber(slotMetadata.dynamicClick?.confidence),
         tempoMap: manifestTempoMap,
-        volume: dynamicClickRouting.outputChannels.length ? clampNumber(dynamicClickMixer?.volume, 0, 100, 80) : 0,
+        volume: dynamicClickRouting.outputChannels.length ? mixerOutputVolume(dynamicClickMixer, 80, soloActive) : 0,
         solo: Boolean(dynamicClickMixer?.solo),
+        mute: Boolean(dynamicClickMixer?.mute),
         routing: dynamicClickRouting
       },
       dynamicCue: {
-        volume: dynamicCueRouting.outputChannels.length ? clampNumber(dynamicCueMixer?.volume, 0, 100, 80) : 0,
+        volume: dynamicCueRouting.outputChannels.length ? mixerOutputVolume(dynamicCueMixer, 80, soloActive) : 0,
         solo: Boolean(dynamicCueMixer?.solo),
+        mute: Boolean(dynamicCueMixer?.mute),
         routing: dynamicCueRouting
       },
       pad: dynamicPad.pad,
@@ -2931,7 +2966,7 @@ async function buildEngineManifest(confirmedSet) {
       stems: playbackStems
         .map((stem, index) => {
           const mixerStem = matchMixerStem(stem, slotMetadata.mixer);
-          return stemManifestEntry(stem, index, routingPreset, mixerStem);
+          return stemManifestEntry(stem, index, routingPreset, mixerStem, soloActive);
         })
         .filter((stem) => stem.role !== "click")
     });
@@ -3246,7 +3281,27 @@ function matchMixerStem(cachedStem, mixer) {
   }) || null;
 }
 
-function stemManifestEntry(stem, index, routingPreset, mixerStem = null) {
+function mixerHasActiveSolo(mixer, playbackStems = []) {
+  const dynamicIds = new Set(["dynamic-click", "dynamic-cue", "dynamic-pad"]);
+  const dynamicStems = (mixer?.stems || []).filter((stem) => dynamicIds.has(stem.id));
+  const regularStems = playbackStems
+    .map((stem) => ({ stem, mixerStem: matchMixerStem(stem, mixer || { stems: [] }) }))
+    .filter(({ stem, mixerStem }) => {
+      const role = canonicalBus(mixerStem?.routeBus || mixerStem?.role || stem.bus || stem.role || stem.playbackRole) || "tracks";
+      return role !== "click";
+    })
+    .map(({ mixerStem }) => mixerStem)
+    .filter(Boolean);
+  return [...regularStems, ...dynamicStems].some((stem) => Boolean(stem.solo));
+}
+
+function mixerOutputVolume(mixerStem, fallback = 80, soloActive = false) {
+  if (Boolean(mixerStem?.mute)) return 0;
+  if (soloActive && !Boolean(mixerStem?.solo)) return 0;
+  return clampNumber(mixerStem?.volume, 0, 100, fallback);
+}
+
+function stemManifestEntry(stem, index, routingPreset, mixerStem = null, soloActive = false) {
   const role = canonicalBus(mixerStem?.routeBus || mixerStem?.role || stem.bus || stem.role || stem.playbackRole) || "tracks";
   const iemSend = Boolean(mixerStem?.iemSend) && role === "tracks";
   const routing = routeForStem(role, index, routingPreset);
@@ -3263,8 +3318,9 @@ function stemManifestEntry(stem, index, routingPreset, mixerStem = null) {
     channels: positiveNumber(stem.channels),
     durationMs: positiveNumber(stem.durationMs),
     sha256: stem.sha256 || "",
-    volume: routing.outputChannels.length ? clampNumber(mixerStem?.volume, 0, 100, 80) : 0,
+    volume: routing.outputChannels.length ? mixerOutputVolume(mixerStem, 80, soloActive) : 0,
     solo: Boolean(mixerStem?.solo),
+    mute: Boolean(mixerStem?.mute),
     iemSend,
     sourceRelativePath: stem.relativePath,
     cacheRelativePath: stem.cacheRelativePath || stem.relativePath,
@@ -3323,11 +3379,13 @@ async function dynamicPadFilePath(folderPath, songKey) {
   return "";
 }
 
-async function dynamicPadManifestObject({ folderPath, songKey, mixer, routingPreset, settings = {} }) {
+async function dynamicPadManifestObject({ folderPath, songKey, mixer, routingPreset, settings = {}, soloActive = false }) {
   const sourcePath = await dynamicPadFilePath(folderPath, songKey);
   const cached = sourcePath ? await cacheDynamicPadFile(sourcePath, songKey) : { filePath: "", status: "missing", error: "No matching pad WAV." };
   const routing = routeForStem(canonicalBus(mixer?.routeBus || "pads"), 0, routingPreset);
-  const mixerVolume = routing.outputChannels.length ? clampNumber(mixer?.volume, 0, 100, Math.round((settings.defaultVolume ?? 0.65) * 100)) : 0;
+  const mixerVolume = routing.outputChannels.length
+    ? mixerOutputVolume(mixer, Math.round((settings.defaultVolume ?? 0.65) * 100), soloActive)
+    : 0;
   const pad = {
     enabled: settings.defaultEnabled !== false,
     padKey: stringValue(songKey),
@@ -3352,6 +3410,7 @@ async function dynamicPadManifestObject({ folderPath, songKey, mixer, routingPre
     active: false,
     volume: mixerVolume,
     solo: Boolean(mixer?.solo),
+    mute: Boolean(mixer?.mute),
     routing,
     pad
   };
@@ -4130,7 +4189,7 @@ async function applySetlistTransitionLocked(state, setlist, payload = {}) {
   }
   const currentSlot = (setlist.slots || []).find((slot) => slot.slot === transition.fromSlot && slot.songId);
   const nextSlot = (setlist.slots || []).find((slot) => slot.slot === transition.toSlot && slot.songId);
-  if (!currentSlot || !nextSlot) {
+  if (!currentSlot || (transition.toSlot && !nextSlot)) {
     const blocked = normalizePlaybackState({
       ...state,
       transport: "stopped",
@@ -5083,10 +5142,11 @@ async function applyLiveMixerUpdate(slotNumber, value) {
   const routingPreset = (settings.routing.presets || [])
     .find((preset) => preset.id === settings.routing.activePresetId)
     || { id: settings.routing.activePresetId, routes: {} };
+  const soloActive = mixerHasActiveSolo(mixer, slot.cachedStems || []);
   const stems = (slot.cachedStems || [])
-    .map((stem, index) => stemManifestEntry(stem, index, routingPreset, matchMixerStem(stem, mixer)))
+    .map((stem, index) => stemManifestEntry(stem, index, routingPreset, matchMixerStem(stem, mixer), soloActive))
     .filter((stem) => stem.role !== "click");
-  const dynamic = await liveDynamicMixerObjects(slot, mixer, routingPreset, settings);
+  const dynamic = await liveDynamicMixerObjects(slot, mixer, routingPreset, settings, soloActive);
   await sendNativePlaybackCommand("updateMixer", { stems });
   await sendNativePlaybackCommand("updateDynamicMixer", {
     dynamicClick: dynamic.dynamicClick,
@@ -5096,7 +5156,7 @@ async function applyLiveMixerUpdate(slotNumber, value) {
   return { ok: true, active: true, slot: slotNumber };
 }
 
-async function liveDynamicMixerObjects(slot, mixer, routingPreset, settings) {
+async function liveDynamicMixerObjects(slot, mixer, routingPreset, settings, soloActive = false) {
   const base = await activeManifestSong(slot.slot) || {};
   const dynamicClickMixer = matchMixerStem({ id: "dynamic-click" }, mixer);
   const dynamicCueMixer = matchMixerStem({ id: "dynamic-cue" }, mixer);
@@ -5109,19 +5169,22 @@ async function liveDynamicMixerObjects(slot, mixer, routingPreset, settings) {
     songKey: slot.padKey || slot.key,
     mixer: dynamicPadMixer,
     routingPreset,
-    settings: settings.pads
+    settings: settings.pads,
+    soloActive
   });
   return {
     dynamicClick: {
       ...(base.dynamicClick || songMetadata?.dynamicClick || {}),
-      volume: dynamicClickRouting.outputChannels.length ? clampNumber(dynamicClickMixer?.volume, 0, 100, 80) : 0,
+      volume: dynamicClickRouting.outputChannels.length ? mixerOutputVolume(dynamicClickMixer, 80, soloActive) : 0,
       solo: Boolean(dynamicClickMixer?.solo),
+      mute: Boolean(dynamicClickMixer?.mute),
       routing: dynamicClickRouting
     },
     dynamicCue: {
       ...(base.dynamicCue || {}),
-      volume: dynamicCueRouting.outputChannels.length ? clampNumber(dynamicCueMixer?.volume, 0, 100, 80) : 0,
+      volume: dynamicCueRouting.outputChannels.length ? mixerOutputVolume(dynamicCueMixer, 80, soloActive) : 0,
       solo: Boolean(dynamicCueMixer?.solo),
+      mute: Boolean(dynamicCueMixer?.mute),
       routing: dynamicCueRouting
     },
     dynamicPad: {
@@ -5683,12 +5746,13 @@ function normalizeMixer(value = {}, slot = {}) {
     role: canonicalBus(stem.role || classifyStem(stem)),
     volume: clampNumber(stem.volume, 0, 100, 80),
     solo: Boolean(stem.solo),
+    mute: Boolean(stem.mute),
     iemSend: Boolean(stem.iemSend) && canonicalBus(stem.routeBus || stem.role || classifyStem(stem)) === "tracks",
     routeBus: canonicalBus(stem.routeBus || classifyStem(stem))
   }));
   ensureDynamicMixerStems(normalizedStems);
   return {
-    controls: ["volume", "solo"],
+    controls: ["volume", "solo", "mute"],
     pan: false,
     songId: stringValue(slot.songId),
     stems: normalizedStems
@@ -5717,6 +5781,7 @@ function ensureDynamicMixerStems(stems) {
       relativePath: "",
       volume: 80,
       solo: false,
+      mute: false,
       iemSend: false
     });
   }
@@ -6801,7 +6866,10 @@ function setFingerprint(setlist) {
 function normalizeSetlist(value = {}) {
   value = value && typeof value === "object" ? value : {};
   const slots = Array.isArray(value.slots) ? value.slots : [];
-  const slotCount = Math.max(10, slots.length);
+  const highestFilledSlot = slots.reduce((highest, slot, index) => (
+    slot?.songId ? Math.max(highest, positiveNumber(slot.slot) || index + 1) : highest
+  ), 0);
+  const slotCount = Math.max(DEFAULT_SETLIST_SLOT_COUNT, highestFilledSlot);
   const normalizedSlots = Array.from({ length: slotCount }, (_, index) => normalizeSetlistSlot(slots[index], index));
   return {
     id: "current",
@@ -6819,34 +6887,40 @@ function normalizeSetlistTransitions(value, slots = []) {
     .map((slot) => Number(slot.slot))
     .filter(Boolean)
     .sort((a, b) => a - b);
-  const adjacentPairs = [];
-  for (let index = 0; index < filled.length - 1; index += 1) {
-    adjacentPairs.push({ fromSlot: filled[index], toSlot: filled[index + 1] });
-  }
+  const transitionActions = filled.map((fromSlot, index) => ({
+    fromSlot,
+    toSlot: filled[index + 1] || null
+  }));
   const existingByPair = new Map((Array.isArray(value) ? value : [])
     .map((transition) => normalizeSetlistTransition(transition))
     .filter(Boolean)
-    .map((transition) => [`${transition.fromSlot}:${transition.toSlot}`, transition]));
-  return adjacentPairs.map((pair) => normalizeSetlistTransition({
-    ...existingByPair.get(`${pair.fromSlot}:${pair.toSlot}`),
-    fromSlot: pair.fromSlot,
-    toSlot: pair.toSlot
+    .map((transition) => [`${transition.fromSlot}:${transition.toSlot || 0}`, transition]));
+  return transitionActions.map((action) => normalizeSetlistTransition({
+    ...existingByPair.get(`${action.fromSlot}:${action.toSlot || 0}`),
+    fromSlot: action.fromSlot,
+    toSlot: action.toSlot,
+    ...(action.toSlot ? {} : {
+      mode: "stay",
+      padBehavior: "off",
+      continuePad: false
+    })
   }));
 }
 
 function normalizeSetlistTransition(value = {}) {
   const fromSlot = positiveNumber(value.fromSlot);
-  const toSlot = positiveNumber(value.toSlot);
-  if (!fromSlot || !toSlot || fromSlot === toSlot) return null;
-  const mode = TRANSITION_MODES.has(value.mode) ? value.mode : "cue-next";
-  const padBehavior = TRANSITION_PAD_BEHAVIORS.has(value.padBehavior) ? value.padBehavior : "next-song-key";
+  const toSlot = positiveNumber(value.toSlot) || null;
+  if (!fromSlot || fromSlot === toSlot) return null;
+  const terminal = !toSlot;
+  const mode = terminal ? "stay" : (TRANSITION_MODES.has(value.mode) ? value.mode : "cue-next");
+  const padBehavior = terminal ? "off" : (TRANSITION_PAD_BEHAVIORS.has(value.padBehavior) ? value.padBehavior : "next-song-key");
   return {
     fromSlot,
     toSlot,
     mode,
     padBehavior,
     durationSeconds: positiveNumber(value.durationSeconds) || 5,
-    continuePad: value.continuePad !== false
+    continuePad: terminal ? false : value.continuePad !== false
   };
 }
 

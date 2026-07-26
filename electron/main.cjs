@@ -7,6 +7,7 @@ const path = require("node:path");
 
 let mainWindow;
 let serverProcess;
+let serverPort;
 let logFile;
 
 app.commandLine.appendSwitch("high-dpi-support", "1");
@@ -29,6 +30,7 @@ app.setPath("userData", localUserDataDir);
 
 async function createWindow() {
   const port = await findOpenPort(Number(process.env.PORT || 5312));
+  serverPort = port;
   const appUrl = `http://127.0.0.1:${port}`;
 
   log(`Starting Playback App V2 at ${appUrl}`);
@@ -161,11 +163,45 @@ function waitForServer(url) {
   });
 }
 
-function stopServer() {
-  if (serverProcess && !serverProcess.killed) {
-    serverProcess.kill();
+async function stopServer() {
+  const child = serverProcess;
+  if (!child || child.exitCode !== null) {
+    serverProcess = null;
+    return;
   }
+
+  await requestServerShutdown().catch((error) => {
+    log(`Graceful playback shutdown failed: ${error.message}`);
+  });
+
+  if (child.exitCode === null) {
+    await Promise.race([
+      new Promise((resolve) => child.once("exit", resolve)),
+      new Promise((resolve) => setTimeout(resolve, 1500))
+    ]);
+  }
+  if (child.exitCode === null && !child.killed) child.kill();
   serverProcess = null;
+}
+
+function requestServerShutdown() {
+  if (!serverPort) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    const request = http.request({
+      hostname: "127.0.0.1",
+      port: serverPort,
+      path: "/api/runtime/shutdown",
+      method: "POST"
+    }, (response) => {
+      response.resume();
+      response.once("end", resolve);
+    });
+    request.setTimeout(3000, () => {
+      request.destroy(new Error("Playback shutdown timed out."));
+    });
+    request.once("error", reject);
+    request.end();
+  });
 }
 
 function log(message) {
@@ -216,9 +252,11 @@ app.whenReady()
     app.quit();
   });
 
-app.on("before-quit", () => {
+app.on("before-quit", (event) => {
+  if (app.isQuiting) return;
+  event.preventDefault();
   app.isQuiting = true;
-  stopServer();
+  stopServer().finally(() => app.quit());
 });
 
 app.on("window-all-closed", () => {

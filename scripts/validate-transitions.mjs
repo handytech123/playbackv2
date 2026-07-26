@@ -10,6 +10,7 @@ const files = {
 
 assert(files.server.includes("function normalizeSetlistTransitions"), "server normalizes setlist transitions");
 assert(files.server.includes("transitions: normalizeSetlistTransitions"), "setlist includes transitions array");
+assert(files.server.includes("const DEFAULT_SETLIST_SLOT_COUNT = 6"), "server defaults setlists to six slots");
 assert(files.server.includes("function applySetlistTransitionLocked"), "server applies transition runtime");
 assert(files.server.includes('"songTransition"'), "playback command includes songTransition");
 assert(files.server.includes("transition: normalizeTransitionRuntime"), "playback state exposes transition runtime");
@@ -22,6 +23,8 @@ assert(!files.server.includes("song-metadata.json") || !files.server.match(/tran
 assert(files.app.includes("setlistTransitions"), "host keeps transition state");
 assert(files.app.includes("transition-tile"), "host renders transition tiles");
 assert(files.app.includes("updateTransition"), "host edits transition tiles");
+assert(files.app.includes("setlist: Array(6).fill(null)"), "host defaults setlists to six slots");
+assert(files.app.includes("normalizeClientTransitions(state.setlistTransitions, state.setlist)"), "host fills missing adjacent transitions before rendering");
 assert(files.server.includes("serviceSongEndBackend"), "backend services transition near song end");
 assert(files.app.includes("body: JSON.stringify({ slots, transitions: state.setlistTransitions })"), "host saves transitions with current setlist");
 
@@ -31,12 +34,15 @@ assert(files.remote.includes("renderTransitionReadout"), "remote renders transit
 const apiSetlist = await readApiSetlist();
 if (apiSetlist) {
   const filled = (apiSetlist.slots || []).filter((slot) => slot.songId);
-  const expected = Math.max(0, filled.length - 1);
+  const expected = filled.length;
   assert(Array.isArray(apiSetlist.transitions), "API setlist returns transitions array");
   assert(apiSetlist.transitions.length === expected, `API has ${expected} adjacent transitions`);
   for (const transition of apiSetlist.transitions) {
     assert(filled.some((slot) => Number(slot.slot) === Number(transition.fromSlot)), "transition fromSlot is filled");
-    assert(filled.some((slot) => Number(slot.slot) === Number(transition.toSlot)), "transition toSlot is filled");
+    assert(
+      transition.toSlot === null || filled.some((slot) => Number(slot.slot) === Number(transition.toSlot)),
+      "transition toSlot is filled or marks the end of the set"
+    );
   }
 }
 

@@ -283,7 +283,7 @@ function renderTransitionReadout() {
   const current = currentSetlistSong();
   const transition = transitionAfterSlot(current?.slot);
   const next = transition ? (remote.setlist?.slots || []).find((slot) => Number(slot.slot) === Number(transition.toSlot)) : null;
-  if (els.transitionNext) els.transitionNext.textContent = `Next: ${next?.title || "--"}`;
+  if (els.transitionNext) els.transitionNext.textContent = `Next: ${next?.title || (transition && !transition.toSlot ? "End of set" : "--")}`;
   if (els.transitionMode) {
     const duration = ["crossfade", "overlap"].includes(transition?.mode) ? ` / ${Number(transition.durationSeconds || 5)}s` : "";
     els.transitionMode.textContent = `Transition: ${transitionModeLabel(transition?.mode)}${duration}`;

@@ -3,7 +3,7 @@
   activeVendor: "All",
   search: "",
   loadedSong: null,
-  setlist: Array(10).fill(null),
+  setlist: Array(6).fill(null),
   setlistTransitions: [],
   setlistFingerprint: "",
   playbackSetFingerprint: "",
@@ -15,6 +15,7 @@
   metadataSaveTimer: null,
   mixerSaveTimer: null,
   timelineZoom: 1,
+  timelineZoomSlot: null,
   timelineSnap: "measure",
   selectedRegionIndex: null,
   selectedArrangedRegionRange: null,
@@ -295,6 +296,7 @@ async function reconcileSetlistForPlayback(playback) {
   const fingerprint = playback?.currentFingerprint || "";
   const slotNumber = Number(playback?.currentSlot || 0);
   const missingCurrentSong = slotNumber > 0 && !state.setlist[slotNumber - 1];
+  if (state.saveTimer || state.setlistSaveInFlight || state.setlistSavePending) return;
   if (!fingerprint || (fingerprint === state.playbackSetFingerprint && !missingCurrentSong)) return;
   await loadCurrentSetlist({ render: false });
   await loadSetMetadata();
@@ -1328,7 +1330,8 @@ function renderPlaybackState() {
   }
   els.appModeStatus.textContent = isPerformance ? "Performance mode" : "Edit mode";
   els.playbackModeTitle.textContent = isPerformance ? "Performance Mode" : "Edit Mode";
-  els.playbackStatus.textContent = playback.lastMessage || readiness.performanceBlockers?.join(" ") || (playback.confirmed ? "Set confirmed." : "Confirm the set before Performance.");
+  const playbackStatusMessage = playback.lastMessage || readiness.performanceBlockers?.join(" ") || (playback.confirmed ? "Set confirmed." : "Confirm the set before Performance.");
+  els.playbackStatus.textContent = /^Selected\s/i.test(playbackStatusMessage) ? "" : playbackStatusMessage;
   els.engineStatus.textContent = engineStatusLabel(displayEngineState);
   els.engineStatus.className = `engine-status ${displayEngineState}`;
   if (els.audioReadiness) els.audioReadiness.textContent = readiness.audioDevice?.state === "missing"
@@ -1373,9 +1376,9 @@ function playbackVisualSlot(playback = state.playbackState || {}) {
   if (!slot || !state.setlist[slot - 1]) return 0;
   if (playback.mode === "performance") return slot;
   if (["playing", "paused", "panic"].includes(playback.transport)) return slot;
+  if (state.selectedSetlistIndex !== null && state.selectedSetlistIndex !== undefined) return 0;
   if (playback.pad?.active || playback.transition?.active || playback.transition?.pending) return slot;
-  if (state.selectedSetlistIndex === null || state.selectedSetlistIndex === undefined) return slot;
-  return 0;
+  return slot;
 }
 
 function renderCommandButtons(transport) {
@@ -1642,6 +1645,11 @@ function renderSelectedMetadata() {
   const selected = selectedMetadata();
   const locked = state.playbackState?.mode === "performance";
   if (selected) {
+    if (Number(state.timelineZoomSlot) !== Number(selected.slot)) {
+      state.timelineZoom = 1;
+      state.timelineZoomSlot = selected.slot;
+      if (els.timelineSurface) els.timelineSurface.scrollLeft = 0;
+    }
     state.selectedMetadataSlot = selected.slot;
     els.metadataSlot.value = String(selected.slot);
   }
@@ -1698,7 +1706,7 @@ function renderSelectedMetadata() {
   els.timelinePanel.classList.remove("hidden");
   els.editorPanel.classList.toggle("hidden", locked);
   const tempo = selected.tempoMap || {};
-  els.timelineStatus.textContent = selected.title;
+  els.timelineStatus.textContent = "Timeline ready";
   renderTransportReadout(selected);
   els.playbackKey.textContent = tempo.key || "--";
   els.playbackTempo.textContent = tempo.bpm || "--";
@@ -1772,6 +1780,8 @@ function renderTimeline(slot) {
   const performanceControlRegion = locked ? performanceActionRegion(slot, liveRegion) : null;
   const liveRepeat = state.playbackState?.liveRepeat || {};
   els.timelinePanel.style.setProperty("--timeline-zoom", state.timelineZoom);
+  els.timelineSurface.classList.toggle("timeline-zoomed", state.timelineZoom > 1);
+  if (state.timelineZoom <= 1) els.timelineSurface.scrollLeft = 0;
   els.zoomReadout.textContent = `${Math.round(state.timelineZoom * 100)}%`;
   renderTimelineRuler(beatGrid, duration);
   renderTimelineGrid(beatGrid, duration);
@@ -1816,7 +1826,7 @@ function renderTimeline(slot) {
     const left = percentForTime(startTime, duration);
     const right = percentForTime(Math.max(startTime + 0.1, endTime), duration);
     item.style.left = `${left}%`;
-    item.style.width = `${Math.max(1, right - left)}%`;
+    item.style.width = `${Math.max(0, Math.min(100 - left, Math.max(1, right - left)))}%`;
     item.innerHTML = `
       ${locked ? "" : "<span class=\"region-resize region-resize-left\" data-resize=\"start\"></span>"}
       <strong>${escapeHtml(region.name)}</strong>
@@ -2479,8 +2489,10 @@ function renderSectionLane(slot, duration, cueMarkers = null) {
     const endTime = next ? timeForBarBeat(slot, Number(next.bar || start + 1), Number(next.beat || 1)) : duration;
     const item = document.createElement("div");
     item.className = "timeline-section-block";
-    item.style.left = `${percentForTime(startTime, duration)}%`;
-    item.style.width = `${Math.max(3, percentForTime(Math.max(startTime + 0.25, endTime), duration) - percentForTime(startTime, duration))}%`;
+    const left = percentForTime(startTime, duration);
+    const right = percentForTime(Math.max(startTime + 0.25, endTime), duration);
+    item.style.left = `${left}%`;
+    item.style.width = `${Math.max(0, Math.min(100 - left, Math.max(3, right - left)))}%`;
     item.title = `${cue.name || `Cue ${index + 1}`} ${start}.${cue.beat || 1}`;
     els.sectionLane.append(item);
   });
@@ -2496,7 +2508,7 @@ function updateWaveformReadout(slot = null) {
   els.waveformSelectedSection.textContent = slot?.title || "--";
   els.waveformNextSection.textContent = nextCue?.name || "--";
   if (slot && scrub) {
-    els.timelineStatus.textContent = `${slot.title} | ${formatSeconds(scrub.timeSeconds)} | ${scrub.measure}.${scrub.beat}`;
+    els.timelineStatus.textContent = `${formatSeconds(scrub.timeSeconds)} | ${scrub.measure}.${scrub.beat}`;
   }
 }
 
@@ -2556,7 +2568,7 @@ function beginRulerGesture(event) {
     els.createRegionFromSelection.disabled = false;
     const range = normalizedRegionSketchRange(state.regionSketch);
     const measureCount = selectedMeasureCount(range);
-    els.timelineStatus.textContent = `${selected.title} | ${measureCount}m selected`;
+    els.timelineStatus.textContent = `${measureCount} measures selected`;
   };
 
   const up = (upEvent) => {
@@ -2599,7 +2611,7 @@ function beginRegionSketch(event) {
     els.createRegionFromSelection.disabled = false;
     const range = normalizedRegionSketchRange(state.regionSketch);
     const measureCount = selectedMeasureCount(range);
-    els.timelineStatus.textContent = `${selected.title} | ${measureCount}m selected`;
+    els.timelineStatus.textContent = `${measureCount} measures selected`;
   };
 
   const up = () => {
@@ -2639,8 +2651,9 @@ function renderRegionSketchSelection(slot) {
   const endTime = timeForBarBeat(slot, range.endBar, 1);
   const left = percentForTime(startTime, duration);
   const right = percentForTime(Math.max(startTime + 0.1, endTime), duration);
+  const width = Math.max(0, Math.min(100 - left, Math.max(1, right - left)));
   els.regionSketchSelection.style.left = `calc(100% * var(--timeline-zoom, 1) * ${left / 100})`;
-  els.regionSketchSelection.style.width = `calc(100% * var(--timeline-zoom, 1) * ${Math.max(1, right - left) / 100})`;
+  els.regionSketchSelection.style.width = `calc(100% * var(--timeline-zoom, 1) * ${width / 100})`;
   els.regionSketchSelection.querySelector("span")?.remove();
   const label = document.createElement("span");
   const measureCount = selectedMeasureCount(range);
@@ -4941,6 +4954,7 @@ function renderSongs() {
 }
 
 function renderSetlist() {
+  state.setlistTransitions = normalizeClientTransitions(state.setlistTransitions, state.setlist);
   els.setlistSlots.replaceChildren();
   const songCount = state.setlist.filter(Boolean).length;
   els.setlistCount.textContent = `${songCount}/${state.setlist.length} songs`;
@@ -5197,15 +5211,31 @@ function transitionDurationRelevant(mode) {
   return ["crossfade", "overlap"].includes(mode);
 }
 
-function normalizeClientTransitions(transitions) {
-  return (Array.isArray(transitions) ? transitions : []).map((transition) => ({
+function normalizeClientTransitions(transitions, slots = state.setlist) {
+  const existingByPair = new Map((Array.isArray(transitions) ? transitions : []).map((transition) => ({
     fromSlot: Number(transition.fromSlot || 0),
-    toSlot: Number(transition.toSlot || 0),
-    mode: ["cue-next", "stay", "autolink", "crossfade", "overlap"].includes(transition.mode) ? transition.mode : "cue-next",
-    padBehavior: ["off", "hold-current-key", "next-song-key", "crossfade-to-next-key"].includes(transition.padBehavior) ? transition.padBehavior : "next-song-key",
+    toSlot: Number(transition.toSlot || 0) || null,
+    mode: transition.toSlot && ["cue-next", "stay", "autolink", "crossfade", "overlap"].includes(transition.mode) ? transition.mode : "stay",
+    padBehavior: transition.toSlot && ["off", "hold-current-key", "next-song-key", "crossfade-to-next-key"].includes(transition.padBehavior) ? transition.padBehavior : "off",
     durationSeconds: Number(transition.durationSeconds || 5),
-    continuePad: transition.continuePad !== false
-  })).filter((transition) => transition.fromSlot && transition.toSlot);
+    continuePad: transition.toSlot ? transition.continuePad !== false : false
+  })).filter((transition) => transition.fromSlot)
+    .map((transition) => [`${transition.fromSlot}:${transition.toSlot || 0}`, transition]));
+  const filled = (Array.isArray(slots) ? slots : [])
+    .map((slot, index) => slot && (slot.songId || slot.id) ? Number(slot.slot || index + 1) : 0)
+    .filter(Boolean)
+    .sort((a, b) => a - b);
+  return filled.map((fromSlot, index) => {
+    const toSlot = filled[index + 1] || null;
+    return existingByPair.get(`${fromSlot}:${toSlot || 0}`) || {
+      fromSlot,
+      toSlot,
+      mode: toSlot ? "cue-next" : "stay",
+      padBehavior: toSlot ? "next-song-key" : "off",
+      durationSeconds: 5,
+      continuePad: Boolean(toSlot)
+    };
+  });
 }
 
 function setFingerprintClient(setlist) {
@@ -5216,7 +5246,7 @@ function setFingerprintClient(setlist) {
     bpm: slot.bpm || "",
     timeSignature: slot.timeSignature || ""
   }));
-  const transitions = normalizeClientTransitions(setlist?.transitions || []).map((transition) => ({
+  const transitions = normalizeClientTransitions(setlist?.transitions || [], setlist?.slots || []).map((transition) => ({
     fromSlot: transition.fromSlot,
     toSlot: transition.toSlot,
     mode: transition.mode,
@@ -5385,15 +5415,27 @@ async function handleSlotDrop(event) {
   }
 }
 
-function clearSetlist() {
+async function clearSetlist() {
   if (state.playbackState?.mode === "performance") return;
   if (!window.confirm("Clear the current setlist?")) return;
-  state.setlist = Array(10).fill(null);
+  clearTimeout(state.saveTimer);
+  state.saveTimer = null;
+  state.setlist = Array(6).fill(null);
+  state.setlistTransitions = [];
   state.selectedSetlistIndex = null;
+  state.selectedMetadataSlot = null;
+  state.setMetadata = { slots: [] };
   state.loadedSong = null;
+  state.timelineZoom = 1;
+  state.timelineZoomSlot = null;
   renderLoadedSong();
   renderSetlist();
-  scheduleSetlistSave();
+  renderSelectedMetadata();
+  try {
+    await saveCurrentSetlist();
+  } catch (error) {
+    setAlert(`Clear setlist failed: ${error.message}`);
+  }
 }
 
 function setlistSongFromLoadedSong(song) {
@@ -5576,6 +5618,7 @@ function renderMixerStrip(selected) {
     const name = stem.name || stem.fileName || "Stem";
     const route = canonicalRoute(stem.routeBus || classifyClientStem(name));
     const volume = clamp(Number(stem.volume ?? 80), 0, 100);
+    const faderPosition = mixerFaderPositionFromVolume(volume);
     const canSendToIem = route === "tracks";
     const meterLevel = meterPercentForStem(stem);
     const channel = document.createElement("div");
@@ -5583,14 +5626,14 @@ function renderMixerStrip(selected) {
     channel.innerHTML = `
       <div class="mixer-peak-label">-inf</div>
       <div class="channel-topline">
-        <button type="button" class="mute-button" disabled aria-label="Mute ${escapeAttr(name)}">M</button>
-        <button type="button" class="solo-button ${stem.solo ? "active" : ""}" data-mixer-index="${index}" ${locked ? "disabled" : ""} aria-label="Solo ${escapeAttr(name)}">S</button>
+        <button type="button" class="mute-button ${stem.mute ? "active" : ""}" data-mixer-index="${index}" ${locked ? "disabled" : ""} aria-pressed="${stem.mute ? "true" : "false"}" aria-label="Mute ${escapeAttr(name)} and its IEM send">M</button>
+        <button type="button" class="solo-button ${stem.solo ? "active" : ""}" data-mixer-index="${index}" ${locked ? "disabled" : ""} aria-pressed="${stem.solo ? "true" : "false"}" aria-label="Solo ${escapeAttr(name)} and its IEM send">S</button>
         <button type="button" class="iem-button ${stem.iemSend && canSendToIem ? "active" : ""}" data-mixer-index="${index}" ${locked || !canSendToIem ? "disabled" : ""} aria-label="Send ${escapeAttr(name)} to IEM" title="${canSendToIem ? "Send instrument to IEM" : "IEM is instruments only"}">IEM</button>
         <button type="button" class="fx-button" disabled aria-label="FX ${escapeAttr(name)}">FX</button>
       </div>
       <div class="mixer-fader-area">
         <div class="meter-track" aria-hidden="true"><div class="meter-fill" data-meter-stem-id="${escapeAttr(stem.id)}" style="height: ${meterLevel}%"></div></div>
-        <input type="range" min="0" max="100" value="${escapeAttr(volume)}" orient="vertical" data-mixer-index="${index}" ${locked ? "disabled" : ""} aria-label="${escapeAttr(name)} volume">
+        <input type="range" min="0" max="100" value="${escapeAttr(faderPosition)}" orient="vertical" data-mixer-index="${index}" ${locked ? "disabled" : ""} aria-label="${escapeAttr(name)} volume" title="Double-click for 75% output at midpoint">
         <span class="volume-readout" data-volume-readout="${index}">${volume}</span>
       </div>
       <select class="stem-route-select" data-mixer-index="${index}" ${locked ? "disabled" : ""} aria-label="${escapeAttr(name)} bus">
@@ -5599,9 +5642,11 @@ function renderMixerStrip(selected) {
       <strong title="${escapeAttr(name)}">${escapeHtml(cleanStemLabel(name))}</strong>
       <div class="channel-number">${index + 1}</div>
     `;
+    channel.querySelector(".mute-button")?.addEventListener("click", toggleStemMute);
     channel.querySelector(".solo-button")?.addEventListener("click", toggleStemSolo);
     channel.querySelector(".iem-button")?.addEventListener("click", toggleStemIemSend);
     channel.querySelector("input")?.addEventListener("input", updateStemVolume);
+    channel.querySelector("input")?.addEventListener("dblclick", resetStemFaderToReference);
     channel.querySelector("select")?.addEventListener("change", updateStemRoute);
     els.mixerStrip.append(channel);
   }
@@ -5673,9 +5718,49 @@ function updateStemVolume(event) {
   const selected = selectedMetadata();
   const stem = selected?.mixer?.stems?.[Number(event.target.dataset.mixerIndex)];
   if (!stem) return;
-  stem.volume = Number(event.target.value);
+  stem.volume = mixerVolumeFromFaderPosition(event.target.value);
   const readout = event.target.closest(".mixer-channel")?.querySelector(".volume-readout");
   if (readout) readout.textContent = String(stem.volume);
+  sendLiveMixerUpdate(selected);
+  scheduleMixerAutosave();
+}
+
+function resetStemFaderToReference(event) {
+  event.preventDefault();
+  const selected = selectedMetadata();
+  const stem = selected?.mixer?.stems?.[Number(event.currentTarget.dataset.mixerIndex)];
+  if (!stem) return;
+  event.currentTarget.value = "50";
+  stem.volume = 75;
+  const readout = event.currentTarget.closest(".mixer-channel")?.querySelector(".volume-readout");
+  if (readout) readout.textContent = "75";
+  sendLiveMixerUpdate(selected);
+  scheduleMixerAutosave();
+}
+
+function mixerVolumeFromFaderPosition(value) {
+  const position = clamp(Number(value), 0, 100);
+  const volume = position <= 50
+    ? position * 1.5
+    : 75 + ((position - 50) * 0.5);
+  return Math.round(clamp(volume, 0, 100));
+}
+
+function mixerFaderPositionFromVolume(value) {
+  const volume = clamp(Number(value), 0, 100);
+  const position = volume <= 75
+    ? volume / 1.5
+    : 50 + ((volume - 75) * 2);
+  return Math.round(clamp(position, 0, 100));
+}
+
+function toggleStemMute(event) {
+  const selected = selectedMetadata();
+  const stem = selected?.mixer?.stems?.[Number(event.currentTarget.dataset.mixerIndex)];
+  if (!stem) return;
+  stem.mute = !stem.mute;
+  renderMixerStrip(selected);
+  renderBusLayer();
   sendLiveMixerUpdate(selected);
   scheduleMixerAutosave();
 }
@@ -5686,6 +5771,7 @@ function toggleStemSolo(event) {
   if (!stem) return;
   stem.solo = !stem.solo;
   renderMixerStrip(selected);
+  renderBusLayer();
   sendLiveMixerUpdate(selected);
   scheduleMixerAutosave();
 }
@@ -5950,13 +6036,17 @@ async function saveCurrentSetlist() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ slots, transitions: state.setlistTransitions })
     });
-    state.setlist = saved.slots.map((slot) => slot.songId ? setlistSongFromSlot(slot) : null);
-    state.setlistTransitions = normalizeClientTransitions(saved.transitions || []);
-    await loadPlaybackState();
-    await loadCacheReport();
-    await loadSetMetadata();
-    renderSetlist();
-    renderLoadedSong();
+    if (!state.setlistSavePending) {
+      state.setlist = saved.slots.map((slot) => slot.songId ? setlistSongFromSlot(slot) : null);
+      state.setlistTransitions = normalizeClientTransitions(saved.transitions || []);
+      state.setlistFingerprint = setFingerprintClient(saved);
+      await loadPlaybackState();
+      state.playbackSetFingerprint = state.playbackState?.currentFingerprint || "";
+      await loadCacheReport();
+      await loadSetMetadata();
+      renderSetlist();
+      renderLoadedSong();
+    }
   } finally {
     state.setlistSaveInFlight = false;
     if (state.setlistSavePending) {
