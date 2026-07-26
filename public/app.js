@@ -9,6 +9,7 @@
   playbackSetFingerprint: "",
   selectedSetlistIndex: null,
   addSongTargetIndex: null,
+  addSongInFlight: false,
   saveTimer: null,
   setlistSaveInFlight: false,
   setlistSavePending: false,
@@ -5360,12 +5361,16 @@ function closeAddSongModal() {
 
 async function addSelectedSongToSet() {
   if (state.playbackState?.mode === "performance") return;
+  if (state.addSongInFlight) return;
   const songId = els.select.value;
   if (!songId || state.addSongTargetIndex === null) return;
+  const targetIndex = state.addSongTargetIndex;
+  state.addSongInFlight = true;
+  els.addSelectedSong.disabled = true;
   try {
     const song = await api(`/api/songs/${encodeURIComponent(songId)}`);
-    insertSongAt(state.addSongTargetIndex, setlistSongFromLoadedSong(song));
-    state.selectedMetadataSlot = state.addSongTargetIndex + 1;
+    insertSongAt(targetIndex, setlistSongFromLoadedSong(song));
+    state.selectedMetadataSlot = targetIndex + 1;
     state.loadedSong = song;
     await saveCurrentSetlist();
     renderLoadedSong();
@@ -5373,6 +5378,9 @@ async function addSelectedSongToSet() {
     closeAddSongModal();
   } catch (error) {
     setAlert(`Could not add song: ${error.message}`);
+  } finally {
+    state.addSongInFlight = false;
+    els.addSelectedSong.disabled = false;
   }
 }
 
@@ -5485,10 +5493,10 @@ function moveSongTo(sourceIndex, targetIndex) {
 
 function trimTrailingEmptySlots(slots) {
   const next = slots.slice();
-  while (next.length > 10 && next[next.length - 1] === null) {
+  while (next.length > 6 && next[next.length - 1] === null) {
     next.pop();
   }
-  while (next.length < 10) next.push(null);
+  while (next.length < 6) next.push(null);
   return next;
 }
 

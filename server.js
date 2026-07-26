@@ -175,17 +175,9 @@ const httpServer = createServer(async (req, res) => {
 
     if (req.method === "PUT" && url.pathname === "/api/setlist/current") {
       const body = await readJsonBody(req);
-      const previousSetlist = await loadCurrentSetlist();
-      const previousFingerprint = setFingerprint(previousSetlist);
-      const setlist = await prepareSetlistCache(normalizeSetlist(body));
-      const nextFingerprint = setFingerprint(setlist);
-      await saveCurrentSetlist(setlist);
-      await ensureSetMetadata(setlist, { allowAnalysis: false });
-      await cleanupSetlistGeneratedArtifacts(setlist);
-      if (nextFingerprint !== previousFingerprint) {
-        await markSetUnconfirmed(setlist);
-      }
-      return json(res, setlist);
+      const update = playbackCommandQueue.then(() => updateCurrentSetlistTransaction(body));
+      playbackCommandQueue = update.catch(() => {});
+      return json(res, await update);
     }
 
     const slotKeyMatch = url.pathname.match(/^\/api\/setlist\/slot\/(\d+)\/key$/);
@@ -366,6 +358,20 @@ async function saveLibrary(library) {
   await writeFile(temporaryPath, `${JSON.stringify(library, null, 2)}\n`, "utf8");
   await rename(temporaryPath, LIBRARY_FILE);
   libraryMemoryCache = library;
+}
+
+async function updateCurrentSetlistTransaction(body) {
+  const previousSetlist = await loadCurrentSetlist();
+  const previousFingerprint = setFingerprint(previousSetlist);
+  const setlist = await prepareSetlistCache(normalizeSetlist(body));
+  const nextFingerprint = setFingerprint(setlist);
+  await saveCurrentSetlist(setlist);
+  await ensureSetMetadata(setlist, { allowAnalysis: false });
+  await cleanupSetlistGeneratedArtifacts(setlist);
+  if (nextFingerprint !== previousFingerprint) {
+    await markSetUnconfirmed(setlist);
+  }
+  return setlist;
 }
 
 function libraryForClient(library) {
@@ -3575,12 +3581,12 @@ async function cleanupSetlistGeneratedArtifacts(setlist) {
     if (slot.songId) {
       const manifest = await readJsonFile(arrangementCacheManifestPath(slotNumber), null);
       if (manifest?.songId && manifest.songId !== slot.songId) {
-        await removeGeneratedPath(arrangementCacheSlotDir(slotNumber));
+        await removeGeneratedPathBestEffort(arrangementCacheSlotDir(slotNumber));
       }
       continue;
     }
-    await removeGeneratedPath(join(SET_METADATA_DIR, `slot-${String(slotNumber).padStart(2, "0")}`));
-    await removeGeneratedPath(arrangementCacheSlotDir(slotNumber));
+    await removeGeneratedPathBestEffort(join(SET_METADATA_DIR, `slot-${String(slotNumber).padStart(2, "0")}`));
+    await removeGeneratedPathBestEffort(arrangementCacheSlotDir(slotNumber));
   }
 
   let metadataEntries = [];
@@ -3593,7 +3599,7 @@ async function cleanupSetlistGeneratedArtifacts(setlist) {
     if (!entry.isDirectory()) continue;
     const match = entry.name.match(/^slot-(\d+)$/);
     if (match && !filledBySlot.has(Number(match[1]))) {
-      await removeGeneratedPath(join(SET_METADATA_DIR, entry.name));
+      await removeGeneratedPathBestEffort(join(SET_METADATA_DIR, entry.name));
     }
   }
 
@@ -3609,7 +3615,7 @@ async function cleanupSetlistGeneratedArtifacts(setlist) {
     const match = entry.name.match(/^slot-(\d+)-(.+)$/);
     if (!match) continue;
     if (!allowedCacheFolderNames.has(entry.name)) {
-      await removeGeneratedPath(join(currentCacheRoot, entry.name));
+      await removeGeneratedPathBestEffort(join(currentCacheRoot, entry.name));
     }
   }
 
@@ -3623,7 +3629,7 @@ async function cleanupSetlistGeneratedArtifacts(setlist) {
     if (!entry.isDirectory()) continue;
     const match = entry.name.match(/^slot-(\d+)$/);
     if (match && !filledBySlot.has(Number(match[1]))) {
-      await removeGeneratedPath(join(ARRANGEMENT_CACHE_DIR, entry.name));
+      await removeGeneratedPathBestEffort(join(ARRANGEMENT_CACHE_DIR, entry.name));
     }
   }
 }
@@ -8517,6 +8523,14 @@ function assertInsideData(filePath) {
 async function removeGeneratedPath(filePath) {
   assertInsideData(filePath);
   await rm(filePath, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+}
+
+async function removeGeneratedPathBestEffort(filePath) {
+  try {
+    await removeGeneratedPath(filePath);
+  } catch (error) {
+    console.warn(`Deferred generated-file cleanup for ${filePath}: ${error.message}`);
+  }
 }
 
 function assertInsideArrangementCache(filePath) {
