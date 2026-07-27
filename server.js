@@ -604,7 +604,7 @@ function normalizeRoutingPresets(presets) {
   const defaults = [
     { id: "stereo", name: "Stereo", routes: { tracks: [1, 2], click: [1, 2], cues: [1, 2], pads: [1, 2], dynamicCue: [1, 2], iem: [1, 2] } },
     { id: "tracks-click-cue", name: "Tracks Click Cue", routes: { tracks: [1, 2], click: [3], cues: [4], pads: [1, 2], dynamicCue: [4], iem: [5, 6] } },
-    { id: "dante-32", name: "Dante 32ch", routes: { tracks: [1, 2], click: [3], cues: [4], pads: [5, 6], dynamicCue: [4], iem: [7, 8] } }
+    { id: "dante-32", name: "Dante 32ch", routes: { tracks: [4], click: [1], cues: [], pads: [5], dynamicCue: [2], iem: [3] } }
   ];
   if (!Array.isArray(presets) || presets.length === 0) return defaults;
   return presets.map((preset, index) => {
@@ -6598,6 +6598,8 @@ async function ensureMixerMetadata(filePath, slot, library) {
       role: canonicalBus(track.bus || classifyStem(track)),
       volume: 80,
       solo: false,
+      mute: false,
+      iemSend: canonicalBus(track.bus || classifyStem(track)) === "tracks",
       routeBus: canonicalBus(track.bus || classifyStem(track)),
       order: index + 1
     }))

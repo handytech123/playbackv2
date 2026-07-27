@@ -1466,9 +1466,6 @@ void sendPlaybackResult(PlaybackSession& session,
         if (stem == nullptr)
             continue;
 
-        if (anySolo && ! static_cast<bool>(stem->getProperty("solo")))
-            continue;
-
         const juce::File audioFile(stem->getProperty("cachePath").toString());
 
         if (! audioFile.existsAsFile())
@@ -1492,7 +1489,7 @@ void sendPlaybackResult(PlaybackSession& session,
         source->transport->setSource(source->readerSource.get(), 32768, &session.readAheadThread, sourceSampleRate);
         if (reuseRunningSession)
             source->transport->prepareToPlay(currentDevice->getCurrentBufferSizeSamples(), currentDevice->getCurrentSampleRate());
-        source->transport->setGain(source->baseGain);
+        source->transport->setGain(anySolo && ! source->solo ? 0.0f : source->baseGain);
         if (playbackStartSeconds > 0.0)
             source->transport->setPosition(playbackStartSeconds);
         source->transport->start();
