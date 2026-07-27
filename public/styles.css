@@ -1736,6 +1736,8 @@ body.mixer-collapsed .meter-track {
 }
 
 .channel-topline {
+  position: relative;
+  z-index: 3;
   display: grid;
   grid-template-columns: 22px;
   grid-auto-rows: 18px;
@@ -1825,6 +1827,7 @@ body.mixer-collapsed .meter-track {
 
 .mixer-fader-area {
   position: relative;
+  z-index: 1;
   display: grid;
   grid-template-columns: 24px 34px;
   grid-column: 1 / -1;
