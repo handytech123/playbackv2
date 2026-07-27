@@ -5637,7 +5637,6 @@ function renderMixerStrip(selected) {
         <button type="button" class="mute-button ${stem.mute ? "active" : ""}" data-mixer-index="${index}" ${locked ? "disabled" : ""} aria-pressed="${stem.mute ? "true" : "false"}" aria-label="Mute ${escapeAttr(name)} and its IEM send">M</button>
         <button type="button" class="solo-button ${stem.solo ? "active" : ""}" data-mixer-index="${index}" ${locked ? "disabled" : ""} aria-pressed="${stem.solo ? "true" : "false"}" aria-label="Solo ${escapeAttr(name)} and its IEM send">S</button>
         <button type="button" class="iem-button ${stem.iemSend && canSendToIem ? "active" : ""}" data-mixer-index="${index}" ${locked || !canSendToIem ? "disabled" : ""} aria-label="Send ${escapeAttr(name)} to IEM" title="${canSendToIem ? "Send instrument to IEM" : "IEM is instruments only"}">IEM</button>
-        <button type="button" class="fx-button" disabled aria-label="FX ${escapeAttr(name)}">FX</button>
       </div>
       <div class="mixer-fader-area">
         <div class="meter-track" aria-hidden="true"><div class="meter-fill" data-meter-stem-id="${escapeAttr(stem.id)}" style="height: ${meterLevel}%"></div></div>

@@ -1752,7 +1752,6 @@ body.mixer-collapsed .meter-track {
 
 .solo-button,
 .mute-button,
-.fx-button,
 .iem-button {
   width: 22px;
   min-height: 18px;
@@ -1775,7 +1774,6 @@ body.mixer-collapsed .meter-track {
   color: #fff0f0;
 }
 
-.fx-button,
 .mute-button:disabled {
   opacity: 0.9;
 }
