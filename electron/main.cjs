@@ -89,6 +89,46 @@ ipcMain.handle("dialog:select-folder", async () => {
   return result.canceled ? "" : result.filePaths[0];
 });
 
+ipcMain.handle("remote:configure-firewall", async () => {
+  const port = Number(serverPort || process.env.PORT || 5312);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    return { ok: false, error: "The remote server port is invalid." };
+  }
+  const command = [
+    `$rule = Start-Process -FilePath "$env:SystemRoot\\System32\\netsh.exe"`,
+    "-Verb RunAs",
+    "-ArgumentList @(",
+    "'advfirewall','firewall','add','rule',",
+    "'name=Playback-App-V2-Remote','dir=in','action=allow','protocol=TCP',",
+    `'localport=${port}','profile=private,public','remoteip=localsubnet'`,
+    ") -Wait -PassThru;",
+    "exit $rule.ExitCode"
+  ].join(" ");
+
+  return new Promise((resolveConfigure) => {
+    const child = spawn("powershell.exe", [
+      "-NoProfile",
+      "-ExecutionPolicy", "Bypass",
+      "-Command", command
+    ], {
+      windowsHide: true,
+      stdio: ["ignore", "pipe", "pipe"]
+    });
+    let errorText = "";
+    child.stderr.on("data", (chunk) => {
+      errorText += chunk.toString();
+    });
+    child.once("error", (error) => {
+      resolveConfigure({ ok: false, error: error.message });
+    });
+    child.once("exit", (code) => {
+      resolveConfigure(code === 0
+        ? { ok: true, port, ruleName: "Playback-App-V2-Remote" }
+        : { ok: false, error: errorText.trim() || "Administrator approval was canceled or Windows rejected the firewall rule." });
+    });
+  });
+});
+
 function startServer(port) {
   const serverPath = path.join(app.getAppPath(), "server.js");
   const dataDir = appDataDir();

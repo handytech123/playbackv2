@@ -318,7 +318,7 @@ const httpServer = createServer(async (req, res) => {
   }
 });
 
-httpServer.listen(PORT, () => {
+httpServer.listen(PORT, "0.0.0.0", () => {
   console.log(`Playback App V2 running at http://localhost:${PORT}`);
   startLiveSupervisor();
 });
@@ -641,6 +641,7 @@ function remoteAccessUrls() {
   for (const addresses of Object.values(networkInterfaces())) {
     for (const address of addresses || []) {
       if (address.family !== "IPv4" || address.internal) continue;
+      if (address.address.startsWith("169.254.")) continue;
       urls.push(`http://${address.address}:${PORT}/remote`);
     }
   }

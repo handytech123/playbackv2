@@ -201,6 +201,8 @@ const els = {
   remoteUrlList: document.querySelector("#remoteUrlList"),
   openRemote: document.querySelector("#openRemoteButton"),
   copyRemoteUrl: document.querySelector("#copyRemoteUrlButton"),
+  allowRemoteFirewall: document.querySelector("#allowRemoteFirewallButton"),
+  remoteFirewallStatus: document.querySelector("#remoteFirewallStatus"),
   cacheReport: document.querySelector("#cacheReport"),
   cueAnalyzerStatus: document.querySelector("#cueAnalyzerStatus"),
   cueRecognitionReport: document.querySelector("#cueRecognitionReport"),
@@ -312,6 +314,7 @@ function wireEvents() {
   els.reloadData.addEventListener("click", reloadAppData);
   els.openRemote?.addEventListener("click", openRemoteWindow);
   els.copyRemoteUrl?.addEventListener("click", copyRemoteUrl);
+  els.allowRemoteFirewall?.addEventListener("click", configureRemoteFirewall);
   els.clearSetlist.addEventListener("click", clearSetlist);
   els.confirmSet.addEventListener("click", confirmSet);
   els.quickConfirmSet?.addEventListener("click", confirmSet);
@@ -921,6 +924,28 @@ function openRemoteWindow() {
 async function copyRemoteUrl() {
   await navigator.clipboard?.writeText(primaryRemoteUrl());
   els.settingsStatus.textContent = "Remote URL copied.";
+}
+
+async function configureRemoteFirewall() {
+  if (!window.playbackShell?.configureRemoteAccess) {
+    if (els.remoteFirewallStatus) els.remoteFirewallStatus.textContent = "Firewall setup is available in the installed Electron app.";
+    return;
+  }
+  els.allowRemoteFirewall.disabled = true;
+  if (els.remoteFirewallStatus) els.remoteFirewallStatus.textContent = "Approve the Windows administrator prompt to allow phone and tablet access.";
+  try {
+    const result = await window.playbackShell.configureRemoteAccess();
+    if (!result?.ok) throw new Error(result?.error || "Windows did not add the remote-access rule.");
+    if (els.remoteFirewallStatus) {
+      els.remoteFirewallStatus.textContent = `Remote access allowed on local networks through TCP port ${result.port}.`;
+    }
+    els.settingsStatus.textContent = "Phone and tablet remote access enabled.";
+  } catch (error) {
+    if (els.remoteFirewallStatus) els.remoteFirewallStatus.textContent = error.message;
+    els.settingsStatus.textContent = "Remote firewall setup was not completed.";
+  } finally {
+    els.allowRemoteFirewall.disabled = false;
+  }
 }
 
 function renderAudioDevices() {
