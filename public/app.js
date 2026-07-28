@@ -72,10 +72,10 @@ window.playbackAppState = state;
 
 const DANTE_ROUTING_ROWS = [
   { key: "tracks", label: "Tracks", hint: "Music stems" },
-  { key: "click", label: "Dynamic Click", hint: "Generated click" },
+  { key: "click", label: "Click", hint: "App-owned dynamic click" },
   { key: "dynamicCue", label: "Dynamic Cue", hint: "Generated cue phrases" },
-  { key: "pads", label: "Dynamic Pad / Pads", hint: "Pad cover and pad stems" },
-  { key: "cues", label: "Guide Cue", hint: "Original guide/cue stems" },
+  { key: "pads", label: "Pads", hint: "Dynamic pad and routed pad stems" },
+  { key: "cues", label: "Guide Cue", hint: "Original guide/cue stems when enabled" },
   { key: "iem", label: "IEM", hint: "Instrument send only" }
 ];
 
@@ -84,6 +84,9 @@ const els = {
   navButtons: [...document.querySelectorAll(".nav-button[data-view]")],
   reloadData: document.querySelector("#reloadDataButton"),
   views: [...document.querySelectorAll(".view")],
+  helpBack: document.querySelector("#helpBackButton"),
+  helpSearch: document.querySelector("#helpSearchInput"),
+  helpTopics: document.querySelector("#helpTopics"),
   status: document.querySelector("#libraryStatus"),
   engineStatus: document.querySelector("#engineStatus"),
   refresh: document.querySelector("#refreshButton"),
@@ -201,6 +204,7 @@ const els = {
   refreshAudioDevices: document.querySelector("#refreshAudioDevicesButton"),
   audioDiagnostics: document.querySelector("#audioDiagnosticsButton"),
   audioDiagnosticsReport: document.querySelector("#audioDiagnosticsReport"),
+  testDynamicCueOutput: document.querySelector("#testDynamicCueOutputButton"),
   libraryRootPath: document.querySelector("#libraryRootPath"),
   libraryRootInput: document.querySelector("#libraryRootInput"),
   libraryVendorFolders: document.querySelector("#libraryVendorFolders"),
@@ -338,6 +342,8 @@ function wireEvents() {
   }
   els.refresh.addEventListener("click", refreshLibrary);
   els.reloadData.addEventListener("click", reloadAppData);
+  els.helpBack?.addEventListener("click", () => showView("setlistView"));
+  els.helpSearch?.addEventListener("input", filterHelpTopics);
   window.playbackShell?.onMenuCommand?.(handleShellMenuCommand);
   els.openRemote?.addEventListener("click", openRemoteWindow);
   els.copyRemoteUrl?.addEventListener("click", copyRemoteUrl);
@@ -364,6 +370,7 @@ function wireEvents() {
   });
   els.refreshAudioDevices.addEventListener("click", refreshAudioDevices);
   els.audioDiagnostics?.addEventListener("click", runAudioDiagnostics);
+  els.testDynamicCueOutput?.addEventListener("click", testDynamicCueOutput);
   els.refreshMidiDevices?.addEventListener("click", () => refreshMidiDevices({ silent: false }));
   els.testMidiSlide?.addEventListener("click", testProPresenterMidiSlide);
   els.routingPreset.addEventListener("change", () => {
@@ -531,6 +538,15 @@ function showView(viewId) {
   els.views.forEach((view) => view.classList.toggle("active", view.id === viewId));
 }
 
+function filterHelpTopics() {
+  const query = String(els.helpSearch?.value || "").trim().toLowerCase();
+  const topics = [...document.querySelectorAll(".help-topic")];
+  for (const topic of topics) {
+    const text = `${topic.textContent || ""} ${topic.dataset.helpText || ""}`.toLowerCase();
+    topic.classList.toggle("hidden", Boolean(query) && !text.includes(query));
+  }
+}
+
 async function selectWavPath(button) {
   const input = document.querySelector(`#${button.dataset.wavPicker}`);
   if (!input || !window.playbackShell?.selectWavFile) return;
@@ -695,6 +711,23 @@ async function runAudioDiagnostics() {
   }
 }
 
+async function testDynamicCueOutput() {
+  if (!els.testDynamicCueOutput) return;
+  els.testDynamicCueOutput.disabled = true;
+  els.testDynamicCueOutput.textContent = "Testing...";
+  els.settingsStatus.textContent = "Sending a dynamic cue test to the selected output route...";
+  try {
+    const result = await api("/api/playback/test-dynamic-cue", { method: "POST" });
+    if (!result.ok) throw new Error(result.error || "Dynamic cue output test failed.");
+    els.settingsStatus.textContent = `Dynamic cue test sent: ${result.cueName || "cue WAV"}.`;
+  } catch (error) {
+    els.settingsStatus.textContent = `Dynamic cue test failed: ${error.message}`;
+  } finally {
+    els.testDynamicCueOutput.disabled = false;
+    els.testDynamicCueOutput.textContent = "Test Dynamic Cue Output";
+  }
+}
+
 function formatAudioDiagnosticReport(report) {
   const lines = [];
   lines.push(`Generated: ${report.generatedAt || "--"}`);
@@ -730,7 +763,7 @@ function formatAudioDiagnosticReport(report) {
   lines.push(`Measurement: ${report.outputSignals?.measurementPoint || "--"}`);
   for (const output of report.outputSignals?.outputs || []) {
     const sources = (output.sources || [])
-      .map((source) => `${source.name}=${Number(source.level || 0).toFixed(4)}`)
+      .map((source) => `${source.name}${source.bus ? ` [${source.bus}]` : ""}=${Number(source.level || 0).toFixed(4)}`)
       .join(", ");
     lines.push(`- Output ${output.channel}: peak=${Number(output.peak || 0).toFixed(4)} | ${sources || "no routed sources"}`);
   }
@@ -1620,6 +1653,10 @@ async function handleShellMenuCommand(command) {
       case "openDanteMatrix":
         openSettingsDrawer();
         showSettingsSection("routingSettings");
+        break;
+      case "openHelp":
+        showView("helpView");
+        els.helpSearch?.focus();
         break;
       case "play":
       case "pause":

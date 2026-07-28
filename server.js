@@ -284,6 +284,10 @@ const httpServer = createServer(async (req, res) => {
       return json(res, await handlePlaybackCommand(body.command, body));
     }
 
+    if (req.method === "POST" && url.pathname === "/api/playback/test-dynamic-cue") {
+      return json(res, await testDynamicCueOutput());
+    }
+
     if (req.method === "POST" && url.pathname === "/api/playback/live-mixer") {
       const body = await readJsonBody(req);
       return json(res, await applyLiveMixerUpdate(positiveNumber(body.slot), body.mixer || body));
@@ -653,7 +657,7 @@ function normalizeRoutingPresets(presets) {
   const defaults = [
     { id: "stereo", name: "Stereo", routes: { tracks: [1, 2], click: [1, 2], cues: [1, 2], pads: [1, 2], dynamicCue: [1, 2], iem: [1, 2] } },
     { id: "tracks-click-cue", name: "Tracks Click Cue", routes: { tracks: [1, 2], click: [3], cues: [4], pads: [1, 2], dynamicCue: [4], iem: [5, 6] } },
-    { id: "dante-32", name: "Dante 32ch", routes: { tracks: [4], click: [1], cues: [], pads: [5], dynamicCue: [2], iem: [3] } }
+    { id: "dante-32", name: "Dante 32ch", routes: { tracks: [1, 2], click: [3], cues: [4], pads: [5, 6], dynamicCue: [4], iem: [7, 8] } }
   ];
   if (!Array.isArray(presets) || presets.length === 0) return defaults;
   return presets.map((preset, index) => {
@@ -829,23 +833,38 @@ async function liveOutputSignalDiagnostics() {
 
   const routes = new Map();
   for (const stem of song.stems || []) {
-    routes.set(stringValue(stem.id), Array.isArray(stem.routing?.outputChannels) ? stem.routing.outputChannels : []);
+    const id = stringValue(stem.id);
+    routes.set(id, [
+      {
+        bus: stringValue(stem.routing?.bus || stem.role || "tracks"),
+        outputChannels: Array.isArray(stem.routing?.outputChannels) ? stem.routing.outputChannels : []
+      }
+    ]);
+    if (stem.iemSend && Array.isArray(stem.iemRouting?.outputChannels) && stem.iemRouting.outputChannels.length) {
+      routes.get(id).push({
+        bus: "iem",
+        outputChannels: stem.iemRouting.outputChannels
+      });
+    }
   }
-  routes.set("dynamic-click", Array.isArray(song.dynamicClick?.routing?.outputChannels) ? song.dynamicClick.routing.outputChannels : []);
-  routes.set("dynamic-cue", Array.isArray(song.dynamicCue?.routing?.outputChannels) ? song.dynamicCue.routing.outputChannels : []);
-  routes.set("dynamic-pad", Array.isArray(song.dynamicPad?.routing?.outputChannels) ? song.dynamicPad.routing.outputChannels : []);
+  routes.set("dynamic-click", [{ bus: "click", outputChannels: Array.isArray(song.dynamicClick?.routing?.outputChannels) ? song.dynamicClick.routing.outputChannels : [] }]);
+  routes.set("dynamic-cue", [{ bus: "dynamicCue", outputChannels: Array.isArray(song.dynamicCue?.routing?.outputChannels) ? song.dynamicCue.routing.outputChannels : [] }]);
+  routes.set("dynamic-pad", [{ bus: "pads", outputChannels: Array.isArray(song.dynamicPad?.routing?.outputChannels) ? song.dynamicPad.routing.outputChannels : [] }]);
 
   const outputs = new Map();
   for (const meter of meters.stems || []) {
-    for (const channel of routes.get(stringValue(meter.id)) || []) {
-      const output = outputs.get(channel) || { channel, peak: 0, sources: [] };
-      output.peak = Math.max(output.peak, clampNumber(meter.level, 0, 1, 0));
-      output.sources.push({
-        id: stringValue(meter.id),
-        name: stringValue(meter.name),
-        level: clampNumber(meter.level, 0, 1, 0)
-      });
-      outputs.set(channel, output);
+    for (const route of routes.get(stringValue(meter.id)) || []) {
+      for (const channel of route.outputChannels || []) {
+        const output = outputs.get(channel) || { channel, peak: 0, sources: [] };
+        output.peak = Math.max(output.peak, clampNumber(meter.level, 0, 1, 0));
+        output.sources.push({
+          id: stringValue(meter.id),
+          name: stringValue(meter.name),
+          bus: route.bus,
+          level: clampNumber(meter.level, 0, 1, 0)
+        });
+        outputs.set(channel, output);
+      }
     }
   }
 
@@ -4077,6 +4096,7 @@ function mixerHasActiveSolo(mixer, playbackStems = []) {
   const dynamicIds = new Set(["dynamic-click", "dynamic-cue", "dynamic-pad"]);
   const dynamicStems = (mixer?.stems || []).filter((stem) => dynamicIds.has(stem.id));
   const regularStems = playbackStems
+    .filter((stem) => stem.playLive !== false)
     .map((stem) => ({ stem, mixerStem: matchMixerStem(stem, mixer || { stems: [] }) }))
     .filter(({ stem, mixerStem }) => {
       const role = canonicalBus(mixerStem?.routeBus || mixerStem?.role || stem.bus || stem.role || stem.playbackRole) || "tracks";
@@ -4095,6 +4115,7 @@ function mixerOutputVolume(mixerStem, fallback = 80, soloActive = false) {
 
 function stemManifestEntry(stem, index, routingPreset, mixerStem = null, soloActive = false) {
   const role = canonicalBus(mixerStem?.routeBus || mixerStem?.role || stem.bus || stem.role || stem.playbackRole) || "tracks";
+  const playLive = stem.playLive !== false;
   const iemSend = Boolean(mixerStem?.iemSend) && role === "tracks";
   const routing = routeForStem(role, index, routingPreset);
   return {
@@ -4105,12 +4126,12 @@ function stemManifestEntry(stem, index, routingPreset, mixerStem = null, soloAct
     role,
     playbackRole: stem.playbackRole || "",
     stemGroup: stem.stemGroup || "",
-    playLive: stem.playLive !== false,
+    playLive,
     sampleRate: positiveNumber(stem.sampleRate),
     channels: positiveNumber(stem.channels),
     durationMs: positiveNumber(stem.durationMs),
     sha256: stem.sha256 || "",
-    volume: routing.outputChannels.length ? mixerOutputVolume(mixerStem, 80, soloActive) : 0,
+    volume: playLive && routing.outputChannels.length ? mixerOutputVolume(mixerStem, 80, soloActive) : 0,
     solo: Boolean(mixerStem?.solo),
     mute: Boolean(mixerStem?.mute),
     iemSend,
@@ -5515,6 +5536,39 @@ async function recoveryCueCommandPayload(regionName) {
     ok: commands.length > 0,
     commands
   };
+}
+
+async function testDynamicCueOutput() {
+  const settings = await loadSettings();
+  const folderPath = stringValue(settings.dynamicCue?.folderPath);
+  if (!folderPath) return { ok: false, error: "Dynamic cue folder is not configured." };
+
+  let entries = [];
+  try {
+    entries = await readdir(folderPath, { withFileTypes: true });
+  } catch {
+    return { ok: false, error: "Dynamic cue folder is unavailable." };
+  }
+
+  const wavs = entries
+    .filter((entry) => entry.isFile() && entry.name.toLowerCase().endsWith(".wav"))
+    .map((entry) => ({ name: entry.name, filePath: join(folderPath, entry.name), key: cueMatchKey(entry.name.replace(/\.wav$/i, "")) }));
+  const match = findCueWav(wavs, "In") || findCueWav(wavs, "Verse") || wavs[0];
+  if (!match) return { ok: false, error: "No WAV files found in the dynamic cue folder." };
+
+  const result = await requestNativePlaybackCommand("triggerCue", {
+    cueId: "settings-dynamic-cue-test",
+    cueName: match.name.replace(/\.wav$/i, ""),
+    filePath: match.filePath
+  }, { timeoutMs: 2000 });
+  if (!result.ok) {
+    return {
+      ok: false,
+      filePath: match.filePath,
+      error: result.error || "Dynamic cue test could not reach the playback engine. Start playback first so the audio engine is open."
+    };
+  }
+  return { ok: true, filePath: match.filePath, cueName: match.name };
 }
 
 function liveRegionCueCommands(regionName, wavs) {

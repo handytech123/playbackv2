@@ -14,6 +14,7 @@
       </div>
       <nav class="nav-buttons" aria-label="Main sections">
         <button class="nav-button active" type="button" data-view="setlistView">Playback</button>
+        <button class="nav-button" type="button" data-view="helpView">Help</button>
         <button id="reloadDataButton" class="nav-button" type="button">Reload</button>
         <button id="settingsMenuButton" class="icon-button menu-button" type="button" aria-label="Open settings">&#9776;</button>
       </nav>
@@ -282,6 +283,264 @@
       </section>
     </main>
 
+    <main id="helpView" class="view help-view" aria-label="Help">
+      <section class="help-shell">
+        <aside class="help-sidebar">
+          <div>
+            <p class="eyebrow">Help</p>
+            <h2>Operator Guide</h2>
+          </div>
+          <button id="helpBackButton" class="help-back-button" type="button">Back To Playback</button>
+          <label class="help-search-label">Search Help
+            <input id="helpSearchInput" type="search" placeholder="Search setlist, panic, MIDI...">
+          </label>
+          <nav class="help-topic-list" aria-label="Help topics">
+            <a href="#help-quick-start">Quick Start</a>
+            <a href="#help-workflow">Weekly Workflow</a>
+            <a href="#help-library">Library And Metadata</a>
+            <a href="#help-setlist">Setlist</a>
+            <a href="#help-confirm-set">Confirm Set</a>
+            <a href="#help-edit-mode">Edit Mode</a>
+            <a href="#help-arrangements">Arrangement Editing</a>
+            <a href="#help-performance">Performance Mode</a>
+            <a href="#help-transport">Transport</a>
+            <a href="#help-repeat-jump">Repeat, Loop, Jump</a>
+            <a href="#help-panic">Panic Recovery</a>
+            <a href="#help-click-cue-pad">Click, Cue, Pad</a>
+            <a href="#help-mixer">Mixer</a>
+            <a href="#help-audio-routing">Audio And Dante</a>
+            <a href="#help-propresenter">ProPresenter MIDI</a>
+            <a href="#help-remote">Stage Remote</a>
+            <a href="#help-transfer">Home To Church Transfer</a>
+            <a href="#help-troubleshooting">Troubleshooting</a>
+          </nav>
+        </aside>
+
+        <section id="helpTopics" class="help-content">
+          <article id="help-quick-start" class="help-topic" data-help-text="quick start startup reload refresh confirm performance play">
+            <h2>Quick Start</h2>
+            <ol>
+              <li>Open the app and check that the top status shows the audio engine is ready.</li>
+              <li>Use an empty setlist slot or the plus button to choose songs from the library.</li>
+              <li>Review each song in Edit mode if cues, regions, key, BPM, pad, or arrangement need changes.</li>
+              <li>Press <strong>Confirm Set</strong>. This builds the playback-ready cache and locks the set for live use.</li>
+              <li>Switch to <strong>Performance</strong> mode and run the set from the transport, song tiles, or stage remote.</li>
+            </ol>
+            <p>The app is designed so Dropbox and source song folders are not touched during live playback. Live playback uses the prepared app cache.</p>
+          </article>
+
+          <article id="help-workflow" class="help-topic" data-help-text="weekly workflow home church edit package export import">
+            <h2>Weekly Workflow</h2>
+            <ol>
+              <li>At home, refresh the library after metadata or song folders change.</li>
+              <li>Build the setlist left to right.</li>
+              <li>Edit song maps, cue markers, key changes, BPM changes, pads, and arrangements as needed.</li>
+              <li>Confirm the set after edits are done.</li>
+              <li>Use <strong>File > Export Set Package</strong> to create a transfer package.</li>
+              <li>At church, use <strong>File > Import Set Package</strong>, then confirm and test audio routing.</li>
+            </ol>
+            <p>Set packages carry the setlist and app metadata. They do not include the original multitrack WAV library.</p>
+          </article>
+
+          <article id="help-library" class="help-topic" data-help-text="library metadata refresh song-metadata analyzer spreadsheet dropbox">
+            <h2>Library And Metadata</h2>
+            <p>The library reads song folders under the configured library folder. A song must have trusted metadata before it appears as usable in the setlist.</p>
+            <ul>
+              <li><strong>Library folder:</strong> set in Settings > Library.</li>
+              <li><strong>Song facts:</strong> title, key, BPM, time signature, WAV count, and duration come from song metadata.</li>
+              <li><strong>Grid:</strong> built from BPM, time signature, duration, and start time 0.000.</li>
+              <li><strong>Skipped folders:</strong> folders missing required metadata are listed instead of silently guessed.</li>
+            </ul>
+            <p>Refreshing the library reloads metadata and reflects analyzer changes. It should not invent missing song facts.</p>
+          </article>
+
+          <article id="help-setlist" class="help-topic" data-help-text="setlist slots drag drop cue next transition add song remove">
+            <h2>Setlist</h2>
+            <p>The setlist is built left to right. Empty slots show a plus button. Filled slots show title, key, BPM, readiness, and song actions.</p>
+            <ul>
+              <li>Drag a song tile to reorder it.</li>
+              <li>Dropping onto another song moves the existing song down when possible.</li>
+              <li>Use the remove button on a tile to clear that slot.</li>
+              <li>Transition tiles between songs control what happens after the previous song ends.</li>
+            </ul>
+            <p>The app defaults to ten possible setlist slots, with only filled slots used for live playback.</p>
+          </article>
+
+          <article id="help-confirm-set" class="help-topic" data-help-text="confirm set cache render ready performance lock">
+            <h2>Confirm Set</h2>
+            <p><strong>Confirm Set</strong> is the live readiness step. It prepares cached audio, writes the playback manifest, and marks the set ready for Performance mode.</p>
+            <ul>
+              <li>Use it after adding songs, changing arrangements, changing keys, changing BPM, changing pads, or editing transitions.</li>
+              <li>If the set changes after confirmation, confirm again before live use.</li>
+              <li>Performance mode expects the confirmed set to be the source of truth.</li>
+            </ul>
+          </article>
+
+          <article id="help-edit-mode" class="help-topic" data-help-text="edit mode cues regions timeline waveform key bpm pad">
+            <h2>Edit Mode</h2>
+            <p>Edit mode is where song-specific work happens. Changes apply to the setlist song and its app metadata, not the original Dropbox WAV stems.</p>
+            <ul>
+              <li>Use the waveform timeline to inspect song structure.</li>
+              <li>Use snap mode for measures, beats, or free movement.</li>
+              <li>Edit cue and region names from the lists below the waveform.</li>
+              <li>Change key, dynamic pad, BPM, and time signature from the editor panel.</li>
+              <li>Use Save Draft or Approve Cue/Regions when the song map is ready.</li>
+            </ul>
+          </article>
+
+          <article id="help-arrangements" class="help-topic" data-help-text="arrangement remove close gap split delete trim undo save">
+            <h2>Arrangement Editing</h2>
+            <p>Arrangement edits create a changed version of the song for this set. They are separate from approved cue and region metadata.</p>
+            <ul>
+              <li><strong>Split At Playhead:</strong> cuts the selected region at the current transport point.</li>
+              <li><strong>Delete Selection:</strong> removes the selected cue or region object.</li>
+              <li><strong>Remove + Close Gap:</strong> removes a song section and pulls later audio earlier.</li>
+              <li><strong>Trim Start / Trim End:</strong> removes silence or extra audio at the beginning or end.</li>
+              <li><strong>Undo Edit:</strong> steps backward through recent edit moves.</li>
+              <li><strong>Save Arrangement:</strong> commits the current arrangement for the setlist song.</li>
+            </ul>
+            <p>After an arrangement edit, the waveform and grid should redraw to match the new song length.</p>
+          </article>
+
+          <article id="help-performance" class="help-topic" data-help-text="performance mode locked live safe operator">
+            <h2>Performance Mode</h2>
+            <p>Performance mode is the live operator surface. The song map is locked, but live actions remain available.</p>
+            <ul>
+              <li>Transport controls remain active.</li>
+              <li>Mixer faders remain active.</li>
+              <li>Repeat, loop, jump, skip, cue next, pad, and panic are live controls.</li>
+              <li>Song edits are blocked until returning to Edit mode.</li>
+            </ul>
+          </article>
+
+          <article id="help-transport" class="help-topic" data-help-text="transport play pause stop restart start playhead spacebar">
+            <h2>Transport</h2>
+            <ul>
+              <li><strong>Play:</strong> starts from the current playhead in Edit mode or selected song in Performance mode.</li>
+              <li><strong>Pause:</strong> stops audio movement without resetting the playhead.</li>
+              <li><strong>Stop:</strong> stops playback and resets live state.</li>
+              <li><strong>Return To Start:</strong> moves the playhead to song start without starting playback.</li>
+              <li><strong>Spacebar:</strong> toggles play and pause while keeping click/cue/pad state in sync.</li>
+            </ul>
+            <p>Measure 1 beat 1 is always time 0.000. The grid is the timing authority.</p>
+          </article>
+
+          <article id="help-repeat-jump" class="help-topic" data-help-text="repeat loop jump skip live action region cue">
+            <h2>Repeat, Loop, Jump, And Skip</h2>
+            <p>Live structure commands wait for musical boundaries. The app does not instantly jump in the middle of a section unless a feature is explicitly designed to do that.</p>
+            <ul>
+              <li><strong>Repeat 1:</strong> repeats the current region once, then continues.</li>
+              <li><strong>Loop:</strong> repeats the selected region until the operator chooses the next action.</li>
+              <li><strong>Jump:</strong> schedules a move to a chosen section.</li>
+              <li><strong>Skip:</strong> passes to the next planned section.</li>
+              <li>Repeat and jump cues are scheduled ahead of the boundary so the band hears where the song is going.</li>
+            </ul>
+          </article>
+
+          <article id="help-panic" class="help-topic" data-help-text="panic recovery pad click tracks down exit next region">
+            <h2>Panic Recovery</h2>
+            <p>Panic is a musical recovery mode, not a stop button.</p>
+            <ul>
+              <li>Backing tracks fade down quickly.</li>
+              <li>Click and timing stay alive.</li>
+              <li>Dynamic pad starts in the song key.</li>
+              <li>The timeline keeps moving internally.</li>
+              <li>Automatic cues and slide MIDI are suppressed while panic is active.</li>
+              <li>Exit panic releases at a safe musical boundary, normally the next region.</li>
+              <li>Recovery should cue the band for the region being recovered to before tracks fade back in.</li>
+            </ul>
+          </article>
+
+          <article id="help-click-cue-pad" class="help-topic" data-help-text="dynamic click cue pad grid key 4/4 6/8">
+            <h2>Dynamic Click, Cue, And Pad</h2>
+            <p>The playback grid owns timing. Analyzer metadata provides song facts; the app places click, cue, and pad on the grid.</p>
+            <ul>
+              <li><strong>Dynamic Click:</strong> uses app-owned global click pattern WAVs, not song click stems.</li>
+              <li><strong>4/4:</strong> one measure has four grid beats.</li>
+              <li><strong>6/8, 9/8, 12/8:</strong> worship BPM is treated as dotted-quarter BPM; the grid still displays every eighth-note beat in the measure.</li>
+              <li><strong>Dynamic Cue:</strong> plays matching cue phrase WAVs from the dynamic cue folder.</li>
+              <li><strong>Dynamic Pad:</strong> uses the selected song key or manually selected pad file.</li>
+            </ul>
+          </article>
+
+          <article id="help-mixer" class="help-topic" data-help-text="mixer fader signal meter mute solo iem bus pads click cue">
+            <h2>Mixer</h2>
+            <p>The mixer controls live playback volume and signal visibility.</p>
+            <ul>
+              <li>Music stems appear as channel strips.</li>
+              <li>Dynamic Click, Dynamic Cue, and Dynamic Pad are always available as dynamic tracks.</li>
+              <li>IEM sends are for music stems only, not click, cues, or dynamic pads.</li>
+              <li>Faders adjust live volume.</li>
+              <li>Meters update during playback so you can see signal activity.</li>
+              <li>Use the collapse and resize controls to balance mixer space against waveform space.</li>
+            </ul>
+          </article>
+
+          <article id="help-audio-routing" class="help-topic" data-help-text="audio routing dante asio wasapi focusrite usb output matrix">
+            <h2>Audio And Dante Routing</h2>
+            <p>Audio device selection lives in Settings > Audio. Routing lives in Settings > Routing.</p>
+            <ul>
+              <li>Choose the default audio device in Settings and save it.</li>
+              <li>Use Refresh Audio Devices when Windows devices change.</li>
+              <li>Use Stereo for basic testing on local speakers or a two-channel interface.</li>
+              <li>Use Dante routing when Dante Virtual Soundcard is available on the playback computer.</li>
+              <li>The routing matrix assigns tracks, click, dynamic cue, pads, and IEM to output channels.</li>
+            </ul>
+          </article>
+
+          <article id="help-propresenter" class="help-topic" data-help-text="propresenter midi slide command next slide note channel loopmidi rtpmidi">
+            <h2>ProPresenter MIDI</h2>
+            <p>The app can send a MIDI note to ProPresenter when cue markers are crossed.</p>
+            <ol>
+              <li>Create or choose a Windows MIDI path that ProPresenter can receive from, such as loopMIDI for the same computer or rtpMIDI for network use.</li>
+              <li>In ProPresenter, configure MIDI input and map the note to the slide command you want.</li>
+              <li>In this app, open Settings > Playback.</li>
+              <li>Enable <strong>Send ProPresenter Slide MIDI</strong>.</li>
+              <li>Refresh MIDI devices and select the ProPresenter MIDI output.</li>
+              <li>Set channel, note, velocity, and note length.</li>
+              <li>Press <strong>Test Next Slide</strong>.</li>
+            </ol>
+            <p>During playback, the app sends the note once per cue marker. Panic suppresses slide MIDI so the operator can recover without unwanted slide movement.</p>
+          </article>
+
+          <article id="help-remote" class="help-topic" data-help-text="remote stage phone tablet operator live waveform setlist">
+            <h2>Stage Remote</h2>
+            <p>The remote is for live control from the stage or another device on the local network.</p>
+            <ul>
+              <li>Open Settings > Remote to see available remote URLs.</li>
+              <li>Use the local network URL on a phone or tablet connected to the same network.</li>
+              <li>The remote shows setlist, current song, waveform, regions, and live action buttons.</li>
+              <li>Remote and main app should stay visually synced through playback state updates.</li>
+            </ul>
+          </article>
+
+          <article id="help-transfer" class="help-topic" data-help-text="export import set package home church pc transfer">
+            <h2>Exporting To The Church PC</h2>
+            <p>Use set packages to move weekly work from the home computer to the playback computer.</p>
+            <ul>
+              <li><strong>Export Set Package:</strong> writes the current setlist and app metadata to a single package file.</li>
+              <li><strong>Import Set Package:</strong> loads that work on the church computer.</li>
+              <li>After import, confirm the set and test audio output before rehearsal.</li>
+              <li>The church computer still needs access to the same song library folder structure.</li>
+            </ul>
+          </article>
+
+          <article id="help-troubleshooting" class="help-topic" data-help-text="troubleshooting errors no sound metadata grid cue off click off device missing">
+            <h2>Troubleshooting</h2>
+            <ul>
+              <li><strong>No audio device:</strong> refresh audio devices, select the correct Windows/ASIO/Dante device, save settings, and restart if needed.</li>
+              <li><strong>Song missing:</strong> refresh library and check that song metadata exists in the song folder.</li>
+              <li><strong>Grid looks wrong:</strong> check BPM and time signature first. The app grid starts at 0.000.</li>
+              <li><strong>Dynamic click sounds wrong:</strong> check the global click-pattern WAV for that time signature.</li>
+              <li><strong>Cues or regions are off:</strong> verify the analyzer metadata and then reload app data.</li>
+              <li><strong>Pad key wrong:</strong> check the song key and the selected dynamic pad in Edit mode.</li>
+              <li><strong>ProPresenter not moving:</strong> refresh MIDI devices, verify the selected output, test the note, and confirm ProPresenter is listening to the same MIDI path.</li>
+            </ul>
+          </article>
+        </section>
+      </section>
+    </main>
+
     <main id="settingsView" class="view settings-view" aria-label="Settings drawer">
       <div class="settings-backdrop" data-close-settings></div>
       <section class="settings-panel">
@@ -362,6 +621,7 @@
                 <button type="button" data-folder-picker="dynamicCueFolderInput">Browse</button>
               </span>
             </label>
+            <button id="testDynamicCueOutputButton" type="button">Test Dynamic Cue Output</button>
             <label>Pads Folder
               <span class="path-picker">
                 <input id="padsFolderInput" type="text" placeholder="Folder with pad WAV files">

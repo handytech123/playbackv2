@@ -152,6 +152,8 @@ function installApplicationMenu() {
     {
       label: "Help",
       submenu: [
+        menuCommand("Open Help", "openHelp", "F1"),
+        { type: "separator" },
         {
           label: "Open App Data Folder",
           click: () => shell.openPath(appDataDir())

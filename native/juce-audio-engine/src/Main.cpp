@@ -99,6 +99,9 @@ int maxOutputChannelFromStemRoutes(const juce::Array<juce::var>* stems)
         if (stem == nullptr)
             continue;
 
+        if (stem->hasProperty("playLive") && ! static_cast<bool>(stem->getProperty("playLive")))
+            continue;
+
         for (const auto& routeName : { juce::Identifier("routing"), juce::Identifier("iemRouting") })
         {
             auto* routing = stem->getProperty(routeName).getDynamicObject();
@@ -1363,6 +1366,9 @@ void sendPlaybackResult(PlaybackSession& session,
         auto* stem = stemValue.getDynamicObject();
 
         if (stem == nullptr)
+            continue;
+
+        if (stem->hasProperty("playLive") && ! static_cast<bool>(stem->getProperty("playLive")))
             continue;
 
         const juce::File audioFile(stem->getProperty("cachePath").toString());
