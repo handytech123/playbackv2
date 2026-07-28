@@ -69,8 +69,12 @@ excludes(server, "triggerTimeSeconds: Math.max(0, Number(block.arrangedStartSeco
 includes(server, "queuePanicReleaseFromState", "Backend must own Panic release queue creation.");
 includes(server, "state.panic?.active === true && (action === \"panic\" || (action === \"exitPanic\"", "Backend must intercept second Panic/Exit Panic as queue requests.");
 includes(server, "state.panic?.active === true && action === \"jumpRegion\"", "Backend must intercept Panic-time region recovery requests.");
-includes(server, "executeSeconds: target.seconds", "Panic recovery must re-enter at the selected target region boundary.");
-excludes(server, "executeSeconds: execute?.seconds ?? target.seconds", "Panic recovery must not re-enter at a separate next-region boundary.");
+includes(server, "const recoveryMode = stringValue(payload.recoveryMode) === \"now\" ? \"now\" : \"boundary\";", "Panic recovery must support explicit Now/Boundary recovery modes.");
+includes(server, "const executeTarget = requested && recoveryMode === \"boundary\"", "Panic recovery Boundary mode must wait for a musical boundary before re-entry.");
+includes(server, "executeSeconds: executeTarget.seconds", "Panic recovery must execute at the selected mode's target boundary.");
+includes(server, "targetSeconds: target.seconds", "Panic recovery must preserve the selected recovery region target.");
+includes(remote, "recoveryMode: remote.recoveryMode", "Remote Panic recovery must send the selected Now/Boundary mode to the backend.");
+excludes(server, "executeSeconds: execute?.seconds ?? target.seconds", "Panic recovery must not use the old implicit next-region fallback.");
 excludes(server, ": await triggerPanicRecoveryCue(liveSong, payload);", "Exit Panic must not fire a late recovery cue; the supervisor must fire it at the regular cue marker.");
 includes(server, "Array.isArray(liveSong.cueMarkers)", "Panic recovery must find regular cue markers from manifest cueMarkers.");
 includes(server, "Panic recovery cue is not scheduled.", "Panic recovery cue must be rejected when no regular cue marker is scheduled.");
@@ -97,13 +101,19 @@ excludes(app, "repeatCueLeadGridBeats", "Main app must not calculate repeat cue 
 
 includes(server, "beatGrid: normalizeBeatGrid(value.beatGrid)", "Backend tempo map must normalize analyzer beatGrid.");
 includes(server, "extendTempoMapForSongPositions", "Backend must extend tail grids when song regions/cues require trailing beats.");
-includes(juce, "readSongClickGrid(song)", "JUCE dynamic click must consume manifest click grid.");
+excludes(juce, "readSongClickGrid", "JUCE must not generate dynamic click from manifest click grid.");
+excludes(juce, "readDynamicClickPath", "JUCE must not load old click/accent dynamic click samples.");
+excludes(juce, "setDynamicClick", "JUCE must not own dynamic click sample triggering.");
 includes(juce, "cue.triggerTimeSeconds", "JUCE dynamic cues must consume manifest triggerTimeSeconds.");
-includes(juce, "if (beatGrid.empty() && samplesSinceClick >= samplesPerBeat)", "JUCE BPM click fallback must be guarded behind an empty beat grid.");
+excludes(juce, "samplesSinceClick", "JUCE must not run BPM fallback dynamic click generation.");
 
-includes(server, "waveform-v2-music-only:4", "Waveform fingerprint must identify music-only waveform generation.");
+includes(server, "waveform-v2-music-only:5", "Waveform fingerprint must identify music-only waveform generation.");
+includes(server, "positiveNumber(existing.tracksUsed) > 0", "Waveform cache must not reuse blank summaries with no scanned audio.");
+includes(server, "existing.peaks.some((peak) => Number(peak) > 0)", "Waveform cache must not reuse all-zero peak summaries.");
 includes(server, "if ([\"click\", \"cues\", \"dynamicCue\"].includes(bus)) return false;", "Waveform generation must exclude click/cue/dynamic cue buses.");
 includes(server, "applyWavShiftIfNeeded", "Audio alignment shifts must be applied in backend cache pipeline.");
+includes(app, "ensureSetlistWaveforms", "Main app must warm waveform summaries for every loaded setlist song, not only the selected song.");
+includes(app, "ensureSlotWaveform(Number(slot.slot))", "Setlist waveform warm-up must request each populated slot.");
 
 includes(server, "refreshEngineManifestForMixer", "Mixer changes must refresh confirmed engine manifest.");
 includes(server, "updateDynamicMixer", "Live mixer updates must flow to JUCE dynamic mixer.");
@@ -156,6 +166,31 @@ if (!songs.length) {
 
     for (const event of Array.isArray(song.dynamicClick?.clickEvents) ? song.dynamicClick.clickEvents : []) {
       if (!Number.isFinite(Number(event.timeSeconds))) fail(`Slot ${song.slot} ${song.title}: dynamic click event missing timeSeconds.`);
+      if (event.source === "click-pattern-template-beat-grid") {
+        const gridTime = timeForGrid(beatGrid, event.measure, event.beat);
+        if (gridTime === null) {
+          fail(`Slot ${song.slot} ${song.title}: dynamic click event points to missing grid ${event.measure}.${event.beat}.`);
+          continue;
+        }
+        const diff = Math.abs(Number(event.timeSeconds) - gridTime);
+        if (diff > 0.002) {
+          fail(`Slot ${song.slot} ${song.title}: dynamic click event at ${event.measure}.${event.beat} differs from grid by ${diff.toFixed(6)}s.`);
+        }
+      }
+      if (event.source === "click-pattern-template-measure-subdivision") {
+        const measureStart = timeForGrid(beatGrid, event.measure, 1);
+        const nextMeasureStart = timeForGrid(beatGrid, Number(event.measure) + 1, 1);
+        const numerator = Number(String(song.tempoMap?.timeSignature || "").split("/")[0]) || 0;
+        if (measureStart === null || nextMeasureStart === null || !numerator) {
+          fail(`Slot ${song.slot} ${song.title}: dynamic click subdivision event cannot resolve measure ${event.measure}.`);
+          continue;
+        }
+        const expectedTime = measureStart + (((nextMeasureStart - measureStart) / numerator) * (Number(event.beat) - 1));
+        const diff = Math.abs(Number(event.timeSeconds) - expectedTime);
+        if (diff > 0.002) {
+          fail(`Slot ${song.slot} ${song.title}: dynamic click subdivision at ${event.measure}.${event.beat} differs from grid subdivision by ${diff.toFixed(6)}s.`);
+        }
+      }
     }
 
     for (const region of Array.isArray(song.regions) ? song.regions : []) {
@@ -172,6 +207,13 @@ if (!songs.length) {
         }
         assertPresetRoute(stem.iemRouting, `Slot ${song.slot} ${song.title}: IEM send ${stem.name || stem.id}`);
       }
+    }
+
+    const renderedClickStem = (Array.isArray(song.stems) ? song.stems : []).find((stem) => stem.id === "dynamic-click" && stem.playbackRole === "dynamic-click-render");
+    if (!renderedClickStem) {
+      fail(`Slot ${song.slot} ${song.title}: rendered dynamic-click stem is missing.`);
+    } else if (!renderedClickStem.cachePath) {
+      fail(`Slot ${song.slot} ${song.title}: rendered dynamic-click stem has no cachePath.`);
     }
 
     assertPresetRoute(song.dynamicClick?.routing, `Slot ${song.slot} ${song.title}: dynamic click`);

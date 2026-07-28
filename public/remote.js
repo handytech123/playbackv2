@@ -1,4 +1,5 @@
 const remote = {
+  flavor: document.body?.dataset.remoteFlavor === "rehearsal" ? "rehearsal" : "performance",
   playback: null,
   setlist: null,
   metadata: null,
@@ -10,6 +11,11 @@ const remote = {
   commandPendingUntil: 0,
   commandInFlight: false,
   commandInFlightSince: 0,
+  commandInFlightCommand: "",
+  recoveryMode: localStorage.getItem("remoteRecoveryMode") || "boundary",
+  jumpMode: localStorage.getItem("remoteJumpMode") || "now",
+  selectedRegion: null,
+  boundaryJump: null,
   waveRenderKey: ""
 };
 
@@ -28,6 +34,18 @@ const els = {
   transitionNext: document.querySelector("#transitionNext"),
   transitionMode: document.querySelector("#transitionMode"),
   transitionPad: document.querySelector("#transitionPad"),
+  transitionReady: document.querySelector("#transitionReady"),
+  transitionFire: document.querySelector("#transitionFireButton"),
+  recoverModeBoundary: document.querySelector("#recoverModeBoundary"),
+  recoverModeNow: document.querySelector("#recoverModeNow"),
+  clearRecovery: document.querySelector("#clearRecoveryButton"),
+  jumpModeBoundary: document.querySelector("#jumpModeBoundary"),
+  jumpModeNow: document.querySelector("#jumpModeNow"),
+  clearJump: document.querySelector("#clearJumpButton"),
+  rehearsalPanel: document.querySelector("#rehearsalPanel"),
+  selectedSectionName: document.querySelector("#selectedSectionName"),
+  selectedSectionLocation: document.querySelector("#selectedSectionLocation"),
+  clearRehearsalSelection: document.querySelector("#clearRehearsalSelectionButton"),
   transportState: document.querySelector("#transportState"),
   transportTime: document.querySelector("#transportTime"),
   currentRegion: document.querySelector("#currentRegion"),
@@ -50,10 +68,18 @@ function wireRemote() {
   document.querySelectorAll("[data-command]").forEach((button) => {
     button.addEventListener("click", () => sendCommand(button.dataset.command));
   });
+  document.querySelectorAll("[data-recovery-mode]").forEach((button) => {
+    button.addEventListener("click", () => setRecoveryMode(button.dataset.recoveryMode));
+  });
+  document.querySelectorAll("[data-jump-mode]").forEach((button) => {
+    button.addEventListener("click", () => setJumpMode(button.dataset.jumpMode));
+  });
+  els.clearJump?.addEventListener("click", clearBoundaryJump);
+  els.clearRehearsalSelection?.addEventListener("click", clearSelectedRegion);
   document.querySelectorAll("[data-region-command]").forEach((button) => {
     button.addEventListener("click", () => sendRegionCommand(button.dataset.regionCommand));
   });
-  els.waveCanvas?.addEventListener("click", jumpToRegionFromWave);
+  els.waveCanvas?.addEventListener("pointerup", jumpToRegionFromWave);
 }
 
 async function bootRemote() {
@@ -63,6 +89,25 @@ async function bootRemote() {
   remote.refreshTimer = window.setInterval(refreshStaticData, 3000);
   window.setInterval(refreshPlaybackFallback, 1000);
   window.setInterval(renderRemote, 100);
+  window.setInterval(serviceBoundaryJump, 80);
+}
+
+function setRecoveryMode(mode) {
+  remote.recoveryMode = mode === "now" ? "now" : "boundary";
+  localStorage.setItem("remoteRecoveryMode", remote.recoveryMode);
+  renderRemote();
+}
+
+function setJumpMode(mode) {
+  remote.jumpMode = mode === "boundary" ? "boundary" : "now";
+  localStorage.setItem("remoteJumpMode", remote.jumpMode);
+  renderRemote();
+}
+
+function clearBoundaryJump() {
+  remote.boundaryJump = null;
+  els.lastMessage.textContent = "Boundary jump cleared.";
+  renderRemote();
 }
 
 async function refreshStaticData() {
@@ -150,9 +195,15 @@ function openMeterStream() {
 }
 
 async function sendCommand(command, extra = {}) {
-  if (remote.commandInFlight && Date.now() - Number(remote.commandInFlightSince || 0) < 2000) return;
+  const panicRecoverySelection = command === "jumpRegion" && remote.playback?.panic?.active === true;
+  const rehearsalPlayAfterSeek = isRehearsalRemote()
+    && command === "play"
+    && remote.commandInFlightCommand === "seek"
+    && Date.now() - Number(remote.commandInFlightSince || 0) < 1200;
+  if (!panicRecoverySelection && !rehearsalPlayAfterSeek && remote.commandInFlight && Date.now() - Number(remote.commandInFlightSince || 0) < 2000) return;
   if (remote.commandInFlight) {
     remote.commandInFlight = false;
+    remote.commandInFlightCommand = "";
   }
   const action = remoteOperatorCommand(command, extra);
   const payload = { command: action, source: "stage-remote", ...extra };
@@ -168,6 +219,7 @@ async function sendCommand(command, extra = {}) {
   }
   remote.commandInFlight = true;
   remote.commandInFlightSince = Date.now();
+  remote.commandInFlightCommand = command;
   remote.commandPendingUntil = Date.now() + 750;
   setConnection("pending", "Sent");
   try {
@@ -185,6 +237,7 @@ async function sendCommand(command, extra = {}) {
   } finally {
     remote.commandInFlight = false;
     remote.commandInFlightSince = 0;
+    remote.commandInFlightCommand = "";
   }
 }
 
@@ -217,11 +270,7 @@ function sendRegionCommand(command) {
     return;
   }
   if ((remote.playback || {}).panic?.active === true && command === "jumpRegion" && region) {
-    sendCommand("jumpRegion", {
-      slot: currentSlotMetadata()?.slot || remote.playback?.currentSlot,
-      regionId: region.region.id,
-      regionName: region.region.name || `Region ${region.index + 1}`
-    });
+    queuePanicRecovery(region);
     return;
   }
   sendCommand(command, region ? {
@@ -256,17 +305,27 @@ function renderRemote() {
   if (backendRecovery) {
     els.lastMessage.textContent = backendRecovery.message || `Panic recovery queued${backendRecovery.regionName ? ` to ${backendRecovery.regionName}` : " at next region"}`;
   }
+  syncModeButtons();
+  syncRehearsalPanel(region);
   els.panicPanel.classList.toggle("hidden", !panicActive);
   els.waveRecoveryBar?.classList.toggle("hidden", !panicActive);
+  els.clearRecovery?.classList.toggle("hidden", !backendRecovery);
+  els.clearJump?.classList.toggle("hidden", !remote.boundaryJump);
   if (els.panicRecoveryTarget) {
     els.panicRecoveryTarget.textContent = backendRecovery?.regionName
-      ? `Queued: ${backendRecovery.regionName}`
+      ? `Queued: ${backendRecovery.regionName} / ${titleCase(backendRecovery.recoveryMode || remote.recoveryMode)}`
       : panicActive
-        ? "Choose recovery target below"
+        ? `Choose recovery target / ${titleCase(remote.recoveryMode)}`
         : "No recovery queued";
   }
   if (els.sectionHint) {
-    els.sectionHint.textContent = panicActive ? "tap to recover there" : "tap to queue jump";
+    els.sectionHint.textContent = panicActive
+      ? `tap to recover / ${titleCase(remote.recoveryMode)}`
+      : isRehearsalRemote()
+        ? "tap section to select"
+      : remote.boundaryJump
+        ? `jump armed: ${remote.boundaryJump.regionName}`
+        : `tap to jump / ${titleCase(remote.jumpMode)}`;
   }
   document.querySelector("#padButton")?.classList.toggle("active", playback.pad?.active === true);
   els.wavePanel?.classList.toggle("region-playing", Boolean(region?.region?.id && playing));
@@ -279,16 +338,66 @@ function renderRemote() {
   renderRegionButtons(region);
 }
 
+function isRehearsalRemote() {
+  return remote.flavor === "rehearsal";
+}
+
+function syncRehearsalPanel(current) {
+  if (!els.rehearsalPanel) return;
+  const selected = selectedRegionEntry() || current || firstRegionEntry();
+  const locked = remote.playback?.mode === "performance";
+  const name = selected?.region?.name || "No section selected";
+  const location = selected
+    ? `${barBeatLabel(selected.region.startBar, selected.region.startBeat)} / ${formatSeconds(selected.startTime)}`
+    : "Tap waveform or section to move playhead";
+  els.selectedSectionName.textContent = locked ? "Performance locked" : name;
+  els.selectedSectionLocation.textContent = locked
+    ? "Use the performance remote for show controls"
+    : location;
+  els.clearRehearsalSelection.disabled = locked || !remote.selectedRegion;
+}
+
 function renderTransitionReadout() {
   const current = currentSetlistSong();
   const transition = transitionAfterSlot(current?.slot);
   const next = transition ? (remote.setlist?.slots || []).find((slot) => Number(slot.slot) === Number(transition.toSlot)) : null;
+  const ready = transitionReadiness(transition);
   if (els.transitionNext) els.transitionNext.textContent = `Next: ${next?.title || (transition && !transition.toSlot ? "End of set" : "--")}`;
   if (els.transitionMode) {
-    const duration = ["crossfade", "overlap"].includes(transition?.mode) ? ` / ${Number(transition.durationSeconds || 5)}s` : "";
+    const duration = transition ? ` / ${Number(transition.durationSeconds || 0)}s` : "";
     els.transitionMode.textContent = `Transition: ${transitionModeLabel(transition?.mode)}${duration}`;
   }
   if (els.transitionPad) els.transitionPad.textContent = `Pad: ${transitionPadSummary(transition)}`;
+  if (els.transitionReady) {
+    els.transitionReady.textContent = ready.label;
+    els.transitionReady.className = ready.ready ? "ready" : "waiting";
+  }
+  if (els.transitionFire) {
+    els.transitionFire.textContent = transitionFireLabel(transition);
+    els.transitionFire.classList.toggle("ready", ready.ready);
+  }
+}
+
+function syncModeButtons() {
+  els.recoverModeBoundary?.classList.toggle("active", remote.recoveryMode === "boundary");
+  els.recoverModeNow?.classList.toggle("active", remote.recoveryMode === "now");
+  els.jumpModeBoundary?.classList.toggle("active", remote.jumpMode === "boundary");
+  els.jumpModeNow?.classList.toggle("active", remote.jumpMode === "now");
+}
+
+function transitionReadiness(transition) {
+  if (!transition || !transition.toSlot) return { ready: false, label: "Next Ready: --" };
+  if (transition.mode !== "crossfade") return { ready: true, label: "Next Ready: queued" };
+  const engine = remote.playback?.readiness?.engine || {};
+  const ready = engine.nextPreloaded === true && Number(engine.preloadedSlot) === Number(transition.toSlot);
+  return { ready, label: ready ? "Next Ready: Engine B" : "Next Ready: loading" };
+}
+
+function transitionFireLabel(transition) {
+  if (!transition) return "Transition";
+  if (transition.mode === "crossfade") return "Fire Crossfade";
+  if (transition.mode === "stay") return "Stay";
+  return "Cue Next";
 }
 
 function transitionAfterSlot(fromSlot) {
@@ -300,9 +409,7 @@ function transitionModeLabel(mode) {
   return {
     "cue-next": "Cue Next",
     stay: "Stay",
-    autolink: "AutoLink",
-    crossfade: "Crossfade",
-    overlap: "Overlap"
+    crossfade: "Crossfade"
   }[mode] || "--";
 }
 
@@ -338,8 +445,12 @@ function renderSetlistCards() {
     `;
     card.addEventListener("click", () => {
       if (Number(slot.slot) === currentSlot) return;
+      if (isRehearsalRemote()) {
+        switchToSetlistSlot(slot);
+        return;
+      }
       if (remote.playback?.transport === "stopped") {
-        sendCommand("play", { slot: slot.slot });
+        sendCommand("selectSlot", { slot: slot.slot });
         return;
       }
       els.lastMessage.textContent = "Use Next Song during playback.";
@@ -348,6 +459,24 @@ function renderSetlistCards() {
   }
   const currentCard = els.setlistCards.querySelector(".song-card.current");
   currentCard?.scrollIntoView({ inline: "center", block: "nearest" });
+}
+
+function switchToSetlistSlot(slot) {
+  if (!slot?.slot) return;
+  if (remote.playback?.mode === "performance") {
+    els.lastMessage.textContent = "Song switching is locked in Performance mode.";
+    return;
+  }
+  remote.selectedRegion = null;
+  remote.boundaryJump = null;
+  const playing = remote.playback?.transport === "playing";
+  sendCommand(playing ? "play" : "selectSlot", {
+    slot: slot.slot,
+    startSeconds: 0,
+    seconds: 0,
+    systemAction: playing,
+  });
+  els.lastMessage.textContent = `Switching to ${slot.title || `Slot ${slot.slot}`}.`;
 }
 
 function renderWaveform(slot, current) {
@@ -490,13 +619,18 @@ function jumpToRegionFromWave(event) {
   const duration = slotDurationSeconds(slot);
   if (duration <= 0) return;
   const rect = els.waveCanvas.getBoundingClientRect();
-  const seconds = ((event.clientX - rect.left) / Math.max(1, rect.width)) * duration;
+  const seconds = clamp(((event.clientX - rect.left) / Math.max(1, rect.width)) * duration, 0, duration);
   const entry = regionEntries().find((item) => seconds >= item.startTime && seconds < item.endTime);
-  if (!entry) return;
-  sendCommand("jumpRegion", {
-    regionId: entry.region.id,
-    regionName: entry.region.name || `Region ${entry.index + 1}`
-  });
+  const panicActive = remote.playback?.panic?.active === true;
+  if (panicActive) {
+    if (!entry) return;
+    queuePanicRecovery(entry);
+  } else if (isRehearsalRemote()) {
+    seekRehearsalTransport(seconds, entry);
+  } else {
+    if (!entry) return;
+    queueOrJumpRegion(entry);
+  }
 }
 
 function arrangedWaveformPeaks(slot) {
@@ -556,26 +690,124 @@ function renderRegionButtons(current) {
     button.type = "button";
     button.className = "region-button";
     button.classList.toggle("current", current?.region?.id === entry.region.id);
+    button.classList.toggle("selected", selectedRegionEntry()?.region?.id === entry.region.id);
     button.classList.toggle("panic-select", panicActive);
     button.classList.toggle("recovery-target", panicActive && pending.regionId === entry.region.id);
     const name = entry.region.name || `Region ${entry.index + 1}`;
     button.textContent = panicActive ? `Recover: ${name}` : name;
     button.addEventListener("click", () => {
       if (panicActive) {
-        sendCommand("jumpRegion", {
-          slot: currentSlotMetadata()?.slot || remote.playback?.currentSlot,
-          regionId: entry.region.id,
-          regionName: name
-        });
+        queuePanicRecovery(entry);
         return;
       }
-      sendCommand("jumpRegion", {
-        regionId: entry.region.id,
-        regionName: name
-      });
+      if (isRehearsalRemote()) {
+        seekRehearsalTransport(entry.startTime, entry);
+        return;
+      }
+      queueOrJumpRegion(entry);
     });
     els.regionButtons.append(button);
   }
+}
+
+function selectRegion(entry) {
+  const name = entry.region.name || `Region ${entry.index + 1}`;
+  remote.selectedRegion = {
+    regionId: entry.region.id,
+    regionName: name,
+    slot: currentSlotMetadata()?.slot || remote.playback?.currentSlot,
+    startTime: entry.startTime
+  };
+  els.lastMessage.textContent = `Selected ${name}.`;
+  renderRemote();
+}
+
+function seekRehearsalTransport(seconds, entry = null) {
+  if (remote.playback?.mode === "performance") {
+    els.lastMessage.textContent = "Rehearsal transport is locked in Performance mode.";
+    return;
+  }
+  const slot = currentSlotMetadata();
+  const targetSeconds = Math.max(0, Number(seconds) || 0);
+  if (entry) {
+    selectRegion(entry);
+  } else {
+    remote.selectedRegion = null;
+    renderRemote();
+  }
+  sendCommand("seek", {
+    slot: slot?.slot || remote.playback?.currentSlot,
+    seconds: targetSeconds,
+    regionId: entry?.region?.id,
+    regionName: entry?.region?.name || (entry ? `Region ${entry.index + 1}` : undefined)
+  });
+  els.lastMessage.textContent = `Playhead set to ${formatSeconds(targetSeconds)}.`;
+}
+
+function clearSelectedRegion() {
+  remote.selectedRegion = null;
+  els.lastMessage.textContent = "Rehearsal selection cleared.";
+  renderRemote();
+}
+
+function selectedRegionEntry() {
+  if (!remote.selectedRegion?.regionId) return null;
+  return regionEntries().find((entry) => entry.region.id === remote.selectedRegion.regionId) || null;
+}
+
+function selectedOrCurrentRegionEntry() {
+  return selectedRegionEntry() || currentRegionEntry() || firstRegionEntry();
+}
+
+function queuePanicRecovery(entry) {
+  const name = entry.region.name || `Region ${entry.index + 1}`;
+  sendCommand("jumpRegion", {
+    slot: currentSlotMetadata()?.slot || remote.playback?.currentSlot,
+    regionId: entry.region.id,
+    regionName: name,
+    targetSeconds: entry.startTime,
+    recoveryTargetSeconds: entry.startTime,
+    recoveryMode: remote.recoveryMode
+  });
+}
+
+function queueOrJumpRegion(entry) {
+  const name = entry.region.name || `Region ${entry.index + 1}`;
+  const payload = {
+    slot: currentSlotMetadata()?.slot || remote.playback?.currentSlot,
+    regionId: entry.region.id,
+    regionName: name,
+    targetSeconds: entry.startTime,
+    recoveryTargetSeconds: entry.startTime
+  };
+  if (remote.jumpMode === "boundary" && remote.playback?.transport === "playing") {
+    const boundary = nextRegionBoundary(currentSlotMetadata(), currentTransportSeconds());
+    remote.boundaryJump = {
+      ...payload,
+      fireSeconds: boundary.seconds,
+      boundaryRegionName: boundary.region?.name || "next boundary"
+    };
+    els.lastMessage.textContent = `Jump armed: ${name} at ${remote.boundaryJump.boundaryRegionName}.`;
+    renderRemote();
+    return;
+  }
+  sendCommand("jumpRegion", payload);
+}
+
+function serviceBoundaryJump() {
+  const pending = remote.boundaryJump;
+  if (!pending) return;
+  if (remote.playback?.panic?.active === true || remote.playback?.transport !== "playing") {
+    remote.boundaryJump = null;
+    return;
+  }
+  if (currentTransportSeconds() < Number(pending.fireSeconds || 0) - 0.035) return;
+  remote.boundaryJump = null;
+  sendCommand("jumpRegion", {
+    slot: pending.slot,
+    regionId: pending.regionId,
+    regionName: pending.regionName
+  });
 }
 
 function currentSetlistSong() {
@@ -695,6 +927,10 @@ function timeForBarBeat(slot, bar, beat) {
   return Number(beatGrid.at(-1)?.timeSeconds || 0);
 }
 
+function barBeatLabel(bar, beat) {
+  return `${Number(bar || 1)}.${Number(beat || 1)}`;
+}
+
 async function api(path, options = {}) {
   const response = await fetch(path, { cache: "no-store", ...options });
   const text = await response.text();
@@ -715,6 +951,7 @@ function commandLabel(command) {
     stop: "Stop sent",
     togglePad: "Pad toggled",
     panic: "Panic sent",
+    clearPanicRecovery: "Recovery cleared",
     exitPanic: "Exit panic sent",
     repeatRegion: "Repeat sent",
     loopRegion: "Loop sent",

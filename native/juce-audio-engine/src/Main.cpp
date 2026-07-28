@@ -21,6 +21,12 @@ namespace
 constexpr int protocolVersion = 1;
 constexpr double toneFrequencyHz = 880.0;
 constexpr int defaultRequestedOutputs = 2;
+constexpr float generatedCueLimiterCeiling = 0.85f;
+
+float limitGeneratedCueLevel(float level)
+{
+    return generatedCueLimiterCeiling * std::tanh(level / generatedCueLimiterCeiling);
+}
 
 void writeJsonLine(const juce::var& value)
 {
@@ -404,12 +410,6 @@ struct StemMeterSnapshot
     float level = 0.0f;
 };
 
-struct ClickBeat
-{
-    double timeSeconds = 0.0;
-    bool strong = false;
-};
-
 struct ClickSample
 {
     juce::AudioBuffer<float> buffer;
@@ -446,29 +446,47 @@ public:
     void setSources(std::vector<std::unique_ptr<StemSource>>* nextSources)
     {
         std::lock_guard<std::mutex> lock(audioMutex);
+        setSourcesUnlocked(nextSources);
+    }
+
+    void setOutgoingSources(std::vector<std::unique_ptr<StemSource>>* nextSources, int durationMs)
+    {
+        std::lock_guard<std::mutex> lock(audioMutex);
+        setOutgoingSourcesUnlocked(nextSources, durationMs);
+    }
+
+    void setSourcesUnlocked(std::vector<std::unique_ptr<StemSource>>* nextSources)
+    {
         sources = nextSources;
     }
 
-    void setDynamicClick(double nextBpm,
-                         const juce::Array<int>& nextOutputs,
-                         float nextGain,
-                         std::vector<ClickBeat> nextBeatGrid,
-                         ClickSample nextClickSample,
-                         ClickSample nextAccentSample)
+    void setOutgoingSourcesUnlocked(std::vector<std::unique_ptr<StemSource>>* nextSources, int durationMs)
     {
-        bpm = nextBpm > 0.0 ? nextBpm : 120.0;
-        clickOutputChannels = nextOutputs;
-        clickGain = juce::jlimit(0.0f, 1.0f, nextGain);
-        beatGrid = std::move(nextBeatGrid);
-        clickSample = std::move(nextClickSample);
-        accentSample = std::move(nextAccentSample);
-        nextBeatIndex = 0;
-        elapsedSamples = 0;
-        samplesSinceClick = 0.0;
-        beatIndex = 0;
-        strongBeat = true;
-        clickPosition = -1.0;
-        accentPosition = -1.0;
+        outgoingSources = nextSources;
+        crossfadeTotalSamples = juce::jmax<int64_t>(1, static_cast<int64_t>((sampleRate * juce::jmax(1, durationMs)) / 1000.0));
+        crossfadeElapsedSamples = 0;
+        outgoingCrossfadeActive = outgoingSources != nullptr && ! outgoingSources->empty();
+        outgoingCrossfadeComplete.store(false);
+    }
+
+    void clearOutgoingSources()
+    {
+        std::lock_guard<std::mutex> lock(audioMutex);
+        clearOutgoingSourcesUnlocked();
+    }
+
+    void clearOutgoingSourcesUnlocked()
+    {
+        outgoingSources = nullptr;
+        outgoingCrossfadeActive = false;
+        crossfadeElapsedSamples = 0;
+        crossfadeTotalSamples = 1;
+        outgoingCrossfadeComplete.store(false);
+    }
+
+    bool isOutgoingCrossfadeComplete() const
+    {
+        return outgoingCrossfadeComplete.load();
     }
 
     void setDynamicCues(std::vector<DynamicCueEvent> nextCues, const juce::Array<int>& nextOutputs, float nextGain)
@@ -544,8 +562,6 @@ public:
                             float nextPadGain,
                             bool nextPadActive)
     {
-        clickOutputChannels = nextClickOutputs;
-        clickGain = juce::jlimit(0.0f, 1.0f, nextClickGain);
         dynamicCueOutputChannels = nextCueOutputs;
         dynamicCueGain = juce::jlimit(0.0f, 1.0f, nextCueGain);
         dynamicPadOutputChannels = nextPadOutputs;
@@ -558,14 +574,6 @@ public:
     void seekTo(double seconds)
     {
         elapsedSamples = static_cast<int64_t>(juce::jmax(0.0, seconds) * sampleRate);
-        samplesSinceClick = 0.0;
-        clickPosition = -1.0;
-        accentPosition = -1.0;
-        nextBeatIndex = 0;
-
-        while (nextBeatIndex < beatGrid.size() && beatGrid[nextBeatIndex].timeSeconds < seconds)
-            ++nextBeatIndex;
-
         for (auto& cue : dynamicCues)
         {
             cue.position = -1.0;
@@ -579,8 +587,6 @@ public:
         if (! paused)
             return;
 
-        clickPosition = -1.0;
-        accentPosition = -1.0;
         for (auto& cue : dynamicCues)
             cue.position = -1.0;
     }
@@ -592,12 +598,18 @@ public:
         if (sources != nullptr)
             for (auto& source : *sources)
                 source->transport->prepareToPlay(samplesPerBlockExpected, sampleRate);
+        if (outgoingSources != nullptr)
+            for (auto& source : *outgoingSources)
+                source->transport->prepareToPlay(samplesPerBlockExpected, sampleRate);
     }
 
     void releaseResources() override
     {
         if (sources != nullptr)
             for (auto& source : *sources)
+                source->transport->releaseResources();
+        if (outgoingSources != nullptr)
+            for (auto& source : *outgoingSources)
                 source->transport->releaseResources();
     }
 
@@ -613,58 +625,25 @@ public:
         if (paused)
             return;
 
-        if (sources != nullptr)
+        const auto crossfadeProgress = outgoingCrossfadeActive
+            ? juce::jlimit(0.0f, 1.0f, static_cast<float>(crossfadeElapsedSamples) / static_cast<float>(crossfadeTotalSamples))
+            : 1.0f;
+        const auto incomingGain = outgoingCrossfadeActive ? crossfadeProgress : 1.0f;
+        const auto outgoingGain = outgoingCrossfadeActive ? 1.0f - crossfadeProgress : 0.0f;
+
+        mixStemSources(*output, bufferToFill, sources, incomingGain);
+        mixStemSources(*output, bufferToFill, outgoingSources, outgoingGain);
+
+        if (outgoingCrossfadeActive)
         {
-            for (auto& source : *sources)
+            crossfadeElapsedSamples += bufferToFill.numSamples;
+            if (crossfadeElapsedSamples >= crossfadeTotalSamples)
             {
-                tempBuffer.setSize(juce::jmax(2, static_cast<int>(source->readerSource->getAudioFormatReader()->numChannels)),
-                                   bufferToFill.numSamples,
-                                   false,
-                                   false,
-                                   true);
-                tempBuffer.clear();
-                juce::AudioSourceChannelInfo tempInfo(&tempBuffer, 0, bufferToFill.numSamples);
-                source->transport->getNextAudioBlock(tempInfo);
-                auto peak = 0.0f;
-                for (int channel = 0; channel < tempBuffer.getNumChannels(); ++channel)
-                    peak = juce::jmax(peak, tempBuffer.getMagnitude(channel, 0, bufferToFill.numSamples));
-                const auto nextPeak = peak * source->baseGain;
-                const auto previousPeak = source->peakLevel.load();
-                source->peakLevel.store(juce::jmax(nextPeak, previousPeak * 0.88f));
-
-                for (int outputChannel : source->outputChannels)
-                {
-                    const auto zeroBasedOutput = outputChannel - 1;
-                    if (zeroBasedOutput < 0 || zeroBasedOutput >= output->getNumChannels())
-                        continue;
-
-                    const auto sourceChannel = source->outputChannels.size() > 1 && outputChannel == source->outputChannels[1] ? 1 : 0;
-                    output->addFrom(zeroBasedOutput,
-                                    bufferToFill.startSample,
-                                    tempBuffer,
-                                    juce::jmin(sourceChannel, tempBuffer.getNumChannels() - 1),
-                                    0,
-                                    bufferToFill.numSamples);
-                }
-
-                for (int outputChannel : source->iemOutputChannels)
-                {
-                    const auto zeroBasedOutput = outputChannel - 1;
-                    if (zeroBasedOutput < 0 || zeroBasedOutput >= output->getNumChannels())
-                        continue;
-
-                    const auto sourceChannel = source->iemOutputChannels.size() > 1 && outputChannel == source->iemOutputChannels[1] ? 1 : 0;
-                    output->addFrom(zeroBasedOutput,
-                                    bufferToFill.startSample,
-                                    tempBuffer,
-                                    juce::jmin(sourceChannel, tempBuffer.getNumChannels() - 1),
-                                    0,
-                                    bufferToFill.numSamples);
-                }
+                outgoingCrossfadeActive = false;
+                outgoingCrossfadeComplete.store(true);
             }
         }
 
-        addDynamicClick(*output, bufferToFill.startSample, bufferToFill.numSamples);
         addDynamicCues(*output, bufferToFill.startSample, bufferToFill.numSamples);
         addDynamicPad(*output, bufferToFill.startSample, bufferToFill.numSamples);
         elapsedSamples += bufferToFill.numSamples;
@@ -687,13 +666,71 @@ public:
             meters.push_back(std::move(meter));
         }
 
-        addDynamicMeter(meters, "dynamic-click", "Dynamic Click", dynamicClickPeakLevel);
         addDynamicMeter(meters, "dynamic-cue", "Dynamic Cue", dynamicCuePeakLevel);
         addDynamicMeter(meters, "dynamic-pad", "Dynamic Pad", dynamicPadPeakLevel);
         return meters;
     }
 
 private:
+    void mixStemSources(juce::AudioBuffer<float>& output,
+                        const juce::AudioSourceChannelInfo& bufferToFill,
+                        std::vector<std::unique_ptr<StemSource>>* stemSources,
+                        float gainMultiplier)
+    {
+        if (stemSources == nullptr || gainMultiplier <= 0.0f)
+            return;
+
+        for (auto& source : *stemSources)
+        {
+            tempBuffer.setSize(juce::jmax(2, static_cast<int>(source->readerSource->getAudioFormatReader()->numChannels)),
+                               bufferToFill.numSamples,
+                               false,
+                               false,
+                               true);
+            tempBuffer.clear();
+            juce::AudioSourceChannelInfo tempInfo(&tempBuffer, 0, bufferToFill.numSamples);
+            source->transport->getNextAudioBlock(tempInfo);
+            auto peak = 0.0f;
+            for (int channel = 0; channel < tempBuffer.getNumChannels(); ++channel)
+                peak = juce::jmax(peak, tempBuffer.getMagnitude(channel, 0, bufferToFill.numSamples));
+            const auto nextPeak = peak * source->baseGain * gainMultiplier;
+            const auto previousPeak = source->peakLevel.load();
+            source->peakLevel.store(juce::jmax(nextPeak, previousPeak * 0.88f));
+
+            for (int outputChannel : source->outputChannels)
+            {
+                const auto zeroBasedOutput = outputChannel - 1;
+                if (zeroBasedOutput < 0 || zeroBasedOutput >= output.getNumChannels())
+                    continue;
+
+                const auto sourceChannel = source->outputChannels.size() > 1 && outputChannel == source->outputChannels[1] ? 1 : 0;
+                output.addFrom(zeroBasedOutput,
+                               bufferToFill.startSample,
+                               tempBuffer,
+                               juce::jmin(sourceChannel, tempBuffer.getNumChannels() - 1),
+                               0,
+                               bufferToFill.numSamples,
+                               gainMultiplier);
+            }
+
+            for (int outputChannel : source->iemOutputChannels)
+            {
+                const auto zeroBasedOutput = outputChannel - 1;
+                if (zeroBasedOutput < 0 || zeroBasedOutput >= output.getNumChannels())
+                    continue;
+
+                const auto sourceChannel = source->iemOutputChannels.size() > 1 && outputChannel == source->iemOutputChannels[1] ? 1 : 0;
+                output.addFrom(zeroBasedOutput,
+                               bufferToFill.startSample,
+                               tempBuffer,
+                               juce::jmin(sourceChannel, tempBuffer.getNumChannels() - 1),
+                               0,
+                               bufferToFill.numSamples,
+                               gainMultiplier);
+            }
+        }
+    }
+
     void addDynamicMeter(std::vector<StemMeterSnapshot>& meters,
                          const juce::String& id,
                          const juce::String& name,
@@ -706,40 +743,6 @@ private:
         meter.level = juce::jlimit(0.0f, 1.0f, currentPeak);
         level.store(currentPeak * 0.82f);
         meters.push_back(std::move(meter));
-    }
-
-    void addDynamicClick(juce::AudioBuffer<float>& output, int startSample, int numSamples)
-    {
-        if (clickOutputChannels.isEmpty() || bpm <= 0.0 || sampleRate <= 0.0 || (! clickSample.isReady() && ! accentSample.isReady()))
-            return;
-
-        const auto samplesPerBeat = sampleRate * 60.0 / bpm;
-
-        if (beatGrid.empty() && elapsedSamples == 0 && samplesSinceClick == 0.0)
-            triggerClickSample(true);
-
-        for (int sample = 0; sample < numSamples; ++sample)
-        {
-            triggerGridClickIfNeeded(sample);
-            const auto level = nextClickSampleValue() * clickGain;
-            dynamicClickPeakLevel.store(juce::jmax(dynamicClickPeakLevel.load(), std::abs(level)));
-
-            for (int outputChannel : clickOutputChannels)
-            {
-                const auto zeroBasedOutput = outputChannel - 1;
-                if (zeroBasedOutput >= 0 && zeroBasedOutput < output.getNumChannels())
-                    output.addSample(zeroBasedOutput, startSample + sample, level);
-            }
-
-            samplesSinceClick += 1.0;
-            if (beatGrid.empty() && samplesSinceClick >= samplesPerBeat)
-            {
-                samplesSinceClick -= samplesPerBeat;
-                beatIndex = (beatIndex + 1) % 4;
-                strongBeat = beatIndex == 0;
-                triggerClickSample(strongBeat);
-            }
-        }
     }
 
     void addDynamicCues(juce::AudioBuffer<float>& output, int startSample, int numSamples)
@@ -772,7 +775,7 @@ private:
                 level += nextSampleValue(cue.sample, cue.position);
             }
 
-            level *= dynamicCueGain;
+            level = limitGeneratedCueLevel(level * dynamicCueGain);
             dynamicCuePeakLevel.store(juce::jmax(dynamicCuePeakLevel.load(), std::abs(level)));
 
             if (level == 0.0f)
@@ -811,41 +814,6 @@ private:
                     output.addSample(zeroBasedOutput, startSample + sample, level);
             }
         }
-    }
-
-    void triggerGridClickIfNeeded(int sample)
-    {
-        if (beatGrid.empty())
-            return;
-
-        const auto currentTimeSeconds = static_cast<double>(elapsedSamples + sample) / sampleRate;
-        while (nextBeatIndex < beatGrid.size() && currentTimeSeconds >= beatGrid[nextBeatIndex].timeSeconds)
-        {
-            samplesSinceClick = 0.0;
-            strongBeat = beatGrid[nextBeatIndex].strong;
-            triggerClickSample(strongBeat);
-            ++nextBeatIndex;
-        }
-    }
-
-    void triggerClickSample(bool accent)
-    {
-        if (accent && accentSample.isReady())
-        {
-            accentPosition = 0.0;
-            return;
-        }
-
-        if (clickSample.isReady())
-            clickPosition = 0.0;
-    }
-
-    float nextClickSampleValue()
-    {
-        float value = 0.0f;
-        value += nextSampleValue(accentSample, accentPosition);
-        value += nextSampleValue(clickSample, clickPosition);
-        return value;
     }
 
     float nextSampleValue(const ClickSample& sample, double& position)
@@ -891,33 +859,25 @@ private:
     }
 
     std::vector<std::unique_ptr<StemSource>>* sources = nullptr;
+    std::vector<std::unique_ptr<StemSource>>* outgoingSources = nullptr;
     juce::AudioBuffer<float> tempBuffer;
-    juce::Array<int> clickOutputChannels;
     juce::Array<int> dynamicCueOutputChannels;
     juce::Array<int> dynamicPadOutputChannels;
-    std::vector<ClickBeat> beatGrid;
     std::vector<DynamicCueEvent> dynamicCues;
-    ClickSample clickSample;
-    ClickSample accentSample;
     ClickSample dynamicPadSample;
     double sampleRate = 48000.0;
-    double bpm = 120.0;
-    double samplesSinceClick = 0.0;
-    double clickPosition = -1.0;
-    double accentPosition = -1.0;
     double dynamicPadPosition = 0.0;
-    float clickGain = 0.8f;
     float dynamicCueGain = 0.8f;
     float dynamicPadGain = 0.8f;
     bool suppressScheduledDynamicCues = false;
     juce::String allowedScheduledCuePrefix;
-    std::atomic<float> dynamicClickPeakLevel { 0.0f };
     std::atomic<float> dynamicCuePeakLevel { 0.0f };
     std::atomic<float> dynamicPadPeakLevel { 0.0f };
     int64_t elapsedSamples = 0;
-    size_t nextBeatIndex = 0;
-    int beatIndex = 0;
-    bool strongBeat = true;
+    int64_t crossfadeTotalSamples = 1;
+    int64_t crossfadeElapsedSamples = 0;
+    std::atomic<bool> outgoingCrossfadeComplete { false };
+    bool outgoingCrossfadeActive = false;
     bool paused = false;
     bool dynamicPadActive = false;
 };
@@ -930,6 +890,7 @@ struct PlaybackSession
     RoutedPlaybackSource routedSource;
     juce::AudioSourcePlayer sourcePlayer;
     std::vector<std::unique_ptr<StemSource>> sources;
+    std::vector<std::unique_ptr<StemSource>> outgoingSources;
     juce::String title;
     int slot = 0;
     int stemCount = 0;
@@ -956,6 +917,8 @@ struct PlaybackSession
         routedSource.setPaused(true);
         manager.removeAudioCallback(&sourcePlayer);
         sourcePlayer.setSource(nullptr);
+        routedSource.clearOutgoingSources();
+        outgoingSources.clear();
         sources.clear();
         active = false;
         paused = false;
@@ -973,6 +936,8 @@ struct PlaybackSession
             source->transport->setPosition(pausedPositionSeconds);
             source->transport->stop();
         }
+        for (auto& source : outgoingSources)
+            source->transport->stop();
 
         routedSource.setPaused(true);
         paused = true;
@@ -985,6 +950,8 @@ struct PlaybackSession
             source->transport->setPosition(pausedPositionSeconds);
             source->transport->start();
         }
+        for (auto& source : outgoingSources)
+            source->transport->start();
 
         routedSource.seekTo(pausedPositionSeconds);
         routedSource.setPaused(false);
@@ -996,6 +963,8 @@ struct PlaybackSession
         const auto target = juce::jmax(0.0, seconds);
         pausedPositionSeconds = target;
         for (auto& source : sources)
+            source->transport->setPosition(target);
+        for (auto& source : outgoingSources)
             source->transport->setPosition(target);
 
         routedSource.seekTo(target);
@@ -1084,6 +1053,15 @@ struct PlaybackSession
                 break;
             }
         }
+    }
+
+    void cleanupOutgoingCrossfadeIfComplete()
+    {
+        if (! routedSource.isOutgoingCrossfadeComplete())
+            return;
+
+        routedSource.clearOutgoingSources();
+        outgoingSources.clear();
     }
 
     void applyDynamicMixer(juce::DynamicObject* dynamicClick, juce::DynamicObject* dynamicCue, juce::DynamicObject* dynamicPad)
@@ -1223,20 +1201,6 @@ int maxChannelInRoute(const juce::Array<int>& channels)
     return maxChannel;
 }
 
-double readSongBpm(juce::DynamicObject* song)
-{
-    auto* dynamicClick = song != nullptr ? song->getProperty("dynamicClick").getDynamicObject() : nullptr;
-    auto* tempoMap = dynamicClick != nullptr ? dynamicClick->getProperty("tempoMap").getDynamicObject() : nullptr;
-    const auto bpm = tempoMap != nullptr ? static_cast<double>(tempoMap->getProperty("bpm")) : 0.0;
-    return bpm > 0.0 ? bpm : 120.0;
-}
-
-juce::String readDynamicClickPath(juce::DynamicObject* song, const juce::Identifier& property)
-{
-    auto* dynamicClick = song != nullptr ? song->getProperty("dynamicClick").getDynamicObject() : nullptr;
-    return dynamicClick != nullptr ? dynamicClick->getProperty(property).toString() : juce::String();
-}
-
 juce::String readDynamicPadPath(juce::DynamicObject* song)
 {
     auto* dynamicPad = song != nullptr ? song->getProperty("dynamicPad").getDynamicObject() : nullptr;
@@ -1266,74 +1230,6 @@ ClickSample loadClickSample(juce::AudioFormatManager& formatManager, const juce:
         sample.buffer.addFrom(0, 0, sourceBuffer, channel, 0, sourceBuffer.getNumSamples(), 1.0f / static_cast<float>(sourceBuffer.getNumChannels()));
 
     return sample;
-}
-
-std::vector<ClickBeat> readSongClickGrid(juce::DynamicObject* song)
-{
-    std::vector<ClickBeat> beats;
-    auto* dynamicClick = song != nullptr ? song->getProperty("dynamicClick").getDynamicObject() : nullptr;
-    auto* clickEvents = dynamicClick != nullptr ? dynamicClick->getProperty("clickEvents").getArray() : nullptr;
-
-    if (clickEvents != nullptr && ! clickEvents->isEmpty())
-    {
-        for (auto& eventValue : *clickEvents)
-        {
-            auto* eventObject = eventValue.getDynamicObject();
-            if (eventObject == nullptr)
-                continue;
-
-            const auto timeSeconds = static_cast<double>(eventObject->getProperty("timeSeconds"));
-            if (timeSeconds < 0.0)
-                continue;
-
-            ClickBeat beat;
-            beat.timeSeconds = timeSeconds;
-            beat.strong = eventObject->getProperty("type").toString() == "accent";
-            beats.push_back(beat);
-        }
-
-        std::sort(beats.begin(), beats.end(), [](const ClickBeat& left, const ClickBeat& right) {
-            return left.timeSeconds < right.timeSeconds;
-        });
-        return beats;
-    }
-
-    auto* tempoMap = dynamicClick != nullptr ? dynamicClick->getProperty("tempoMap").getDynamicObject() : nullptr;
-    auto* beatGrid = tempoMap != nullptr ? tempoMap->getProperty("beatGrid").getArray() : nullptr;
-    auto* pattern = dynamicClick != nullptr ? dynamicClick->getProperty("pattern").getArray() : nullptr;
-    const auto hasPattern = pattern != nullptr && ! pattern->isEmpty();
-    int patternIndex = 0;
-
-    if (beatGrid == nullptr)
-        return beats;
-
-    for (auto& beatValue : *beatGrid)
-    {
-        auto* beatObject = beatValue.getDynamicObject();
-        if (beatObject == nullptr)
-            continue;
-
-        const auto timeSeconds = static_cast<double>(beatObject->getProperty("timeSeconds"));
-        if (timeSeconds < 0.0)
-            continue;
-
-        ClickBeat beat;
-        beat.timeSeconds = timeSeconds;
-        if (hasPattern)
-        {
-            const auto patternValue = pattern->getReference(patternIndex % pattern->size()).toString();
-            beat.strong = patternValue == "accent";
-            ++patternIndex;
-        }
-        else
-        {
-            beat.strong = static_cast<bool>(beatObject->getProperty("isDownbeat"))
-                || static_cast<int>(beatObject->getProperty("beat")) == 1;
-        }
-        beats.push_back(beat);
-    }
-
-    return beats;
 }
 
 std::vector<DynamicCueEvent> readSongDynamicCues(juce::DynamicObject* song, juce::AudioFormatManager& formatManager)
@@ -1373,9 +1269,12 @@ void sendPlaybackResult(PlaybackSession& session,
                         const juce::String& deviceName,
                         const juce::String& deviceType,
                         double startSeconds,
-                        double requestedSampleRate)
+                        double requestedSampleRate,
+                        int crossfadeDurationMs,
+                        bool startPaused)
 {
     const bool reuseRunningSession = session.active && session.manager.getCurrentAudioDevice() != nullptr;
+    const bool crossfadeRunningSession = reuseRunningSession && crossfadeDurationMs > 0;
     if (! reuseRunningSession)
         session.stop();
     const auto playbackStartSeconds = juce::jmax(0.0, startSeconds);
@@ -1492,7 +1391,8 @@ void sendPlaybackResult(PlaybackSession& session,
         source->transport->setGain(anySolo && ! source->solo ? 0.0f : source->baseGain);
         if (playbackStartSeconds > 0.0)
             source->transport->setPosition(playbackStartSeconds);
-        source->transport->start();
+        if (! startPaused)
+            source->transport->start();
         nextSources.push_back(std::move(source));
     }
 
@@ -1502,19 +1402,28 @@ void sendPlaybackResult(PlaybackSession& session,
         return;
     }
 
-    auto clickSample = loadClickSample(session.formatManager, readDynamicClickPath(song, juce::Identifier("clickSoundPath")));
-    auto accentSample = loadClickSample(session.formatManager, readDynamicClickPath(song, juce::Identifier("accentSoundPath")));
     auto dynamicPadSample = loadClickSample(session.formatManager, readDynamicPadPath(song));
 
     if (reuseRunningSession)
     {
         std::lock_guard<std::mutex> lock(session.routedSource.audioMutex);
-        for (auto& source : session.sources)
-            source->transport->stop();
+        if (crossfadeRunningSession)
+        {
+            session.routedSource.clearOutgoingSourcesUnlocked();
+            session.outgoingSources = std::move(session.sources);
+            session.routedSource.setOutgoingSourcesUnlocked(&session.outgoingSources, crossfadeDurationMs);
+        }
+        else
+        {
+            for (auto& source : session.sources)
+                source->transport->stop();
+            session.routedSource.clearOutgoingSourcesUnlocked();
+            session.outgoingSources.clear();
+        }
         session.sources = std::move(nextSources);
-        session.routedSource.setDynamicClick(readSongBpm(song), clickOutputs, clickGain, readSongClickGrid(song), std::move(clickSample), std::move(accentSample));
+        session.routedSource.setSourcesUnlocked(&session.sources);
         session.routedSource.setDynamicCues(readSongDynamicCues(song, session.formatManager), dynamicCueOutputs, dynamicCueGain);
-        session.routedSource.setPaused(false);
+        session.routedSource.setPaused(startPaused);
         if (playbackStartSeconds > 0.0)
             session.routedSource.seekTo(playbackStartSeconds);
     }
@@ -1522,17 +1431,17 @@ void sendPlaybackResult(PlaybackSession& session,
     {
         session.sources = std::move(nextSources);
         session.routedSource.setSources(&session.sources);
-        session.routedSource.setDynamicClick(readSongBpm(song), clickOutputs, clickGain, readSongClickGrid(song), std::move(clickSample), std::move(accentSample));
         session.routedSource.setDynamicCues(readSongDynamicCues(song, session.formatManager), dynamicCueOutputs, dynamicCueGain);
         session.routedSource.setDynamicPad(dynamicPadOutputs, dynamicPadGain, std::move(dynamicPadSample));
-        session.routedSource.setPaused(false);
+        session.routedSource.setPaused(startPaused);
         session.sourcePlayer.setSource(&session.routedSource);
         if (playbackStartSeconds > 0.0)
             session.routedSource.seekTo(playbackStartSeconds);
         session.manager.addAudioCallback(&session.sourcePlayer);
     }
     session.active = true;
-    session.paused = false;
+    session.paused = startPaused;
+    session.pausedPositionSeconds = playbackStartSeconds;
     session.slot = slot;
     session.title = song->getProperty("title").toString();
     session.stemCount = static_cast<int>(session.sources.size());
@@ -1549,6 +1458,7 @@ void sendPlaybackResult(PlaybackSession& session,
     response->setProperty("title", session.title);
     response->setProperty("stemCount", session.stemCount);
     response->setProperty("currentPositionSeconds", playbackStartSeconds);
+    response->setProperty("paused", startPaused);
     writeJsonLine(juce::var(response.get()));
 }
 
@@ -1574,6 +1484,7 @@ void sendSessionAccepted(const juce::String& requestId, const juce::String& type
 
 void sendMeterSnapshot(const juce::String& requestId, PlaybackSession& session)
 {
+    session.cleanupOutgoingCrossfadeIfComplete();
     auto response = makeBaseResponse("meterUpdate", requestId);
     response->setProperty("nativeAudioActive", session.active);
     response->setProperty("slot", session.slot);
@@ -1645,7 +1556,9 @@ int runCommand(PlaybackSession& session, const juce::String& line)
         const auto slot = juce::jmax(1, static_cast<int>(object->getProperty("slot")));
         const auto startSeconds = juce::jmax(0.0, static_cast<double>(object->getProperty("startSeconds")));
         const auto requestedSampleRate = juce::jmax(0.0, static_cast<double>(object->getProperty("sampleRate")));
-        sendPlaybackResult(session, requestId, manifestPath, slot, deviceName, deviceType, startSeconds, requestedSampleRate);
+        const auto crossfadeDurationMs = juce::jmax(0, static_cast<int>(object->getProperty("crossfadeDurationMs")));
+        const auto startPaused = static_cast<bool>(object->getProperty("startPaused"));
+        sendPlaybackResult(session, requestId, manifestPath, slot, deviceName, deviceType, startSeconds, requestedSampleRate, crossfadeDurationMs, startPaused);
         return 0;
     }
 

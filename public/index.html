@@ -53,6 +53,7 @@
 
         <section class="setlist-row-shell layout-section" aria-label="Current set">
           <div id="setlistSlots" class="setlist-slots" aria-label="Setlist slots"></div>
+          <div id="transitionEditorDock" class="transition-editor-dock hidden" aria-label="Transition editor"></div>
         </section>
 
         <section class="selected-song-surface">
@@ -101,8 +102,9 @@
               </div>
               <button id="createRegionFromSelectionButton" type="button" disabled>Create Region</button>
               <button id="undoCueMoveButton" type="button" disabled>Undo Edit</button>
-              <label class="timeline-snap-control">Snap
+                <label class="timeline-snap-control">Snap
                 <select id="timelineSnapSelect" aria-label="Timeline snap">
+                  <option value="free">Free</option>
                   <option value="beat">Beats</option>
                   <option value="measure" selected>Measures</option>
                 </select>
@@ -143,7 +145,7 @@
           </section>
 
           <section id="editorPanel" class="editor-panel layout-section hidden">
-            <div class="editor-card playback-key-card">
+            <div class="editor-card playback-key-card editor-card-compact">
               <div class="panel-title">
                 <strong>Playback Key</strong>
                 <span id="playbackKeyStatus">Selected song key and matching dynamic pad.</span>
@@ -152,27 +154,33 @@
                 <label>Setlist Key
                   <select id="playbackKeySelect"></select>
                 </label>
+                <label>Dynamic Pad
+                  <select id="playbackPadSelect"></select>
+                </label>
                 <span id="playbackKeyOriginal">Original: --</span>
                 <span id="playbackKeyTranspose">Transpose: 0 cents</span>
+                <span id="playbackPadStatus">Pad: auto</span>
               </div>
             </div>
 
-            <div class="editor-card">
+            <div class="editor-card editor-card-compact">
               <div class="panel-title">
                 <strong>Tempo Map</strong>
                 <span>Draft edits preview in Edit mode and are saved on Confirm Set.</span>
               </div>
               <div class="inline-form">
                 <label>Key <input id="tempoKeyInput" type="text" placeholder="G"></label>
-                <label>BPM <input id="tempoBpmInput" type="number" min="1" step="0.01"></label>
+                <label>BPM <input id="tempoBpmInput" type="number" min="1" max="300" step="1" inputmode="numeric"></label>
                 <label>Time Sig <input id="tempoTimeSignatureInput" type="text" placeholder="4/4"></label>
                 <button id="saveMetadataButton" type="button">Save Draft</button>
                 <button id="approveMetadataButton" type="button">Approve Cue/Regions</button>
               </div>
               <div class="inline-form audio-align-form">
-                <button id="alignAudioStartButton" type="button">Move Audio Start Here</button>
+                <button id="setAudioAlignSourceButton" type="button">Set Source</button>
+                <button id="setAudioAlignTargetButton" type="button">Set Target</button>
+                <button id="alignAudioStartButton" type="button">Apply Move</button>
                 <button id="resetAudioAlignmentButton" type="button">Reset Audio Shift</button>
-                <span id="audioAlignmentStatus">Audio shift: 0.000s</span>
+                <span id="audioAlignmentStatus">Shift: 0.000s | Source: -- | Target: --</span>
               </div>
             </div>
 
@@ -381,17 +389,8 @@
             <label>Pad Fade Out Ms
               <input id="padsFadeOutInput" type="number" min="0" step="100">
             </label>
-            <label>Dynamic Click WAV
-              <span class="path-picker">
-                <input id="dynamicClickSoundInput" type="text" placeholder="Path to normal click WAV">
-                <button type="button" data-wav-picker="dynamicClickSoundInput">Browse</button>
-              </span>
-            </label>
-            <label>Dynamic Click Accent WAV
-              <span class="path-picker">
-                <input id="dynamicClickAccentInput" type="text" placeholder="Path to accent click WAV">
-                <button type="button" data-wav-picker="dynamicClickAccentInput">Browse</button>
-              </span>
+            <label>Dynamic Click Patterns
+              <input id="dynamicClickPatternFolderInput" type="text" value="D:\PlaybackAppV2\click-patterns" readonly>
             </label>
           </div>
         </section>
@@ -421,6 +420,7 @@
               <button id="allowRemoteFirewallButton" type="button">Allow Phone / Tablet</button>
             </div>
             <p id="remoteFirewallStatus" class="settings-help">Windows may request administrator approval to allow local-network access.</p>
+            <div id="remoteLinkCards" class="remote-link-cards"></div>
             <div id="remoteUrlList" class="remote-url-list"></div>
           </div>
         </section>
@@ -432,6 +432,37 @@
             <div id="cueAnalyzerStatus" class="settings-readout">
               <span>Cue Recognizer</span>
               <strong>Checking...</strong>
+            </div>
+            <label class="setting-checkbox">
+              <input id="proPresenterMidiEnabledInput" type="checkbox">
+              <span>Send ProPresenter Slide MIDI</span>
+            </label>
+            <label>ProPresenter MIDI Output
+              <select id="proPresenterMidiOutputSelect"></select>
+            </label>
+            <div class="settings-row">
+              <label>MIDI Channel
+                <input id="proPresenterMidiChannelInput" type="number" min="1" max="16" step="1">
+              </label>
+              <label>Next Slide Note
+                <input id="proPresenterMidiNoteInput" type="number" min="0" max="127" step="1">
+              </label>
+            </div>
+            <div class="settings-row">
+              <label>Velocity
+                <input id="proPresenterMidiVelocityInput" type="number" min="1" max="127" step="1">
+              </label>
+              <label>Note Length Ms
+                <input id="proPresenterMidiLengthInput" type="number" min="20" max="1000" step="10">
+              </label>
+            </div>
+            <div class="remote-actions">
+              <button id="refreshMidiDevicesButton" type="button">Refresh MIDI Devices</button>
+              <button id="testMidiSlideButton" type="button">Test Next Slide</button>
+            </div>
+            <div id="proPresenterMidiStatus" class="settings-readout">
+              <span>MIDI Status</span>
+              <strong>Not scanned</strong>
             </div>
             <div id="cueRecognitionReport" class="cue-recognition-report"></div>
           </div>

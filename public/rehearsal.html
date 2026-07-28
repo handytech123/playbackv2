@@ -5,11 +5,11 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="theme-color" content="#080b0d">
   <meta name="mobile-web-app-capable" content="yes">
-  <title>Playback Remote</title>
-  <link rel="stylesheet" href="/remote.css?v=20260728-md-remote-1">
+  <title>Playback Rehearsal Remote</title>
+  <link rel="stylesheet" href="/remote.css?v=20260728-rehearsal-2">
 </head>
-<body>
-  <main class="remote-shell">
+<body data-remote-flavor="rehearsal">
+  <main class="remote-shell rehearsal-shell">
     <header class="top-bar">
       <div class="compact-readout">
         <strong id="tempoReadout">--</strong>
@@ -45,7 +45,7 @@
     <section class="setlist-strip">
       <div class="setlist-title">
         <span id="modeStatus">Mode --</span>
-        <strong>Current Set</strong>
+        <strong>Rehearsal Remote</strong>
       </div>
       <div id="setlistCards" class="setlist-cards"></div>
       <div id="transitionReadout" class="transition-readout">
@@ -71,6 +71,15 @@
       </div>
     </section>
 
+    <section id="rehearsalPanel" class="rehearsal-panel">
+      <div>
+        <span>Rehearsal Start</span>
+        <strong id="selectedSectionName">No section selected</strong>
+        <small id="selectedSectionLocation">Tap waveform or section to move playhead</small>
+      </div>
+      <button id="clearRehearsalSelectionButton" class="command" type="button">Clear</button>
+    </section>
+
     <section class="command-grid live">
       <button class="command warn" type="button" data-region-command="repeatRegion">Repeat 1</button>
       <button class="command warn" type="button" data-region-command="loopRegion">Loop</button>
@@ -82,7 +91,7 @@
     <section class="sections-panel">
       <div class="panel-title">
         <strong>Sections</strong>
-        <span id="sectionHint">tap to queue jump</span>
+        <span id="sectionHint">tap section to select</span>
       </div>
       <div class="section-controls">
         <div class="segmented" aria-label="Jump mode">
@@ -100,6 +109,6 @@
       <span id="lastMessage">Ready</span>
     </footer>
   </main>
-  <script src="/remote.js?v=20260728-remote-card-switch-1"></script>
+  <script src="/remote.js?v=20260728-rehearsal-card-switch-1"></script>
 </body>
 </html>

@@ -1,9 +1,10 @@
-const { app, BrowserWindow, dialog, ipcMain } = require("electron");
+const { app, BrowserWindow, dialog, ipcMain, Menu, shell } = require("electron");
 const { spawn } = require("node:child_process");
 const http = require("node:http");
 const net = require("node:net");
 const fs = require("node:fs");
 const path = require("node:path");
+const zlib = require("node:zlib");
 
 let mainWindow;
 let serverProcess;
@@ -12,6 +13,7 @@ let logFile;
 
 app.commandLine.appendSwitch("high-dpi-support", "1");
 app.commandLine.appendSwitch("enable-gpu-rasterization");
+app.commandLine.appendSwitch("enable-features", "WebMidi");
 
 const singleInstanceLock = app.requestSingleInstanceLock();
 if (!singleInstanceLock) {
@@ -54,10 +56,24 @@ async function createWindow() {
     }
   });
 
-  mainWindow.removeMenu();
+  installApplicationMenu();
+  mainWindow.webContents.session.setPermissionRequestHandler((_webContents, permission, callback) => {
+    if (permission === "midi") {
+      callback(true);
+      return;
+    }
+    if (permission === "midiSysex") {
+      callback(false);
+      return;
+    }
+    callback(false);
+  });
   mainWindow.webContents.on("before-input-event", (event, input) => {
     const key = String(input.key || "").toLowerCase();
-    if (input.key === "F5" || ((input.control || input.meta) && key === "r")) {
+    if (input.key === "F5") {
+      event.preventDefault();
+      sendMenuCommand("reloadData");
+    } else if ((input.control || input.meta) && key === "r") {
       event.preventDefault();
       mainWindow.reload();
     }
@@ -66,6 +82,111 @@ async function createWindow() {
     mainWindow.show();
   });
   await mainWindow.loadURL(appUrl);
+}
+
+function installApplicationMenu() {
+  const template = [
+    {
+      label: "File",
+      submenu: [
+        menuCommand("Export Set Package", "exportSetPackage"),
+        menuCommand("Import Set Package", "importSetPackage"),
+        { type: "separator" },
+        menuCommand("Save Draft", "saveDraft"),
+        menuCommand("Confirm Set", "confirmSet"),
+        { type: "separator" },
+        { label: "Exit", role: "quit" }
+      ]
+    },
+    {
+      label: "Edit",
+      submenu: [
+        menuCommand("Undo", "undo"),
+        { type: "separator" },
+        menuCommand("Split At Playhead", "splitAtPlayhead"),
+        menuCommand("Delete Selection", "deleteSelection"),
+        menuCommand("Remove + Close Gap", "removeCloseGap")
+      ]
+    },
+    {
+      label: "View",
+      submenu: [
+        menuCommand("Reload App Data", "reloadData", "F5"),
+        { type: "separator" },
+        menuCommand("Toggle Mixer", "toggleMixer", "Ctrl+M"),
+        menuCommand("Reset Mixer Height", "resetMixerHeight"),
+        { type: "separator" },
+        menuCommand("Zoom In", "zoomIn", "Ctrl+="),
+        menuCommand("Zoom Out", "zoomOut", "Ctrl+-")
+      ]
+    },
+    {
+      label: "Library",
+      submenu: [
+        menuCommand("Refresh Library", "refreshLibrary"),
+        menuCommand("Open Library Settings", "openLibrarySettings")
+      ]
+    },
+    {
+      label: "Playback",
+      submenu: [
+        menuCommand("Play", "play"),
+        menuCommand("Pause", "pause"),
+        menuCommand("Stop", "stop"),
+        menuCommand("Return To Start", "seek", "Home"),
+        { type: "separator" },
+        menuCommand("Cue Next", "songTransition"),
+        menuCommand("Test ProPresenter Next Slide", "testProPresenterMidi"),
+        menuCommand("Toggle Pad", "togglePad"),
+        menuCommand("Panic", "panic")
+      ]
+    },
+    {
+      label: "Audio",
+      submenu: [
+        menuCommand("Audio & Routing Settings", "openAudioSettings"),
+        menuCommand("Refresh Audio Devices", "refreshAudioDevices"),
+        menuCommand("Open Dante Matrix", "openDanteMatrix")
+      ]
+    },
+    {
+      label: "Help",
+      submenu: [
+        {
+          label: "Open App Data Folder",
+          click: () => shell.openPath(appDataDir())
+        },
+        {
+          label: "Show Logs",
+          click: () => shell.openPath(path.dirname(logFile || path.join(appDataDir(), "logs", "electron.log")))
+        },
+        { type: "separator" },
+        {
+          label: "About Playback App V2",
+          click: () => dialog.showMessageBox(mainWindow, {
+            type: "info",
+            title: "About Playback App V2",
+            message: "Playback App V2",
+            detail: `Version ${app.getVersion()}\nData: ${appDataDir()}`
+          })
+        }
+      ]
+    }
+  ];
+  Menu.setApplicationMenu(Menu.buildFromTemplate(template));
+}
+
+function menuCommand(label, command, accelerator) {
+  return {
+    label,
+    accelerator,
+    click: () => sendMenuCommand(command)
+  };
+}
+
+function sendMenuCommand(command) {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  mainWindow.webContents.send("menu:command", command);
 }
 
 ipcMain.handle("dialog:select-wav-file", async () => {
@@ -87,6 +208,44 @@ ipcMain.handle("dialog:select-folder", async () => {
   });
 
   return result.canceled ? "" : result.filePaths[0];
+});
+
+ipcMain.handle("set-package:save", async (_event, packagePayload) => {
+  const safeDate = new Date().toISOString().slice(0, 10);
+  const title = String(packagePayload?.summary?.titles?.[0] || "set").replace(/[<>:"/\\|?*]+/g, "-").slice(0, 48);
+  const result = await dialog.showSaveDialog(mainWindow, {
+    title: "Export Set Package",
+    defaultPath: path.join(defaultPackageFolder(), `${safeDate}-${title}.playbackset.zip`),
+    filters: [
+      { name: "Playback Set Package", extensions: ["zip"] },
+      { name: "Zip files", extensions: ["zip"] }
+    ]
+  });
+  if (result.canceled || !result.filePath) return { ok: false, canceled: true };
+  const zip = createSingleFileZip("playback-set-package.json", `${JSON.stringify(packagePayload, null, 2)}\n`);
+  fs.mkdirSync(path.dirname(result.filePath), { recursive: true });
+  fs.writeFileSync(result.filePath, zip);
+  return { ok: true, filePath: result.filePath };
+});
+
+ipcMain.handle("set-package:open", async () => {
+  const result = await dialog.showOpenDialog(mainWindow, {
+    title: "Import Set Package",
+    defaultPath: defaultPackageFolder(),
+    properties: ["openFile"],
+    filters: [
+      { name: "Playback Set Package", extensions: ["zip"] },
+      { name: "Zip files", extensions: ["zip"] },
+      { name: "JSON files", extensions: ["json"] }
+    ]
+  });
+  if (result.canceled || !result.filePaths[0]) return { ok: false, canceled: true };
+  const filePath = result.filePaths[0];
+  const buffer = fs.readFileSync(filePath);
+  const text = filePath.toLowerCase().endsWith(".json")
+    ? buffer.toString("utf8")
+    : readSingleFileZip(buffer, "playback-set-package.json");
+  return { ok: true, filePath, package: JSON.parse(text.replace(/^\uFEFF/, "")) };
 });
 
 ipcMain.handle("remote:configure-firewall", async () => {
@@ -284,6 +443,102 @@ function migratePackagedDataDir(nextDataDir) {
     log(`Data migration skipped: ${error.message}`);
   }
 }
+
+function defaultPackageFolder() {
+  const worshipFolder = "D:\\Dropbox\\Worship";
+  return fs.existsSync(worshipFolder) ? worshipFolder : app.getPath("documents");
+}
+
+function createSingleFileZip(fileName, text) {
+  const name = Buffer.from(fileName, "utf8");
+  const source = Buffer.from(text, "utf8");
+  const compressed = zlib.deflateRawSync(source);
+  const crc = crc32(source);
+  const local = Buffer.alloc(30);
+  local.writeUInt32LE(0x04034b50, 0);
+  local.writeUInt16LE(20, 4);
+  local.writeUInt16LE(0, 6);
+  local.writeUInt16LE(8, 8);
+  local.writeUInt16LE(0, 10);
+  local.writeUInt16LE(0, 12);
+  local.writeUInt32LE(crc, 14);
+  local.writeUInt32LE(compressed.length, 18);
+  local.writeUInt32LE(source.length, 22);
+  local.writeUInt16LE(name.length, 26);
+  local.writeUInt16LE(0, 28);
+  const localRecord = Buffer.concat([local, name, compressed]);
+  const central = Buffer.alloc(46);
+  central.writeUInt32LE(0x02014b50, 0);
+  central.writeUInt16LE(20, 4);
+  central.writeUInt16LE(20, 6);
+  central.writeUInt16LE(0, 8);
+  central.writeUInt16LE(8, 10);
+  central.writeUInt16LE(0, 12);
+  central.writeUInt16LE(0, 14);
+  central.writeUInt32LE(crc, 16);
+  central.writeUInt32LE(compressed.length, 20);
+  central.writeUInt32LE(source.length, 24);
+  central.writeUInt16LE(name.length, 28);
+  central.writeUInt16LE(0, 30);
+  central.writeUInt16LE(0, 32);
+  central.writeUInt16LE(0, 34);
+  central.writeUInt16LE(0, 36);
+  central.writeUInt32LE(0, 38);
+  central.writeUInt32LE(0, 42);
+  const centralRecord = Buffer.concat([central, name]);
+  const end = Buffer.alloc(22);
+  end.writeUInt32LE(0x06054b50, 0);
+  end.writeUInt16LE(0, 4);
+  end.writeUInt16LE(0, 6);
+  end.writeUInt16LE(1, 8);
+  end.writeUInt16LE(1, 10);
+  end.writeUInt32LE(centralRecord.length, 12);
+  end.writeUInt32LE(localRecord.length, 16);
+  end.writeUInt16LE(0, 20);
+  return Buffer.concat([localRecord, centralRecord, end]);
+}
+
+function readSingleFileZip(buffer, expectedName) {
+  let offset = 0;
+  while (offset + 30 <= buffer.length) {
+    if (buffer.readUInt32LE(offset) !== 0x04034b50) break;
+    const method = buffer.readUInt16LE(offset + 8);
+    const compressedSize = buffer.readUInt32LE(offset + 18);
+    const fileNameLength = buffer.readUInt16LE(offset + 26);
+    const extraLength = buffer.readUInt16LE(offset + 28);
+    const nameStart = offset + 30;
+    const name = buffer.subarray(nameStart, nameStart + fileNameLength).toString("utf8");
+    const dataStart = nameStart + fileNameLength + extraLength;
+    const data = buffer.subarray(dataStart, dataStart + compressedSize);
+    if (name === expectedName) {
+      if (method === 0) return data.toString("utf8");
+      if (method === 8) return zlib.inflateRawSync(data).toString("utf8");
+      throw new Error("Unsupported package compression.");
+    }
+    offset = dataStart + compressedSize;
+  }
+  throw new Error("Playback set package data was not found.");
+}
+
+function crc32(buffer) {
+  let crc = 0xffffffff;
+  for (const byte of buffer) {
+    crc = CRC32_TABLE[(crc ^ byte) & 0xff] ^ (crc >>> 8);
+  }
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+const CRC32_TABLE = (() => {
+  const table = new Uint32Array(256);
+  for (let index = 0; index < 256; index += 1) {
+    let value = index;
+    for (let bit = 0; bit < 8; bit += 1) {
+      value = value & 1 ? 0xedb88320 ^ (value >>> 1) : value >>> 1;
+    }
+    table[index] = value >>> 0;
+  }
+  return table;
+})();
 
 app.whenReady()
   .then(createWindow)

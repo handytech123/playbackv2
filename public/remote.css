@@ -41,12 +41,17 @@ button {
   overflow: hidden;
 }
 
+.remote-shell.rehearsal-shell {
+  grid-template-rows: auto auto auto minmax(220px, 1fr) auto auto auto;
+}
+
 .top-bar,
 .panic-panel,
 .setlist-strip,
 .wave-panel,
 .sections-panel,
-.remote-footer {
+.remote-footer,
+.rehearsal-panel {
   border: 1px solid var(--line);
   border-radius: 8px;
   background: var(--panel);
@@ -159,6 +164,51 @@ button {
   color: #fff4f4;
 }
 
+.panic-controls,
+.section-controls {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.segmented {
+  display: inline-grid;
+  grid-auto-flow: column;
+  border: 1px solid #34434c;
+  border-radius: 8px;
+  overflow: hidden;
+  background: #0d1216;
+}
+
+.segmented button,
+.panic-clear {
+  min-height: 38px;
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  font-weight: 900;
+  padding: 0 12px;
+}
+
+.segmented button + button {
+  border-left: 1px solid #34434c;
+}
+
+.segmented button.active {
+  background: rgba(66, 183, 255, 0.24);
+  color: #fff;
+  box-shadow: inset 0 0 0 1px rgba(66, 183, 255, 0.52);
+}
+
+.panic-clear {
+  border: 1px solid #5c4a25;
+  border-radius: 8px;
+  background: #171208;
+  color: #ffd47a;
+}
+
 .panic-panel div:first-child {
   display: grid;
   gap: 2px;
@@ -209,7 +259,7 @@ button {
 
 .transition-readout {
   display: grid;
-  grid-template-columns: minmax(160px, 1fr) auto auto;
+  grid-template-columns: minmax(160px, 1fr) auto auto auto;
   gap: 10px;
   align-items: center;
   margin-top: 4px;
@@ -219,6 +269,16 @@ button {
   background: rgba(7, 10, 13, 0.72);
   color: var(--muted);
   font-size: 13px;
+}
+
+.transition-readout .ready {
+  color: var(--green);
+  font-weight: 900;
+}
+
+.transition-readout .waiting {
+  color: var(--yellow);
+  font-weight: 900;
 }
 
 .transition-readout strong {
@@ -386,6 +446,16 @@ button {
   border-color: var(--yellow);
 }
 
+.command.play {
+  border-color: var(--green);
+  color: var(--green);
+}
+
+.command.transition-fire.ready {
+  border-color: var(--green);
+  box-shadow: inset 0 0 0 2px rgba(39, 212, 125, 0.26);
+}
+
 .command:disabled,
 .top-command:disabled {
   opacity: 0.42;
@@ -400,6 +470,11 @@ button {
   display: flex;
   justify-content: space-between;
   gap: 10px;
+  margin-bottom: 8px;
+}
+
+.section-controls {
+  justify-content: space-between;
   margin-bottom: 8px;
 }
 
@@ -427,6 +502,12 @@ button {
   box-shadow: 0 0 0 2px rgba(66, 183, 255, 0.7) inset;
 }
 
+.region-button.selected {
+  border-color: var(--yellow);
+  background: #211b0d;
+  box-shadow: 0 0 0 2px rgba(217, 162, 51, 0.62) inset;
+}
+
 .region-button.recovery-target {
   border-color: var(--yellow);
   background: #2b2107;
@@ -436,6 +517,46 @@ button {
 
 .region-button.panic-select {
   border-color: #805f18;
+}
+
+.rehearsal-panel {
+  display: grid;
+  grid-template-columns: minmax(220px, 1fr) minmax(112px, 0.25fr);
+  gap: 10px;
+  align-items: stretch;
+  padding: 10px;
+}
+
+.rehearsal-panel > div {
+  display: grid;
+  align-content: center;
+  gap: 3px;
+  min-width: 0;
+  border: 1px solid #263139;
+  border-radius: 8px;
+  background: #0f1418;
+  padding: 10px 12px;
+}
+
+.rehearsal-panel span,
+.rehearsal-panel small {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.rehearsal-panel strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.rehearsal-shell .wave-panel {
+  touch-action: manipulation;
+}
+
+.rehearsal-shell #waveCanvas {
+  cursor: crosshair;
+  touch-action: manipulation;
 }
 
 .remote-footer {
@@ -473,6 +594,14 @@ button {
     grid-auto-rows: 60px;
   }
 
+  .rehearsal-panel {
+    grid-template-columns: minmax(0, 1fr) minmax(120px, 0.28fr);
+  }
+
+  .rehearsal-panel > div {
+    grid-column: auto;
+  }
+
   .time-readout {
     grid-column: span 2;
   }
@@ -483,11 +612,11 @@ button {
   }
 
   .wave-panel {
-    min-height: 240px;
+    min-height: 140px;
   }
 
   #waveCanvas {
-    min-height: 240px;
+    min-height: 140px;
   }
 }
 
@@ -532,6 +661,16 @@ button {
 
   .panic-panel {
     grid-template-columns: 1fr;
+  }
+
+  .panic-controls,
+  .section-controls {
+    justify-content: stretch;
+  }
+
+  .panic-controls .segmented,
+  .section-controls .segmented {
+    flex: 1;
   }
 
   .setlist-cards {
@@ -581,7 +720,16 @@ button {
 
   .wave-panel,
   #waveCanvas {
-    min-height: 210px;
+    min-height: 125px;
+  }
+
+  .rehearsal-panel {
+    grid-template-columns: 1fr;
+  }
+
+  .rehearsal-panel > div,
+  .rehearsal-panel .command {
+    min-height: 64px;
   }
 
   .region-buttons {
@@ -619,7 +767,7 @@ button {
 
   .wave-panel,
   #waveCanvas {
-    min-height: 190px;
+    min-height: 110px;
   }
 
   .wave-region-label {

@@ -14,9 +14,12 @@ assert(files.server.includes("const DEFAULT_SETLIST_SLOT_COUNT = 6"), "server de
 assert(files.server.includes("function applySetlistTransitionLocked"), "server applies transition runtime");
 assert(files.server.includes('"songTransition"'), "playback command includes songTransition");
 assert(files.server.includes("transition: normalizeTransitionRuntime"), "playback state exposes transition runtime");
-assert(files.server.includes("transition.mode === \"autolink\""), "autolink starts the next song");
+assert(files.server.includes("transition.mode === \"crossfade\""), "crossfade starts the next preloaded song");
+assert(files.server.includes("durationByMode"), "transition timing is stored per transition mode");
 assert(files.server.includes("transition.mode === \"cue-next\" ? \"waiting-next\""), "cue-next selects the next song and waits");
 assert(files.server.includes("function applyTransitionPadHold"), "cue-next can hold the next song pad while waiting");
+assert(!files.server.includes("transition.mode === \"autolink\""), "autolink runtime branch has been removed");
+assert(!files.server.includes("transition.mode === \"overlap\""), "overlap runtime branch has been removed");
 assert(!files.server.includes("[\"cue-next\", \"autolink\"].includes(transition.mode)"), "cue-next must not auto-start the next song");
 assert(!files.server.includes("song-metadata.json") || !files.server.match(/transition[\s\S]{0,80}song-metadata\.json/i), "transition data is not written to song metadata");
 

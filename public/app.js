@@ -11,6 +11,9 @@
   addSongTargetIndex: null,
   addSongInFlight: false,
   saveTimer: null,
+  transitionSaveTimer: null,
+  transitionSaveInFlight: false,
+  transitionSavePending: false,
   setlistSaveInFlight: false,
   setlistSavePending: false,
   metadataSaveTimer: null,
@@ -30,6 +33,7 @@
   settings: null,
   systemInfo: null,
   audioDevices: null,
+  padOptions: [],
   cacheReport: null,
   setMetadata: null,
   selectedMetadataSlot: null,
@@ -52,10 +56,16 @@
   mixerMeterStream: null,
   scrubBySlot: {},
   waveformLoadInFlight: new Set(),
+  audioAlignMarkersBySlot: {},
   userTimelineScrollActiveUntil: 0,
   timelineAutoScrolling: false,
   mixerPanelHeight: null,
-  playbackKeyInteractionUntil: 0
+  mixerPanelHeightMode: "",
+  playbackKeyInteractionUntil: 0,
+  uiInteractionHoldUntil: 0,
+  midiAccess: null,
+  midiOutputs: [],
+  midiCueTracker: null
 };
 
 window.playbackAppState = state;
@@ -83,6 +93,7 @@ const els = {
   skippedSummary: document.querySelector("#skippedSummary"),
   skippedFolders: document.querySelector("#skippedFolders"),
   setlistSlots: document.querySelector("#setlistSlots"),
+  transitionEditorDock: document.querySelector("#transitionEditorDock"),
   setlistCount: document.querySelector("#setlistCount"),
   clearSetlist: document.querySelector("#clearSetlistButton"),
   songTitle: document.querySelector("#songTitle"),
@@ -137,15 +148,19 @@ const els = {
   editorPause: document.querySelector("#editorPauseButton"),
   editorTransportStatus: document.querySelector("#editorTransportStatus"),
   playbackKeySelect: document.querySelector("#playbackKeySelect"),
+  playbackPadSelect: document.querySelector("#playbackPadSelect"),
   playbackKeyStatus: document.querySelector("#playbackKeyStatus"),
   playbackKeyOriginal: document.querySelector("#playbackKeyOriginal"),
   playbackKeyTranspose: document.querySelector("#playbackKeyTranspose"),
+  playbackPadStatus: document.querySelector("#playbackPadStatus"),
   createRegionFromSelection: document.querySelector("#createRegionFromSelectionButton"),
   undoCueMove: document.querySelector("#undoCueMoveButton"),
   timelineSnap: document.querySelector("#timelineSnapSelect"),
   tempoKey: document.querySelector("#tempoKeyInput"),
   tempoBpm: document.querySelector("#tempoBpmInput"),
   tempoTimeSignature: document.querySelector("#tempoTimeSignatureInput"),
+  setAudioAlignSource: document.querySelector("#setAudioAlignSourceButton"),
+  setAudioAlignTarget: document.querySelector("#setAudioAlignTargetButton"),
   alignAudioStart: document.querySelector("#alignAudioStartButton"),
   resetAudioAlignment: document.querySelector("#resetAudioAlignmentButton"),
   audioAlignmentStatus: document.querySelector("#audioAlignmentStatus"),
@@ -198,6 +213,7 @@ const els = {
   routingStructure: document.querySelector("#routingStructure"),
   remoteStatus: document.querySelector("#remoteStatusReadout"),
   remotePrimaryUrl: document.querySelector("#remotePrimaryUrl"),
+  remoteLinkCards: document.querySelector("#remoteLinkCards"),
   remoteUrlList: document.querySelector("#remoteUrlList"),
   openRemote: document.querySelector("#openRemoteButton"),
   copyRemoteUrl: document.querySelector("#copyRemoteUrlButton"),
@@ -214,8 +230,16 @@ const els = {
   padsDefaultVolume: document.querySelector("#padsDefaultVolumeInput"),
   padsFadeIn: document.querySelector("#padsFadeInInput"),
   padsFadeOut: document.querySelector("#padsFadeOutInput"),
-  dynamicClickSound: document.querySelector("#dynamicClickSoundInput"),
-  dynamicClickAccent: document.querySelector("#dynamicClickAccentInput"),
+  dynamicClickPatternFolder: document.querySelector("#dynamicClickPatternFolderInput"),
+  proPresenterMidiEnabled: document.querySelector("#proPresenterMidiEnabledInput"),
+  proPresenterMidiOutput: document.querySelector("#proPresenterMidiOutputSelect"),
+  proPresenterMidiChannel: document.querySelector("#proPresenterMidiChannelInput"),
+  proPresenterMidiNote: document.querySelector("#proPresenterMidiNoteInput"),
+  proPresenterMidiVelocity: document.querySelector("#proPresenterMidiVelocityInput"),
+  proPresenterMidiLength: document.querySelector("#proPresenterMidiLengthInput"),
+  refreshMidiDevices: document.querySelector("#refreshMidiDevicesButton"),
+  testMidiSlide: document.querySelector("#testMidiSlideButton"),
+  proPresenterMidiStatus: document.querySelector("#proPresenterMidiStatus"),
   wavPathButtons: [...document.querySelectorAll("[data-wav-picker]")],
   folderPathButtons: [...document.querySelectorAll("[data-folder-picker]")],
   engineManifestPreview: document.querySelector("#engineManifestPreview"),
@@ -246,6 +270,7 @@ async function init() {
   await loadSystemInfo();
   await loadCurrentSetlist();
   await loadSettings();
+  await loadPadOptions();
   await loadAudioDevices();
   await loadCueAnalyzerStatus();
   await loadCacheReport();
@@ -299,6 +324,7 @@ async function reconcileSetlistForPlayback(playback) {
   const fingerprint = playback?.currentFingerprint || "";
   const slotNumber = Number(playback?.currentSlot || 0);
   const missingCurrentSong = slotNumber > 0 && !state.setlist[slotNumber - 1];
+  if (isUserEditingUi()) return;
   if (state.saveTimer || state.setlistSaveInFlight || state.setlistSavePending) return;
   if (!fingerprint || (fingerprint === state.playbackSetFingerprint && !missingCurrentSong)) return;
   await loadCurrentSetlist({ render: false });
@@ -312,6 +338,7 @@ function wireEvents() {
   }
   els.refresh.addEventListener("click", refreshLibrary);
   els.reloadData.addEventListener("click", reloadAppData);
+  window.playbackShell?.onMenuCommand?.(handleShellMenuCommand);
   els.openRemote?.addEventListener("click", openRemoteWindow);
   els.copyRemoteUrl?.addEventListener("click", copyRemoteUrl);
   els.allowRemoteFirewall?.addEventListener("click", configureRemoteFirewall);
@@ -337,6 +364,8 @@ function wireEvents() {
   });
   els.refreshAudioDevices.addEventListener("click", refreshAudioDevices);
   els.audioDiagnostics?.addEventListener("click", runAudioDiagnostics);
+  els.refreshMidiDevices?.addEventListener("click", () => refreshMidiDevices({ silent: false }));
+  els.testMidiSlide?.addEventListener("click", testProPresenterMidiSlide);
   els.routingPreset.addEventListener("change", () => {
     if (!state.settings) return;
     state.settings.routing.activePresetId = els.routingPreset.value;
@@ -358,6 +387,18 @@ function wireEvents() {
   els.playbackKeySelect?.addEventListener("blur", () => {
     state.playbackKeyInteractionUntil = 0;
   });
+  els.playbackPadSelect?.addEventListener("change", () => {
+    if (state.selectedSetlistIndex === null) return;
+    updateSetlistSongPad(state.selectedSetlistIndex, els.playbackPadSelect.value);
+  });
+  els.playbackPadSelect?.addEventListener("pointerdown", holdPlaybackKeyEditor);
+  els.playbackPadSelect?.addEventListener("focus", holdPlaybackKeyEditor);
+  els.playbackPadSelect?.addEventListener("blur", () => {
+    state.playbackKeyInteractionUntil = 0;
+  });
+  els.tempoBpm?.addEventListener("keydown", stepTempoBpmWithArrowKeys);
+  els.tempoBpm?.addEventListener("change", normalizeTempoBpmInput);
+  els.tempoBpm?.addEventListener("blur", normalizeTempoBpmInput);
   els.timelineRuler?.addEventListener("pointerdown", beginRulerGesture);
   els.timelineSurface.addEventListener("pointerdown", beginTimelineScrub);
   els.timelineSurface.addEventListener("contextmenu", openTimelineRegionContextMenu);
@@ -397,6 +438,8 @@ function wireEvents() {
   els.regionDelete.addEventListener("click", deleteSelectedRegion);
   els.saveMetadata.addEventListener("click", saveSelectedMetadata);
   els.approveMetadata?.addEventListener("click", approveSelectedMetadata);
+  els.setAudioAlignSource?.addEventListener("click", setAudioAlignmentSourceMarker);
+  els.setAudioAlignTarget?.addEventListener("click", setAudioAlignmentTargetMarker);
   els.alignAudioStart?.addEventListener("click", alignAudioStartToPlayhead);
   els.resetAudioAlignment?.addEventListener("click", resetAudioAlignment);
   els.addRegion.addEventListener("click", addRegionDraft);
@@ -457,10 +500,14 @@ function wireEvents() {
     if (els.select.value) loadSong(els.select.value);
   });
   els.select.addEventListener("dblclick", addSelectedSongToSet);
+  document.addEventListener("focusin", markUiInteractionActive, true);
+  document.addEventListener("input", markUiInteractionActive, true);
+  document.addEventListener("pointerdown", markUiInteractionActive, true);
   document.addEventListener("keydown", handleKeyboardShortcuts);
   document.addEventListener("click", (event) => {
-    if (!event.target.closest(".transition-tile") && !event.target.closest(".transition-editor")) {
+    if (!event.target.closest(".transition-tile") && !event.target.closest("#transitionEditorDock")) {
       state.openTransitionFromSlot = null;
+      renderTransitionEditorDock({ force: true });
       document.querySelectorAll(".transition-tile.editing").forEach((item) => item.classList.remove("editing"));
     }
     if (!event.target.closest("#regionMenu") && !event.target.closest(".timeline-region")) {
@@ -537,12 +584,14 @@ async function reloadAppData() {
     await loadSystemInfo();
     await loadCurrentSetlist();
     await loadSettings();
+    await loadPadOptions();
     await loadAudioDevices();
     await loadCueAnalyzerStatus();
     await loadCacheReport();
     await loadEngineManifestPreview();
     await loadPlaybackState();
     await loadSetMetadata();
+    await redrawInvalidSetWaveforms();
     renderSelectedMetadata();
     await runSystemCheck();
     els.playbackStatus.textContent = "Saved metadata reloaded.";
@@ -584,6 +633,13 @@ async function loadCurrentSetlist(options = {}) {
 async function loadSettings() {
   state.settings = await api("/api/settings");
   renderSettings();
+}
+
+async function loadPadOptions() {
+  const result = await api("/api/pads/options");
+  state.padOptions = Array.isArray(result.pads) ? result.pads : [];
+  populatePlaybackPadSelect();
+  renderSelectedMetadata();
 }
 
 async function loadSystemInfo() {
@@ -763,13 +819,20 @@ async function saveSettings() {
         fadeInMs: Number(els.padsFadeIn?.value || 1500),
         fadeOutMs: Number(els.padsFadeOut?.value || 2500)
       },
-      dynamicClick: {
-        clickSoundPath: els.dynamicClickSound.value,
-        accentSoundPath: els.dynamicClickAccent.value
+      dynamicClick: {},
+      proPresenterMidi: {
+        enabled: Boolean(els.proPresenterMidiEnabled?.checked),
+        outputId: els.proPresenterMidiOutput?.value || "",
+        outputName: selectedMidiOutputName(),
+        channel: Number(els.proPresenterMidiChannel?.value || 1),
+        nextSlideNote: Number(els.proPresenterMidiNote?.value || 60),
+        velocity: Number(els.proPresenterMidiVelocity?.value || 100),
+        noteLengthMs: Number(els.proPresenterMidiLength?.value || 80)
       }
     })
   });
   els.settingsStatus.textContent = `Settings saved. Active routing: ${preset?.name || els.routingPreset.value}.`;
+  await loadPadOptions();
   await loadAudioDevices();
   await loadEngineManifestPreview();
   renderSettings();
@@ -863,8 +926,10 @@ function renderSettings() {
   if (els.padsDefaultVolume) els.padsDefaultVolume.value = String(Math.round(Number(settings.pads?.defaultVolume ?? 0.65) * 100));
   if (els.padsFadeIn) els.padsFadeIn.value = String(settings.pads?.fadeInMs ?? 1500);
   if (els.padsFadeOut) els.padsFadeOut.value = String(settings.pads?.fadeOutMs ?? 2500);
-  els.dynamicClickSound.value = settings.dynamicClick.clickSoundPath || settings.dynamicClick.soundFolderPath || "";
-  els.dynamicClickAccent.value = settings.dynamicClick.accentSoundPath || "";
+  if (els.dynamicClickPatternFolder) {
+    els.dynamicClickPatternFolder.value = settings.dynamicClick?.soundFolderPath || "D:\\PlaybackAppV2\\click-patterns";
+  }
+  renderMidiSettings();
   els.routingPreset.replaceChildren();
   for (const preset of settings.routing.presets || []) {
     const option = document.createElement("option");
@@ -882,9 +947,154 @@ function renderSettings() {
   renderFoundationPanels();
 }
 
+function renderMidiSettings() {
+  const settings = state.settings?.proPresenterMidi || {};
+  if (els.proPresenterMidiEnabled) els.proPresenterMidiEnabled.checked = Boolean(settings.enabled);
+  if (els.proPresenterMidiChannel) els.proPresenterMidiChannel.value = String(settings.channel || 1);
+  if (els.proPresenterMidiNote) els.proPresenterMidiNote.value = String(settings.nextSlideNote ?? 60);
+  if (els.proPresenterMidiVelocity) els.proPresenterMidiVelocity.value = String(settings.velocity || 100);
+  if (els.proPresenterMidiLength) els.proPresenterMidiLength.value = String(settings.noteLengthMs || 80);
+  if (!els.proPresenterMidiOutput) return;
+  const selectedId = settings.outputId || "";
+  els.proPresenterMidiOutput.replaceChildren();
+  const placeholder = document.createElement("option");
+  placeholder.value = "";
+  placeholder.textContent = state.midiOutputs.length ? "Choose MIDI output" : "No MIDI outputs scanned";
+  els.proPresenterMidiOutput.append(placeholder);
+  for (const output of state.midiOutputs) {
+    const option = document.createElement("option");
+    option.value = output.id;
+    option.textContent = output.manufacturer ? `${output.name} (${output.manufacturer})` : output.name;
+    option.selected = output.id === selectedId;
+    els.proPresenterMidiOutput.append(option);
+  }
+  if (selectedId && !state.midiOutputs.some((output) => output.id === selectedId)) {
+    const missing = document.createElement("option");
+    missing.value = selectedId;
+    missing.textContent = settings.outputName ? `${settings.outputName} (missing)` : "Saved device missing";
+    missing.selected = true;
+    els.proPresenterMidiOutput.append(missing);
+  }
+  setMidiStatus(settings.enabled
+    ? (selectedId ? "Ready when output is available" : "Choose an output")
+    : "Disabled");
+}
+
+async function refreshMidiDevices(options = {}) {
+  if (!("requestMIDIAccess" in navigator)) {
+    setMidiStatus("Web MIDI is not available in this Electron build.");
+    return [];
+  }
+  try {
+    state.midiAccess = await navigator.requestMIDIAccess({ sysex: false });
+    state.midiOutputs = [...state.midiAccess.outputs.values()].map((output) => ({
+      id: output.id,
+      name: output.name || "MIDI Output",
+      manufacturer: output.manufacturer || ""
+    })).sort((left, right) => left.name.localeCompare(right.name));
+    state.midiAccess.onstatechange = () => {
+      state.midiOutputs = [...state.midiAccess.outputs.values()].map((output) => ({
+        id: output.id,
+        name: output.name || "MIDI Output",
+        manufacturer: output.manufacturer || ""
+      })).sort((left, right) => left.name.localeCompare(right.name));
+      renderMidiSettings();
+    };
+    renderMidiSettings();
+    if (!options.silent) setMidiStatus(`${state.midiOutputs.length} MIDI output(s) found.`);
+    return state.midiOutputs;
+  } catch (error) {
+    setMidiStatus(`MIDI scan failed: ${error.message}`);
+    return [];
+  }
+}
+
+function selectedMidiOutputName() {
+  const outputId = els.proPresenterMidiOutput?.value || "";
+  return state.midiOutputs.find((output) => output.id === outputId)?.name || state.settings?.proPresenterMidi?.outputName || "";
+}
+
+function setMidiStatus(message) {
+  const target = els.proPresenterMidiStatus?.querySelector("strong");
+  if (target) target.textContent = message;
+}
+
+async function ensureMidiOutput() {
+  const settings = state.settings?.proPresenterMidi || {};
+  if (!settings.enabled) return null;
+  if (!state.midiAccess) await refreshMidiDevices({ silent: true });
+  const outputId = settings.outputId || els.proPresenterMidiOutput?.value || "";
+  const output = outputId ? state.midiAccess?.outputs?.get(outputId) : null;
+  if (!output) {
+    setMidiStatus(settings.outputName ? `${settings.outputName} is not available.` : "Choose a MIDI output.");
+    return null;
+  }
+  return output;
+}
+
+async function sendProPresenterNextSlide() {
+  const output = await ensureMidiOutput();
+  if (!output) return false;
+  const settings = state.settings?.proPresenterMidi || {};
+  const channel = Math.max(1, Math.min(16, Math.round(Number(settings.channel || 1)))) - 1;
+  const note = Math.max(0, Math.min(127, Math.round(Number(settings.nextSlideNote ?? 60))));
+  const velocity = Math.max(1, Math.min(127, Math.round(Number(settings.velocity || 100))));
+  const lengthMs = Math.max(20, Math.min(1000, Math.round(Number(settings.noteLengthMs || 80))));
+  output.send([0x90 + channel, note, velocity]);
+  window.setTimeout(() => output.send([0x80 + channel, note, 0]), lengthMs);
+  setMidiStatus(`Sent next slide note ${note} on channel ${channel + 1}.`);
+  return true;
+}
+
+async function testProPresenterMidiSlide() {
+  await saveSettings();
+  await sendProPresenterNextSlide();
+}
+
+function serviceProPresenterMidiCues(slot) {
+  const settings = state.settings?.proPresenterMidi || {};
+  const playback = state.playbackState || {};
+  if (!settings.enabled || !slot || playback.transport !== "playing") {
+    state.midiCueTracker = null;
+    return;
+  }
+  if (playback.panic?.active === true && settings.fireInPanic !== true) return;
+  if (Number(playback.currentSlot) !== Number(slot.slot)) return;
+  const point = currentScrubPoint(slot);
+  if (!point) return;
+  const currentTime = Number(point.timeSeconds || 0);
+  const tracker = state.midiCueTracker;
+  const slotChanged = Number(tracker?.slot) !== Number(slot.slot);
+  const seekedBackward = tracker && currentTime < Number(tracker.lastTimeSeconds || 0) - 0.25;
+  if (!tracker || slotChanged || seekedBackward) {
+    state.midiCueTracker = {
+      slot: slot.slot,
+      lastTimeSeconds: Math.max(0, currentTime - 0.05),
+      fired: new Set()
+    };
+    return;
+  }
+  const cues = (slot.cues?.cueMarkers || [])
+    .map((cue, index) => ({
+      key: cue.id || `${cue.name || "cue"}-${cue.bar || 1}-${cue.beat || 1}-${index}`,
+      timeSeconds: timeForBarBeat(slot, cue.bar || 1, cue.beat || 1)
+    }))
+    .filter((cue) => Number.isFinite(cue.timeSeconds))
+    .sort((left, right) => left.timeSeconds - right.timeSeconds);
+  const previousTime = Number(tracker.lastTimeSeconds || 0);
+  tracker.lastTimeSeconds = currentTime;
+  for (const cue of cues) {
+    if (tracker.fired.has(cue.key)) continue;
+    if (cue.timeSeconds <= previousTime + 0.001 || cue.timeSeconds > currentTime + 0.001) continue;
+    tracker.fired.add(cue.key);
+    sendProPresenterNextSlide().catch((error) => setMidiStatus(`MIDI send failed: ${error.message}`));
+  }
+}
+
 function renderRemoteSettings() {
   if (!els.remotePrimaryUrl) return;
-  const urls = remoteUrls();
+  const links = remoteLinks();
+  const urls = links.performance;
   const primary = primaryRemoteUrl();
   els.remotePrimaryUrl.textContent = primary;
   if (els.remoteStatus) {
@@ -892,9 +1102,10 @@ function renderRemoteSettings() {
       ? "Performance remote active"
       : "Available in Edit and Performance";
   }
+  renderRemoteLinkCards(links);
   if (!els.remoteUrlList) return;
   els.remoteUrlList.replaceChildren();
-  for (const url of urls) {
+  for (const url of [...links.performance, ...links.rehearsal]) {
     const item = document.createElement("button");
     item.type = "button";
     item.className = "remote-url-item";
@@ -907,14 +1118,73 @@ function renderRemoteSettings() {
   }
 }
 
-function remoteUrls() {
-  const urls = Array.isArray(state.systemInfo?.remoteUrls) ? state.systemInfo.remoteUrls : [];
-  return urls.length ? urls : [`${window.location.origin}/remote`];
+function renderRemoteLinkCards(links) {
+  if (!els.remoteLinkCards) return;
+  els.remoteLinkCards.replaceChildren();
+  const cards = [
+    {
+      title: "Performance Remote",
+      note: "Operator-safe show controls",
+      url: primaryRemoteUrl("performance")
+    },
+    {
+      title: "Rehearsal Remote",
+      note: "MD section start tools",
+      url: primaryRemoteUrl("rehearsal")
+    }
+  ];
+  for (const card of cards) {
+    const item = document.createElement("article");
+    item.className = "remote-link-card";
+    item.innerHTML = `
+      <div class="remote-link-copy">
+        <span>${escapeHtml(card.note)}</span>
+        <strong>${escapeHtml(card.title)}</strong>
+        <button type="button" class="remote-card-url">${escapeHtml(card.url)}</button>
+        <div class="remote-card-actions">
+          <button type="button" data-remote-open="${escapeHtml(card.url)}">Open</button>
+          <button type="button" data-remote-copy="${escapeHtml(card.url)}">Copy</button>
+        </div>
+      </div>
+      <img class="remote-qr" alt="${escapeHtml(card.title)} QR code" src="${remoteQrUrl(card.url)}">
+    `;
+    item.querySelector("[data-remote-open]")?.addEventListener("click", () => window.open(card.url, "_blank", "noopener"));
+    item.querySelector("[data-remote-copy]")?.addEventListener("click", async () => {
+      await navigator.clipboard?.writeText(card.url);
+      els.settingsStatus.textContent = `${card.title} URL copied.`;
+    });
+    item.querySelector(".remote-card-url")?.addEventListener("click", async () => {
+      await navigator.clipboard?.writeText(card.url);
+      els.settingsStatus.textContent = `${card.title} URL copied.`;
+    });
+    els.remoteLinkCards.append(item);
+  }
 }
 
-function primaryRemoteUrl() {
-  const urls = remoteUrls();
+function remoteUrls() {
+  return remoteLinks().performance;
+}
+
+function remoteLinks() {
+  const links = state.systemInfo?.remoteLinks || {};
+  const performance = Array.isArray(links.performance) && links.performance.length
+    ? links.performance
+    : Array.isArray(state.systemInfo?.remoteUrls) && state.systemInfo.remoteUrls.length
+      ? state.systemInfo.remoteUrls
+      : [`${window.location.origin}/remote`];
+  const rehearsal = Array.isArray(links.rehearsal) && links.rehearsal.length
+    ? links.rehearsal
+    : performance.map((url) => url.replace(/\/remote$/, "/rehearsal"));
+  return { performance, rehearsal };
+}
+
+function primaryRemoteUrl(type = "performance") {
+  const urls = remoteLinks()[type] || remoteUrls();
   return urls.find((url) => !url.includes("127.0.0.1")) || urls[0] || `${window.location.origin}/remote`;
+}
+
+function remoteQrUrl(url) {
+  return `/api/remote/qr?url=${encodeURIComponent(url)}`;
 }
 
 function openRemoteWindow() {
@@ -1221,15 +1491,13 @@ function renderBusLayer() {
 function renderPadLayer() {
   if (!els.padLayer) return;
   const selected = selectedMetadata();
-  const clickSound = state.settings?.dynamicClick?.clickSoundPath || state.settings?.dynamicClick?.soundFolderPath || "Default click";
-  const accentSound = state.settings?.dynamicClick?.accentSoundPath || "Default accent";
+  const clickPatternFolder = state.settings?.dynamicClick?.soundFolderPath || "D:\\PlaybackAppV2\\click-patterns";
   const dynamicCueFolder = state.settings?.dynamicCue?.folderPath || "No dynamic cue folder";
   const padsFolder = state.settings?.pads?.folderPath || "No pads folder";
   els.padLayer.replaceChildren();
   const rows = [
     ["Dynamic Cue", dynamicCueFolder],
-    ["Dynamic Click", clickSound],
-    ["Click Accent", accentSound],
+    ["Dynamic Click", clickPatternFolder],
     ["Pads", padsFolder],
     ["Selected Song", selected ? "Ready with selected song" : "Select song"]
   ];
@@ -1261,10 +1529,156 @@ function emptyState(message) {
   return item;
 }
 
+function markUiInteractionActive(event = null) {
+  const target = event?.target;
+  if (isInteractiveElement(target) || target?.closest?.(".region-menu, .song-action-menu, #transitionEditorDock, .mixer-strip")) {
+    state.uiInteractionHoldUntil = Date.now() + 1200;
+  }
+}
+
+function isUserEditingUi() {
+  const active = document.activeElement;
+  if (isInteractiveElement(active)) return true;
+  if (Date.now() < Number(state.uiInteractionHoldUntil || 0)) return true;
+  if (state.openTransitionFromSlot) return true;
+  if (els.regionMenu && !els.regionMenu.classList.contains("hidden")) return true;
+  if (document.querySelector(".setlist-slot.menu-open")) return true;
+  return false;
+}
+
+function isInteractiveElement(element) {
+  if (!(element instanceof HTMLElement)) return false;
+  if (element.closest("[data-live-render-safe]")) return false;
+  return Boolean(element.closest("input, textarea, select, [contenteditable='true'], .transition-editor, #transitionEditorDock, .region-menu, .song-action-menu, .mixer-strip"));
+}
+
 async function loadPlaybackState() {
   const playback = await api("/api/playback/state");
   state.playbackState = playback && typeof playback === "object" ? playback : { mode: "edit", transport: "stopped" };
   renderPlaybackState();
+}
+
+async function handleShellMenuCommand(command) {
+  const selected = selectedMetadata();
+  try {
+    switch (command) {
+      case "saveDraft":
+        await saveSelectedMetadata();
+        setAlert("Draft saved.");
+        break;
+      case "exportSetPackage":
+        await exportSetPackage();
+        break;
+      case "importSetPackage":
+        await importSetPackage();
+        break;
+      case "confirmSet":
+        await confirmSet();
+        break;
+      case "undo":
+        undoLastCueMove();
+        break;
+      case "splitAtPlayhead":
+        splitSelectedRegionAtPlayhead();
+        break;
+      case "deleteSelection":
+        if (state.selectedCueIndex !== null) deleteSelectedCue();
+        else if (state.selectedRegionIndex !== null) deleteSelectedRegion();
+        break;
+      case "removeCloseGap":
+        removeSelectedRegionAndCloseGap();
+        break;
+      case "reloadData":
+        await reloadAppData();
+        break;
+      case "toggleMixer":
+        toggleMixerCollapse();
+        break;
+      case "resetMixerHeight":
+        resetMixerHeightForCurrentMode();
+        break;
+      case "zoomIn":
+        setTimelineZoom(state.timelineZoom + timelineZoomStep(1));
+        break;
+      case "zoomOut":
+        setTimelineZoom(state.timelineZoom - timelineZoomStep(-1));
+        break;
+      case "refreshLibrary":
+        await refreshLibrary();
+        break;
+      case "openLibrarySettings":
+        openSettingsDrawer();
+        showSettingsSection("librarySettings");
+        break;
+      case "openAudioSettings":
+        openSettingsDrawer();
+        showSettingsSection("audioSettings");
+        break;
+      case "refreshAudioDevices":
+        await refreshAudioDevices();
+        break;
+      case "openDanteMatrix":
+        openSettingsDrawer();
+        showSettingsSection("routingSettings");
+        break;
+      case "play":
+      case "pause":
+      case "stop":
+      case "seek":
+      case "songTransition":
+      case "togglePad":
+      case "panic":
+        await sendPlaybackCommand(command, selected?.slot ? { slot: selected.slot } : {});
+        break;
+      case "testProPresenterMidi":
+        openSettingsDrawer();
+        showSettingsSection("playbackSettings");
+        await testProPresenterMidiSlide();
+        break;
+      default:
+        break;
+    }
+  } catch (error) {
+    setAlert(error.message);
+  }
+}
+
+async function exportSetPackage() {
+  if (!window.playbackShell?.saveSetPackage) {
+    throw new Error("Set package export is only available in the Windows app.");
+  }
+  if (state.playbackState?.mode !== "performance") {
+    await saveSelectedMetadata();
+    await saveCurrentSetlist();
+  }
+  setAlert("Preparing set package...");
+  const packagePayload = await api("/api/set-package/export");
+  const result = await window.playbackShell.saveSetPackage(packagePayload);
+  if (result?.canceled) {
+    setAlert("Set package export canceled.");
+    return;
+  }
+  setAlert(`Set package exported: ${result.filePath}`);
+}
+
+async function importSetPackage() {
+  if (!window.playbackShell?.openSetPackage) {
+    throw new Error("Set package import is only available in the Windows app.");
+  }
+  if (!window.confirm("Import this set package as the current draft set on this PC?")) return;
+  const opened = await window.playbackShell.openSetPackage();
+  if (opened?.canceled) {
+    setAlert("Set package import canceled.");
+    return;
+  }
+  setAlert("Importing set package and preparing local cache...");
+  const result = await api("/api/set-package/import", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ package: opened.package })
+  });
+  await reloadAppData();
+  setAlert(result.message || "Set package imported. Confirm Set on this PC before Performance.");
 }
 
 async function confirmSet() {
@@ -1390,10 +1804,12 @@ function renderPlaybackState() {
   renderCommandButtons(playback.transport);
   syncTransportClock();
   setPlanningLocked(isPerformance);
-  renderSetlist();
-  renderFoundationPanels();
-  renderLoadedSong();
-  renderSelectedMetadata();
+  if (!isUserEditingUi()) {
+    renderSetlist();
+    renderFoundationPanels();
+    renderLoadedSong();
+    renderSelectedMetadata();
+  }
   renderEditorTransport(selectedMetadata());
 }
 
@@ -1450,6 +1866,7 @@ function renderLiveTransportPosition() {
   if (playbackSlot) {
     serviceArrangementBlocks(playbackSlot);
     serviceArrangementCuts(playbackSlot);
+    serviceProPresenterMidiCues(playbackSlot);
   }
 }
 
@@ -1474,9 +1891,14 @@ function engineStatusLabel(value) {
 }
 
 function setPlanningLocked(locked) {
-  const controls = [els.clearSetlist, els.search, els.select, els.addSelectedSong, ...els.tabs];
+  const controls = [els.clearSetlist, els.addSelectedSong];
   for (const control of controls) {
     control.disabled = locked;
+  }
+  els.search.disabled = false;
+  els.select.disabled = false;
+  for (const tab of els.tabs) {
+    tab.disabled = false;
   }
   els.refresh.disabled = false;
   els.setlistSlots.classList.toggle("locked", locked);
@@ -1638,6 +2060,7 @@ async function loadSetMetadata() {
   renderMetadataSlotOptions();
   renderSelectedMetadata();
   ensureSelectedWaveform();
+  ensureSetlistWaveforms();
 }
 
 function renderMetadataSlotOptions() {
@@ -1681,6 +2104,8 @@ function renderSelectedMetadata() {
   }
   els.metadataSlot.disabled = !state.setMetadata?.slots?.length;
   els.saveMetadata.disabled = locked || !selected;
+  if (els.setAudioAlignSource) els.setAudioAlignSource.disabled = locked || !selected;
+  if (els.setAudioAlignTarget) els.setAudioAlignTarget.disabled = locked || !selected;
   if (els.alignAudioStart) els.alignAudioStart.disabled = locked || !selected;
   if (els.resetAudioAlignment) els.resetAudioAlignment.disabled = locked || !selected;
   els.addRegion.disabled = locked || !selected;
@@ -1732,7 +2157,7 @@ function renderSelectedMetadata() {
   els.timelinePanel.classList.remove("hidden");
   els.editorPanel.classList.toggle("hidden", locked);
   const tempo = selected.tempoMap || {};
-  els.timelineStatus.textContent = "Timeline ready";
+  els.timelineStatus.textContent = playbackBoundsStatusText(selected);
   renderTransportReadout(selected);
   els.playbackKey.textContent = tempo.key || "--";
   els.playbackTempo.textContent = tempo.bpm || "--";
@@ -1742,7 +2167,7 @@ function renderSelectedMetadata() {
   els.tempoTimeSignature.value = tempo.timeSignature || "";
   renderPlaybackKeyEditor(selected);
   if (els.audioAlignmentStatus) {
-    els.audioAlignmentStatus.textContent = `Audio shift: ${Number(selected.audioAlignment?.shiftSeconds || 0).toFixed(3)}s`;
+    renderAudioAlignmentStatus(selected);
   }
   els.cueLane.classList.remove("hidden");
   renderTimeline(selected);
@@ -1753,31 +2178,34 @@ function renderSelectedMetadata() {
 }
 
 function slotHasWaveformPeaks(slot) {
+  return waveformSummaryUsable(slot?.arrangementCache?.waveform) || waveformSummaryUsable(slot?.waveform);
+}
+
+function waveformSummaryUsable(waveform) {
   return Boolean(
-    slot?.arrangementCache?.waveform?.peaks?.length
-    || slot?.waveform?.peaks?.length
+    Array.isArray(waveform?.peaks)
+    && waveform.peaks.length
+    && Number(waveform.tracksUsed || 0) > 0
+    && waveform.peaks.some((peak) => Number(peak) > 0.005)
   );
 }
 
 async function ensureSelectedWaveform(selected = selectedMetadata()) {
   if (!selected || slotHasWaveformPeaks(selected)) return;
   const slotNumber = Number(selected.slot || 0);
-  if (!slotNumber || state.waveformLoadInFlight.has(slotNumber)) return;
-  state.waveformLoadInFlight.add(slotNumber);
-  try {
-    const waveform = await api(`/api/set-metadata/current/slot/${slotNumber}/waveform?buckets=1800`);
-    const slot = (state.setMetadata?.slots || []).find((item) => Number(item.slot) === slotNumber);
-    if (slot) {
-      slot.waveform = waveform;
-      if (Number(selectedMetadata()?.slot) === slotNumber) {
-        renderTimeline(slot);
-      }
-    }
-  } catch (error) {
-    console.warn("Waveform refresh failed", error);
-  } finally {
-    state.waveformLoadInFlight.delete(slotNumber);
+  await ensureSlotWaveform(slotNumber);
+}
+
+function playbackBoundsStatusText(slot) {
+  const arrangement = slot?.arrangement || {};
+  const start = Number(arrangement.trimStartSeconds || 0);
+  const end = Number(arrangement.trimEndSeconds || 0);
+  const audioEnd = slotWaveformDuration(slot);
+  const tailMeasures = 8;
+  if (start > 0 || end > 0) {
+    return `Playback trim ${formatSeconds(start)} -> ${formatSeconds(end || audioEnd)} | ruler +${tailMeasures} measures`;
   }
+  return `Timeline ready | ruler +${tailMeasures} measures`;
 }
 
 function renderTransportReadout(fallbackSelected = null) {
@@ -1800,9 +2228,10 @@ function renderTimeline(slot) {
   const beatGrid = visualBeatGrid(slot);
   const maxBeatGridBar = beatGrid.reduce((max, beat) => Math.max(max, Number(beat.measure || 0)), 0);
   const maxBar = Math.max(16, maxBeatGridBar, ...regionEntries.map((entry) => Number(entry.region.endBar || 1)), ...cues.map((cue) => Number(cue.bar || 1)));
-  const duration = slotWaveformDuration(slot);
+  const duration = slotTimelineDuration(slot);
   const locked = state.playbackState?.mode === "performance";
   const liveRegion = locked ? currentTimelineRegion(slot) : null;
+  const nextLiveRegion = locked ? nextTimelineRegion(slot, liveRegion) : null;
   const performanceControlRegion = locked ? performanceActionRegion(slot, liveRegion) : null;
   const liveRepeat = state.playbackState?.liveRepeat || {};
   els.timelinePanel.style.setProperty("--timeline-zoom", state.timelineZoom);
@@ -1822,10 +2251,12 @@ function renderTimeline(slot) {
     const item = document.createElement("div");
     item.className = "timeline-region";
     const isCurrentLiveRegion = Boolean(locked && liveRegion?.region?.id === region.id);
+    const isNextLiveRegion = Boolean(locked && nextLiveRegion?.region?.id === region.id);
     const panicActive = state.playbackState?.panic?.active === true;
     const showPerformanceActions = Boolean(locked && (panicActive || performanceControlRegion?.region?.id === region.id));
     const isQueuedRepeat = Boolean(liveRepeat.regionId === region.id && liveRepeat.queued && !liveRepeat.releaseRequested);
     item.classList.toggle("current-live-region", isCurrentLiveRegion);
+    item.classList.toggle("next-live-region", isNextLiveRegion);
     item.classList.toggle("performance-action-region", showPerformanceActions);
     item.classList.toggle("repeat-queued", isQueuedRepeat);
     item.classList.toggle("selected-region", selectedArrangedEntryMatches(index, entry.blockId));
@@ -1853,9 +2284,14 @@ function renderTimeline(slot) {
     const right = percentForTime(Math.max(startTime + 0.1, endTime), duration);
     item.style.left = `${left}%`;
     item.style.width = `${Math.max(0, Math.min(100 - left, Math.max(1, right - left)))}%`;
+    const performanceBadge = locked && isCurrentLiveRegion
+      ? "<em class=\"performance-region-badge\">Current</em>"
+      : locked && isNextLiveRegion
+        ? "<em class=\"performance-region-badge next\">Next</em>"
+        : "";
     item.innerHTML = `
       ${locked ? "" : "<span class=\"region-resize region-resize-left\" data-resize=\"start\"></span>"}
-      <strong>${escapeHtml(region.name)}</strong>
+      <strong>${escapeHtml(region.name)}</strong>${performanceBadge}
       ${showPerformanceActions ? regionLiveActions(region, liveRepeat, panicActive) : ""}
       ${locked ? "" : "<span class=\"region-resize region-resize-right\" data-resize=\"end\"></span>"}
     `;
@@ -1944,18 +2380,30 @@ function regionLiveActions(region, liveRepeat, panicActive = false) {
 
 function currentTimelineRegion(slot) {
   const point = currentScrubPoint(slot);
-  const regions = slot?.regions?.regions || [];
-  if (!point || !regions.length || state.playbackState?.currentSlot !== slot.slot || !["playing", "paused"].includes(state.playbackState?.transport)) {
+  const entries = timelineRegionEntries(slot);
+  if (!point || !entries.length || state.playbackState?.currentSlot !== slot.slot || !["playing", "paused"].includes(state.playbackState?.transport)) {
     return null;
   }
-  return regions
+  return entries.find((item) => point.timeSeconds >= item.startTime && point.timeSeconds < Math.max(item.startTime + 0.1, item.endTime)) || null;
+}
+
+function nextTimelineRegion(slot, current) {
+  const entries = timelineRegionEntries(slot);
+  if (!entries.length) return null;
+  if (!current) return entries[0] || null;
+  const index = entries.findIndex((entry) => entry.region.id === current.region.id);
+  return index >= 0 ? entries[index + 1] || null : null;
+}
+
+function timelineRegionEntries(slot) {
+  return (slot?.regions?.regions || [])
     .map((region, index) => ({
       region,
       index,
       startTime: timeForBarBeat(slot, Number(region.startBar || 1), Number(region.startBeat || 1)),
       endTime: timeForBarBeat(slot, Number(region.endBar || region.startBar || 1), Number(region.endBeat || 1))
     }))
-    .find((item) => point.timeSeconds >= item.startTime && point.timeSeconds < Math.max(item.startTime + 0.1, item.endTime)) || null;
+    .sort((left, right) => left.startTime - right.startTime);
 }
 
 function performanceActionRegion(slot, liveRegion) {
@@ -2149,16 +2597,63 @@ function editorTransportLocked(slot) {
 async function alignAudioStartToPlayhead() {
   const slot = selectedMetadata();
   if (editorTransportLocked(slot)) return;
-  const point = audioAlignmentMarkerPoint(slot);
-  const seconds = Math.max(0, Number(point?.timeSeconds || 0));
-  if (!window.confirm(`Move this song's cached audio start to the transport marker at ${formatSeconds(seconds)} (${point.measure}.${point.beat})? This rewrites the app cache, not Dropbox WAVs.`)) return;
-  await applyAudioAlignment(slot, seconds);
+  const markers = audioAlignmentMarkers(slot);
+  if (!markers.source || !markers.target) {
+    setAlert("Set a source waveform point and a target grid point first.");
+    return;
+  }
+  const currentShift = Number(slot.audioAlignment?.shiftSeconds || 0);
+  const deltaSeconds = Number(markers.target.timeSeconds || 0) - Number(markers.source.timeSeconds || 0);
+  const nextShift = currentShift + deltaSeconds;
+  const direction = deltaSeconds > 0 ? "add space before the song" : deltaSeconds < 0 ? "remove space from the front" : "leave the song in place";
+  const message = `Move source ${formatSeconds(markers.source.timeSeconds)} to target ${formatSeconds(markers.target.timeSeconds)}?\n\nThis will ${direction} by ${Math.abs(deltaSeconds).toFixed(3)}s.\nSaved song shift will be ${nextShift.toFixed(3)}s.\n\nThis rewrites the app cache, not Dropbox WAVs.`;
+  if (!window.confirm(message)) return;
+  await applyAudioAlignment(slot, nextShift);
 }
 
-function audioAlignmentMarkerPoint(slot) {
-  const stored = slot ? state.scrubBySlot[slot.slot] : null;
-  if (stored) return stored;
-  return currentScrubPoint(slot);
+function setAudioAlignmentSourceMarker() {
+  setAudioAlignmentMarker("source");
+}
+
+function setAudioAlignmentTargetMarker() {
+  setAudioAlignmentMarker("target");
+}
+
+function setAudioAlignmentMarker(kind) {
+  const slot = selectedMetadata();
+  if (editorTransportLocked(slot)) return;
+  const point = currentScrubPoint(slot);
+  if (!point) return;
+  const markers = audioAlignmentMarkers(slot);
+  markers[kind] = {
+    timeSeconds: Number(point.timeSeconds || 0),
+    measure: Number(point.measure || 1),
+    beat: Number(point.beat || 1)
+  };
+  renderAudioAlignmentStatus(slot);
+  setAlert(`${kind === "source" ? "Source" : "Target"} marker set at ${formatSeconds(point.timeSeconds)} (${point.measure}.${point.beat}).`);
+}
+
+function audioAlignmentMarkers(slot) {
+  if (!slot?.slot) return {};
+  if (!state.audioAlignMarkersBySlot[slot.slot]) state.audioAlignMarkersBySlot[slot.slot] = {};
+  return state.audioAlignMarkersBySlot[slot.slot];
+}
+
+function renderAudioAlignmentStatus(slot = selectedMetadata()) {
+  if (!els.audioAlignmentStatus) return;
+  if (!slot) {
+    els.audioAlignmentStatus.textContent = "Shift: 0.000s | Source: -- | Target: --";
+    return;
+  }
+  const markers = audioAlignmentMarkers(slot);
+  const source = markers.source ? formatSeconds(markers.source.timeSeconds) : "--";
+  const target = markers.target ? formatSeconds(markers.target.timeSeconds) : "--";
+  const shift = Number(slot.audioAlignment?.shiftSeconds || 0);
+  const pending = markers.source && markers.target
+    ? ` | Move: ${(Number(markers.target.timeSeconds || 0) - Number(markers.source.timeSeconds || 0)).toFixed(3)}s`
+    : "";
+  els.audioAlignmentStatus.textContent = `Shift: ${shift.toFixed(3)}s | Source: ${source} | Target: ${target}${pending}`;
 }
 
 async function resetAudioAlignment() {
@@ -2171,7 +2666,7 @@ async function resetAudioAlignment() {
 async function applyAudioAlignment(slot, seconds) {
   try {
     setBusy("Rebuilding shifted audio cache...");
-    const markerSeconds = Math.max(0, Number(seconds || 0));
+    const markerSeconds = Number.isFinite(Number(seconds)) ? Number(seconds) : 0;
     const result = await api(`/api/set-metadata/current/slot/${slot.slot}/audio-shift`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -2184,8 +2679,11 @@ async function applyAudioAlignment(slot, seconds) {
     if (updated) {
       state.selectedMetadataSlot = updated.slot;
       state.selectedSetlistIndex = updated.slot - 1;
-      state.scrubBySlot[updated.slot] = beatAtTime(visualBeatGrid(updated), markerSeconds) || {
-        timeSeconds: markerSeconds,
+      delete state.audioAlignMarkersBySlot[updated.slot];
+      state.waveformLoadInFlight.delete(updated.slot);
+      const targetSeconds = Math.max(0, Number(slotWaveformDuration(updated) || 0) > 0 ? Math.min(Number(slotWaveformDuration(updated)), Math.abs(Number(result.shiftSeconds || 0))) : 0);
+      state.scrubBySlot[updated.slot] = beatAtTime(visualBeatGrid(updated), targetSeconds) || {
+        timeSeconds: targetSeconds,
         measure: 1,
         beat: 1,
         globalBeat: 0
@@ -2196,10 +2694,48 @@ async function applyAudioAlignment(slot, seconds) {
     await loadCacheReport();
     renderSetlist();
     renderSelectedMetadata();
-    setAlert(`Audio shift saved: ${Number(result.shiftSeconds || 0).toFixed(3)}s. Confirm Set before Performance.`);
+    const savedShift = Number(result.shiftSeconds || 0);
+    setAlert(savedShift === 0
+      ? "Audio shift reset to original. Confirm Set before Performance."
+      : `Audio shift saved: ${savedShift.toFixed(3)}s. Confirm Set before Performance.`);
   } catch (error) {
     setAlert(error.message);
   }
+}
+
+async function ensureSetlistWaveforms() {
+  const slots = Array.isArray(state.setMetadata?.slots) ? state.setMetadata.slots : [];
+  for (const slot of slots) {
+    if (!slot?.slot || !slot.songId || slotHasWaveformPeaks(slot)) continue;
+    ensureSlotWaveform(Number(slot.slot));
+  }
+}
+
+async function ensureSlotWaveform(slotNumber) {
+  if (!slotNumber || state.waveformLoadInFlight.has(slotNumber)) return;
+  state.waveformLoadInFlight.add(slotNumber);
+  try {
+    const waveform = await api(`/api/set-metadata/current/slot/${slotNumber}/waveform?buckets=1800`);
+    const slot = (state.setMetadata?.slots || []).find((item) => Number(item.slot) === slotNumber);
+    if (slot) {
+      slot.waveform = waveform;
+      if (Number(selectedMetadata()?.slot) === slotNumber) {
+        renderTimeline(slot);
+      }
+    }
+  } catch (error) {
+    console.warn("Waveform refresh failed", error);
+  } finally {
+    state.waveformLoadInFlight.delete(slotNumber);
+  }
+}
+
+async function redrawInvalidSetWaveforms() {
+  const slots = Array.isArray(state.setMetadata?.slots) ? state.setMetadata.slots : [];
+  const targets = slots.filter((slot) => slot?.slot && slot.songId && !slotHasWaveformPeaks(slot));
+  if (!targets.length) return;
+  if (els.timelineStatus) els.timelineStatus.textContent = `Redrawing ${targets.length} waveform${targets.length === 1 ? "" : "s"}...`;
+  await Promise.all(targets.map((slot) => ensureSlotWaveform(Number(slot.slot))));
 }
 
 async function playEditorFromTransport() {
@@ -2458,7 +2994,7 @@ function renderTimelineGrid(beatGrid, duration) {
 }
 
 function renderWaveformBed(slot, maxBar) {
-  const peaks = arrangedWaveformPeaks(slot);
+  const peaks = appendTimelineTailPeaks(slot, arrangedWaveformPeaks(slot));
   const bars = peaks.length ? peaks.length : Math.min(220, Math.max(48, Math.round(maxBar * 1.5)));
   const fragment = document.createDocumentFragment();
   for (let index = 0; index < bars; index += 1) {
@@ -2658,7 +3194,7 @@ function measurePointFromPointer(event, slot) {
   const rect = els.timelineSurface.getBoundingClientRect();
   const timelineWidth = Math.max(1, els.timelineSurface.clientWidth * state.timelineZoom);
   const x = Math.max(0, Math.min(timelineWidth, event.clientX - rect.left + els.timelineSurface.scrollLeft));
-  const duration = slotWaveformDuration(slot);
+  const duration = slotTimelineDuration(slot);
   const targetSeconds = (x / timelineWidth) * duration;
   const measureGrid = fourBeatSnapGrid(beatGrid);
   return nearestBeat(measureGrid.length ? measureGrid : beatGrid, targetSeconds);
@@ -2672,7 +3208,7 @@ function renderRegionSketchSelection(slot) {
     return;
   }
   const range = normalizedRegionSketchRange(sketch);
-  const duration = slotWaveformDuration(slot);
+  const duration = slotTimelineDuration(slot);
   const startTime = timeForBarBeat(slot, range.startBar, 1);
   const endTime = timeForBarBeat(slot, range.endBar, 1);
   const left = percentForTime(startTime, duration);
@@ -2741,6 +3277,7 @@ function setTimelineTransportPoint(slot, point, options = {}) {
   state.scrubBySlot[slot.slot] = point;
   renderScrubPlayhead(slot);
   updateWaveformReadout(slot);
+  renderAudioAlignmentStatus(slot);
   renderTransportReadout(slot);
   if (options.seekPlayback) seekPlaybackToPoint(slot, point);
 }
@@ -2757,7 +3294,7 @@ function snappedBeatFromPointer(event, slot) {
   const rect = els.timelineSurface.getBoundingClientRect();
   const timelineWidth = Math.max(1, els.timelineSurface.clientWidth * state.timelineZoom);
   const x = Math.max(0, Math.min(timelineWidth, event.clientX - rect.left + els.timelineSurface.scrollLeft));
-  const duration = slotWaveformDuration(slot);
+  const duration = slotTimelineDuration(slot);
   const targetSeconds = (x / timelineWidth) * duration;
   const lastBeat = beatGrid.at(-1);
   if (lastBeat && targetSeconds > Number(lastBeat.timeSeconds || 0)) {
@@ -2792,9 +3329,9 @@ function sourceBeatGrid(slot) {
 
 function visualBeatGrid(slot) {
   const source = sourceBeatGrid(slot);
-  if (!arrangementEnabled(slot)) return source;
+  if (!arrangementEnabled(slot)) return extendBeatGridForTimeline(source);
   const blocks = arrangedBlocks(slot);
-  if (!blocks.length) return source;
+  if (!blocks.length) return extendBeatGridForTimeline(source);
   const arranged = [];
   let fallbackGlobalBeat = 0;
   blocks.forEach((block) => {
@@ -2818,7 +3355,63 @@ function visualBeatGrid(slot) {
       fallbackGlobalBeat += 1;
     });
   });
-  return arranged.length ? arranged : source;
+  return extendBeatGridForTimeline(arranged.length ? arranged : source);
+}
+
+function appendTimelineTailPeaks(slot, peaks) {
+  if (!Array.isArray(peaks) || !peaks.length) return peaks;
+  const audioDuration = slotWaveformDuration(slot);
+  const timelineDuration = slotTimelineDuration(slot);
+  if (timelineDuration <= audioDuration + 0.001) return peaks;
+  const tailCount = Math.ceil(peaks.length * ((timelineDuration - audioDuration) / Math.max(0.001, audioDuration)));
+  return peaks.concat(Array(Math.min(400, Math.max(1, tailCount))).fill(0));
+}
+
+function extendBeatGridForTimeline(beatGrid, extraMeasures = 8) {
+  const source = Array.isArray(beatGrid) ? beatGrid.slice() : [];
+  if (source.length < 2 || extraMeasures <= 0) return source;
+  const last = source.at(-1);
+  const previous = source.at(-2);
+  const beatSeconds = Math.max(0.001, Number(last.timeSeconds || 0) - Number(previous.timeSeconds || 0));
+  const beatsPerMeasure = beatsPerMeasureFromGrid(source);
+  const extended = source.slice();
+  let measure = Number(last.measure || 1);
+  let beat = Number(last.beat || last.beatInMeasure || beatsPerMeasure);
+  let globalBeat = gridGlobalBeat(last, source.length - 1);
+  let timeSeconds = Number(last.timeSeconds || 0);
+  const beatsToAdd = Math.max(0, Math.floor(extraMeasures * beatsPerMeasure));
+  for (let index = 0; index < beatsToAdd; index += 1) {
+    beat += 1;
+    if (beat > beatsPerMeasure) {
+      beat = 1;
+      measure += 1;
+    }
+    globalBeat += 1;
+    timeSeconds += beatSeconds;
+    extended.push({
+      ...last,
+      timeSeconds,
+      measure,
+      beat,
+      beatInMeasure: beat,
+      globalBeat,
+      isDownbeat: beat === 1,
+      timelineTail: true
+    });
+  }
+  return extended;
+}
+
+function beatsPerMeasureFromGrid(beatGrid) {
+  const measures = new Map();
+  beatGrid.forEach((beat) => {
+    const measure = Number(beat.measure);
+    const beatNumber = Number(beat.beat || beat.beatInMeasure);
+    if (!Number.isFinite(measure) || !Number.isFinite(beatNumber)) return;
+    measures.set(measure, Math.max(measures.get(measure) || 0, beatNumber));
+  });
+  const values = [...measures.values()].filter((value) => value > 0);
+  return Math.max(1, Math.round(values.at(-1) || values[0] || 4));
 }
 
 function percentForTime(timeSeconds, durationSeconds) {
@@ -2840,12 +3433,14 @@ function nearestBeat(beatGrid, targetSeconds) {
 }
 
 function nearestTransportSnap(beatGrid, targetSeconds) {
+  if (currentTimelineSnap() === "free") return beatAtTime(beatGrid, targetSeconds);
   if (currentTimelineSnap() !== "measure") return nearestBeat(beatGrid, targetSeconds);
   const measureGrid = fourBeatSnapGrid(beatGrid);
   return nearestBeat(measureGrid.length ? measureGrid : beatGrid, targetSeconds);
 }
 
 function currentTimelineSnap() {
+  if (els.timelineSnap?.value === "free") return "free";
   return ["measure", "bar"].includes(els.timelineSnap?.value) ? "measure" : "beat";
 }
 
@@ -2925,7 +3520,7 @@ function renderScrubPlayhead(slot) {
     els.waveformPlayhead.title = "Start";
     return;
   }
-  const duration = slotWaveformDuration(slot);
+  const duration = slotTimelineDuration(slot);
   const percent = duration > 0 ? Math.max(0, Math.min(100, (point.timeSeconds / duration) * 100)) : 0;
   const surfaceWidth = Math.max(1, els.timelineSurface?.clientWidth || 1);
   const playheadX = surfaceWidth * state.timelineZoom * (percent / 100);
@@ -3031,6 +3626,13 @@ function slotWaveformDuration(slot) {
   const beatGrid = visualBeatGrid(slot);
   const gridDuration = Number(beatGrid.at(-1)?.timeSeconds || 0);
   return Math.max(gridDuration, 1);
+}
+
+function slotTimelineDuration(slot) {
+  const audioDuration = slotWaveformDuration(slot);
+  const beatGrid = visualBeatGrid(slot);
+  const gridDuration = Number(beatGrid.at(-1)?.timeSeconds || 0);
+  return Math.max(audioDuration, gridDuration, 1);
 }
 
 function cueAtBeat(cues, point) {
@@ -3286,7 +3888,7 @@ function openTimelineRegionContextMenu(event) {
 
 function regionEntryFromTimelinePointer(event, slot) {
   if (!slot) return null;
-  const duration = slotWaveformDuration(slot);
+  const duration = slotTimelineDuration(slot);
   if (!duration) return null;
   const rect = els.timelineSurface.getBoundingClientRect();
   const timelineWidth = Math.max(1, els.timelineSurface.clientWidth * state.timelineZoom);
@@ -3480,7 +4082,7 @@ function reorderArrangementBlockByPointer(event, slot, arrangedRange) {
   const timelineWidth = Math.max(1, els.regionLane.clientWidth);
   const x = Math.max(0, Math.min(timelineWidth, event.clientX - rect.left + els.timelineSurface.scrollLeft));
   const percent = Math.max(0, Math.min(100, (x / timelineWidth) * 100));
-  const duration = slotWaveformDuration(slot);
+  const duration = slotTimelineDuration(slot);
   const pointerTime = (percent / 100) * duration;
   const entries = arrangedRegionEntries(slot);
   const target = entries.find((entry) => {
@@ -4105,6 +4707,7 @@ function trimSongStartToPlayhead() {
   arrangement.trimStartBeat = Number(point.beat || 1);
   arrangement.trimStartSeconds = trimStartSeconds;
   arrangement.enabled = true;
+  arrangement.updatedAt = new Date().toISOString();
   selected.arrangementCache = null;
   renderSelectedMetadata();
   scheduleMetadataAutosave();
@@ -4131,6 +4734,7 @@ function trimSongEndToPlayhead() {
   arrangement.trimEndBeat = Number(point.beat || 1);
   arrangement.trimEndSeconds = trimEndSeconds;
   arrangement.enabled = true;
+  arrangement.updatedAt = new Date().toISOString();
   selected.arrangementCache = null;
   renderSelectedMetadata();
   scheduleMetadataAutosave();
@@ -4749,14 +5353,23 @@ function parseMeasureBeat(value) {
 }
 
 async function saveSelectedMetadata() {
-  const selected = selectedMetadata();
+  let selected = selectedMetadata();
   if (!selected) return;
   const keepEditorFocus = metadataInputHasFocus();
   commitFocusedMetadataInput(selected);
+  const selectedBpm = Number(els.tempoBpm.value || 0) || null;
+  const setlistIndex = Number(selected.slot) - 1;
+  const setlistSong = state.setlist[setlistIndex] || null;
+  if (selectedBpm && setlistSong && Math.abs(Number(setlistSong.bpm || 0) - selectedBpm) >= 0.001) {
+    await updateSetlistSongBpm(setlistIndex, selectedBpm);
+    selected = selectedMetadata();
+    if (!selected) return;
+    commitFocusedMetadataInput(selected);
+  }
   selected.tempoMap = {
     ...(selected.tempoMap || {}),
     key: els.tempoKey.value.trim(),
-    bpm: Number(els.tempoBpm.value || 0) || null,
+    bpm: selectedBpm,
     timeSignature: els.tempoTimeSignature.value.trim()
   };
   state.setMetadata = await api(`/api/set-metadata/current/slot/${selected.slot}`, {
@@ -4852,7 +5465,11 @@ function renderMetadataAuditReport(result) {
 
 function metadataInputHasFocus() {
   const active = document.activeElement;
-  return Boolean(active instanceof HTMLInputElement && (active.dataset.regionField || active.dataset.cueField));
+  return Boolean(active instanceof HTMLInputElement && (
+    active.dataset.regionField
+    || active.dataset.cueField
+    || active === els.tempoBpm
+  ));
 }
 
 function metadataNameInputHasFocus() {
@@ -4872,7 +5489,24 @@ function commitFocusedMetadataInput(selected = selectedMetadata()) {
     commitRegionInputValue(active, selected);
   } else if (active.dataset.cueField) {
     commitCueInputValue(active, selected);
+  } else if (active === els.tempoBpm) {
+    normalizeTempoBpmInput();
   }
+}
+
+function normalizeTempoBpmInput() {
+  if (!els.tempoBpm || els.tempoBpm.value === "") return;
+  const bpm = Math.max(1, Math.min(300, Math.round(Number(els.tempoBpm.value || 0))));
+  if (Number.isFinite(bpm)) els.tempoBpm.value = String(bpm);
+}
+
+function stepTempoBpmWithArrowKeys(event) {
+  if (!els.tempoBpm || !["ArrowUp", "ArrowDown"].includes(event.key)) return;
+  event.preventDefault();
+  const current = Number(els.tempoBpm.value || selectedMetadata()?.tempoMap?.bpm || 1);
+  const delta = event.key === "ArrowUp" ? 1 : -1;
+  const next = Math.max(1, Math.min(300, Math.round(current + delta)));
+  els.tempoBpm.value = String(next);
 }
 
 function commitRegionInputValue(input, selected = selectedMetadata()) {
@@ -5082,15 +5716,10 @@ function renderSetlist() {
       els.setlistSlots.append(transitionTile(transition));
     }
   });
-  if (state.openTransitionFromSlot !== null) {
-    window.requestAnimationFrame(() => {
-      const tile = els.setlistSlots.querySelector(`.transition-tile[data-from-slot="${state.openTransitionFromSlot}"]`);
-      const editor = tile?.querySelector(".transition-editor");
-      if (tile && editor) {
-        tile.classList.add("editing");
-        positionTransitionEditor(tile, editor);
-      }
-    });
+  if (!transitionEditorHasFocus()) {
+    renderTransitionEditorDock();
+  } else {
+    syncTransitionTileEditingState();
   }
 }
 
@@ -5102,41 +5731,57 @@ function transitionTile(transition) {
   const tile = document.createElement("article");
   tile.className = `transition-tile transition-${transition.mode}`;
   tile.dataset.fromSlot = String(transition.fromSlot);
-  const locked = state.playbackState?.mode === "performance";
+  tile.classList.toggle("editing", Number(state.openTransitionFromSlot) === Number(transition.fromSlot));
   const summary = document.createElement("button");
   summary.type = "button";
   summary.className = "transition-summary";
-  summary.disabled = locked;
   summary.innerHTML = `
     <strong>${escapeHtml(transitionModeLabel(transition.mode))}</strong>
     <span>${escapeHtml(transitionPadSummary(transition))}</span>
-    ${transitionDurationRelevant(transition.mode) ? `<small>${Number(transition.durationSeconds || 5)}s</small>` : ""}
+    <small>${transitionDurationForMode(transition, transition.mode)}s</small>
   `;
-  summary.addEventListener("click", (event) => {
+  const toggleEditor = (event) => {
     event.preventDefault();
     event.stopPropagation();
-    if (locked) return;
     const fromSlot = Number(transition.fromSlot);
     const willOpen = Number(state.openTransitionFromSlot) !== fromSlot;
     state.openTransitionFromSlot = willOpen ? fromSlot : null;
-    document.querySelectorAll(".transition-tile.editing").forEach((item) => {
-      if (item !== tile) item.classList.remove("editing");
-    });
+    document.querySelectorAll(".transition-tile.editing").forEach((item) => item.classList.remove("editing"));
     tile.classList.toggle("editing", willOpen);
-    if (willOpen) {
-      window.requestAnimationFrame(() => positionTransitionEditor(tile, editor));
-    }
+    renderTransitionEditorDock();
+  };
+  tile.addEventListener("click", toggleEditor);
+  summary.addEventListener("click", toggleEditor);
+
+  tile.append(summary);
+  return tile;
+}
+
+function renderTransitionEditorDock(options = {}) {
+  if (!els.transitionEditorDock) return;
+  if (!options.force && transitionEditorHasFocus()) return;
+  const transition = state.openTransitionFromSlot === null ? null : transitionAfterSlot(state.openTransitionFromSlot);
+  els.transitionEditorDock.replaceChildren();
+  els.transitionEditorDock.classList.toggle("hidden", !transition);
+  if (!transition) return;
+
+  const title = document.createElement("div");
+  title.className = "transition-dock-title";
+  title.innerHTML = `
+    <strong>Transition after slot ${Number(transition.fromSlot)}</strong>
+    <span>${transition.toSlot ? `to slot ${Number(transition.toSlot)}` : "end of set"}</span>
+  `;
+  const close = document.createElement("button");
+  close.type = "button";
+  close.textContent = "Close";
+  close.addEventListener("click", (event) => {
+    event.stopPropagation();
+    state.openTransitionFromSlot = null;
+    renderTransitionEditorDock({ force: true });
+    renderSetlist();
   });
 
-  const editor = document.createElement("div");
-  editor.className = "transition-editor";
-  const mode = selectControl("Mode", transition.mode, [
-    ["cue-next", "Cue Next"],
-    ["stay", "Stay"],
-    ["autolink", "AutoLink"],
-    ["crossfade", "Crossfade"],
-    ["overlap", "Overlap"]
-  ]);
+  const mode = transitionTypeControl(transition.mode);
   const continuePad = document.createElement("label");
   continuePad.className = "transition-toggle";
   continuePad.innerHTML = `<input type="checkbox" ${transition.continuePad !== false ? "checked" : ""}> <span>Pad</span>`;
@@ -5147,46 +5792,107 @@ function transitionTile(transition) {
     ["crossfade-to-next-key", "Pad Xfade"]
   ]);
   const duration = document.createElement("label");
-  duration.textContent = "Seconds";
+  duration.className = "transition-duration-field";
+  duration.textContent = "Transition Time";
   const durationInput = document.createElement("input");
   durationInput.type = "number";
-  durationInput.min = "1";
   durationInput.max = "30";
-  durationInput.step = "1";
-  durationInput.value = String(Number(transition.durationSeconds || 5));
+  durationInput.step = "0.25";
+  durationInput.min = transition.mode === "crossfade" ? "0.25" : "0";
+  durationInput.value = String(transitionDurationForMode(transition, transition.mode));
   duration.append(durationInput);
-  editor.append(mode.label, continuePad, pad.label, duration);
-  editor.addEventListener("pointerdown", (event) => event.stopPropagation());
-  editor.addEventListener("click", (event) => event.stopPropagation());
+  const durationHint = document.createElement("span");
+  durationHint.className = "transition-duration-hint";
+  durationHint.textContent = `${transitionModeLabel(transition.mode)} lead`;
+  duration.append(durationHint);
   const saveTransition = () => {
+    const nextMode = mode.value();
+    const durationByMode = {
+      ...normalizeTransitionDurationByMode(transition.durationByMode || transition),
+      [transitionDurationKey(nextMode)]: normalizeTransitionDurationSeconds(
+        durationInput.value,
+        defaultTransitionDurationForMode(nextMode),
+        nextMode === "crossfade" ? 0.25 : 0
+      )
+    };
     updateTransition(transition.fromSlot, {
-      mode: mode.select.value,
+      mode: nextMode,
       continuePad: continuePad.querySelector("input").checked,
       padBehavior: pad.select.value,
-      durationSeconds: Number(durationInput.value || 5)
+      durationSeconds: transitionDurationForMode({ durationByMode }, nextMode),
+      durationByMode
     });
   };
-  [mode.select, pad.select, durationInput, continuePad.querySelector("input")].forEach((control) => {
+  mode.buttons.forEach((button) => {
+    button.addEventListener("click", (event) => {
+      event.stopPropagation();
+      mode.setValue(button.dataset.transitionMode);
+      const nextMode = button.dataset.transitionMode;
+      durationInput.min = nextMode === "crossfade" ? "0.25" : "0";
+      durationInput.value = String(transitionDurationForMode(transition, nextMode));
+      durationHint.textContent = `${transitionModeLabel(nextMode)} lead`;
+      saveTransition();
+    });
+  });
+  [pad.select, durationInput, continuePad.querySelector("input")].forEach((control) => {
     control.addEventListener("change", saveTransition);
     control.addEventListener("click", (event) => event.stopPropagation());
+    control.addEventListener("pointerdown", (event) => event.stopPropagation());
   });
-  tile.append(summary, editor);
-  return tile;
+  durationInput.addEventListener("keydown", (event) => {
+    event.stopPropagation();
+    if (event.key === "Enter") {
+      durationInput.blur();
+      saveTransition();
+    }
+  });
+  durationInput.addEventListener("blur", saveTransition);
+
+  const fields = document.createElement("div");
+  fields.className = "transition-dock-fields";
+  fields.append(mode.label, continuePad, pad.label, duration);
+  els.transitionEditorDock.append(title, fields, close);
 }
 
-function positionTransitionEditor(tile, editor) {
-  if (!tile || !editor) return;
-  const rect = tile.getBoundingClientRect();
-  const width = editor.offsetWidth || 260;
-  const height = editor.offsetHeight || 210;
-  const left = Math.min(window.innerWidth - width - 12, Math.max(12, rect.left));
-  const below = rect.bottom + 8;
-  const above = rect.top - height - 8;
-  const top = below + height <= window.innerHeight - 12
-    ? below
-    : Math.max(12, above);
-  editor.style.left = `${left}px`;
-  editor.style.top = `${top}px`;
+function transitionEditorHasFocus() {
+  return Boolean(els.transitionEditorDock && els.transitionEditorDock.contains(document.activeElement));
+}
+
+function syncTransitionTileEditingState() {
+  document.querySelectorAll(".transition-tile").forEach((tile) => {
+    tile.classList.toggle("editing", Number(tile.dataset.fromSlot) === Number(state.openTransitionFromSlot));
+  });
+}
+
+function transitionTypeControl(value) {
+  const label = document.createElement("label");
+  label.textContent = "Type";
+  label.className = "transition-type-field";
+  const group = document.createElement("div");
+  group.className = "transition-type-options";
+  const options = [
+    ["cue-next", "Cue Next"],
+    ["stay", "Stay"],
+    ["crossfade", "Crossfade"]
+  ];
+  const buttons = options.map(([optionValue, text]) => {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.dataset.transitionMode = optionValue;
+    button.textContent = text;
+    button.classList.toggle("active", optionValue === value);
+    group.append(button);
+    return button;
+  });
+  label.append(group);
+  return {
+    label,
+    buttons,
+    value: () => group.querySelector("button.active")?.dataset.transitionMode || "cue-next",
+    setValue: (nextValue) => {
+      buttons.forEach((button) => button.classList.toggle("active", button.dataset.transitionMode === nextValue));
+    }
+  };
 }
 
 function selectControl(labelText, value, options) {
@@ -5210,17 +5916,74 @@ function updateTransition(fromSlot, patch) {
     if (Number(transition.fromSlot) !== Number(fromSlot)) return transition;
     return { ...transition, ...patch };
   }));
-  renderSetlist();
-  scheduleSetlistSave();
+  refreshTransitionTile(fromSlot);
+  scheduleTransitionSave();
+}
+
+function refreshTransitionTile(fromSlot) {
+  const transition = transitionAfterSlot(fromSlot);
+  const tile = els.setlistSlots?.querySelector(`.transition-tile[data-from-slot="${fromSlot}"]`);
+  const summary = tile?.querySelector(".transition-summary");
+  if (!transition || !tile || !summary) return;
+  tile.className = `transition-tile transition-${transition.mode}`;
+  tile.classList.toggle("editing", Number(state.openTransitionFromSlot) === Number(fromSlot));
+  summary.innerHTML = `
+    <strong>${escapeHtml(transitionModeLabel(transition.mode))}</strong>
+    <span>${escapeHtml(transitionPadSummary(transition))}</span>
+    <small>${transitionDurationForMode(transition, transition.mode)}s</small>
+  `;
+}
+
+function scheduleTransitionSave() {
+  clearTimeout(state.transitionSaveTimer);
+  state.transitionSaveTimer = setTimeout(saveTransitionSettings, 150);
+}
+
+async function saveTransitionSettings() {
+  clearTimeout(state.transitionSaveTimer);
+  state.transitionSaveTimer = null;
+  if (state.transitionSaveInFlight) {
+    state.transitionSavePending = true;
+    return;
+  }
+  state.transitionSaveInFlight = true;
+  try {
+    const saved = await api("/api/setlist/current/transitions", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ transitions: state.setlistTransitions })
+    });
+    state.setlistTransitions = normalizeClientTransitions(saved.transitions || [], state.setlist);
+    state.setlistFingerprint = setFingerprintClient({
+      slots: state.setlist.map((song, index) => song ? {
+        slot: index + 1,
+        songId: song.id,
+        key: song.key,
+        selectedKey: song.selectedKey,
+        padKey: song.padKey,
+        padFileName: song.padFileName,
+        bpm: song.bpm,
+        timeSignature: song.timeSignature
+      } : { slot: index + 1, songId: null }),
+      transitions: state.setlistTransitions
+    });
+    renderPlaybackState();
+  } catch (error) {
+    setAlert(`Transition save failed: ${error.message}`);
+  } finally {
+    state.transitionSaveInFlight = false;
+    if (state.transitionSavePending) {
+      state.transitionSavePending = false;
+      await saveTransitionSettings();
+    }
+  }
 }
 
 function transitionModeLabel(mode) {
   return {
     "cue-next": "Cue Next",
     stay: "Stay",
-    autolink: "AutoLink",
-    crossfade: "Crossfade",
-    overlap: "Overlap"
+    crossfade: "Crossfade"
   }[mode] || "Cue Next";
 }
 
@@ -5233,19 +5996,73 @@ function transitionPadSummary(transition) {
   }[transition.padBehavior] || "Pad -> Next";
 }
 
-function transitionDurationRelevant(mode) {
-  return ["crossfade", "overlap"].includes(mode);
+function normalizeTransitionMode(mode, toSlot = true) {
+  if (!toSlot) return "stay";
+  if (mode === "overlap") return "crossfade";
+  if (mode === "autolink") return "cue-next";
+  return ["cue-next", "stay", "crossfade"].includes(mode) ? mode : "cue-next";
+}
+
+function transitionDurationKey(mode) {
+  if (mode === "crossfade") return "crossfade";
+  if (mode === "stay") return "stay";
+  return "cueNext";
+}
+
+function defaultTransitionDurationForMode(mode) {
+  if (mode === "crossfade") return 5;
+  if (mode === "stay") return 0;
+  return 0.25;
+}
+
+function normalizeTransitionDurationByMode(value = {}) {
+  const legacy = value.durationSeconds;
+  return {
+    crossfade: normalizeTransitionDurationSeconds(value.crossfade ?? value.crossfadeSeconds ?? legacy, 5, 0.25),
+    cueNext: normalizeTransitionDurationSeconds(value.cueNext ?? value.cueNextSeconds ?? legacy, 0.25, 0),
+    stay: normalizeTransitionDurationSeconds(value.stay ?? value.staySeconds ?? legacy, 0, 0)
+  };
+}
+
+function normalizeTransitionDurationByModeForMode(value = {}, mode = "cue-next") {
+  if (value.durationByMode && typeof value.durationByMode === "object") {
+    return normalizeTransitionDurationByMode(value.durationByMode);
+  }
+  const defaults = normalizeTransitionDurationByMode({});
+  if (value.durationSeconds !== undefined) {
+    defaults[transitionDurationKey(mode)] = normalizeTransitionDurationSeconds(
+      value.durationSeconds,
+      defaultTransitionDurationForMode(mode),
+      mode === "crossfade" ? 0.25 : 0
+    );
+  }
+  return defaults;
+}
+
+function transitionDurationForMode(transition = {}, mode = "") {
+  const durations = normalizeTransitionDurationByMode(transition.durationByMode || transition);
+  return durations[transitionDurationKey(mode)];
+}
+
+function normalizeTransitionDurationSeconds(value, fallback = 5, minimum = 0.25) {
+  const number = Number(value);
+  const selected = Number.isFinite(number) && number >= 0 ? number : fallback;
+  return Math.max(minimum, Math.min(30, Math.round(selected * 4) / 4));
 }
 
 function normalizeClientTransitions(transitions, slots = state.setlist) {
   const existingByPair = new Map((Array.isArray(transitions) ? transitions : []).map((transition) => ({
     fromSlot: Number(transition.fromSlot || 0),
     toSlot: Number(transition.toSlot || 0) || null,
-    mode: transition.toSlot && ["cue-next", "stay", "autolink", "crossfade", "overlap"].includes(transition.mode) ? transition.mode : "stay",
+    mode: normalizeTransitionMode(transition.mode, transition.toSlot),
     padBehavior: transition.toSlot && ["off", "hold-current-key", "next-song-key", "crossfade-to-next-key"].includes(transition.padBehavior) ? transition.padBehavior : "off",
-    durationSeconds: Number(transition.durationSeconds || 5),
+    durationByMode: normalizeTransitionDurationByModeForMode(transition, normalizeTransitionMode(transition.mode, transition.toSlot)),
     continuePad: transition.toSlot ? transition.continuePad !== false : false
   })).filter((transition) => transition.fromSlot)
+    .map((transition) => ({
+      ...transition,
+      durationSeconds: transitionDurationForMode(transition, transition.mode)
+    }))
     .map((transition) => [`${transition.fromSlot}:${transition.toSlot || 0}`, transition]));
   const filled = (Array.isArray(slots) ? slots : [])
     .map((slot, index) => slot && (slot.songId || slot.id) ? Number(slot.slot || index + 1) : 0)
@@ -5258,7 +6075,8 @@ function normalizeClientTransitions(transitions, slots = state.setlist) {
       toSlot,
       mode: toSlot ? "cue-next" : "stay",
       padBehavior: toSlot ? "next-song-key" : "off",
-      durationSeconds: 5,
+      durationByMode: normalizeTransitionDurationByMode({}),
+      durationSeconds: transitionDurationForMode({ durationByMode: normalizeTransitionDurationByMode({}) }, toSlot ? "cue-next" : "stay"),
       continuePad: Boolean(toSlot)
     };
   });
@@ -5269,6 +6087,9 @@ function setFingerprintClient(setlist) {
     slot: Number(slot.slot || 0),
     songId: slot.songId || "",
     key: slot.selectedKey || slot.key || "",
+    padKey: slot.padKey || "",
+    padKeyOverride: slot.padKeyOverride || "",
+    padFileName: slot.padFileName || "",
     bpm: slot.bpm || "",
     timeSignature: slot.timeSignature || ""
   }));
@@ -5278,6 +6099,7 @@ function setFingerprintClient(setlist) {
     mode: transition.mode,
     padBehavior: transition.padBehavior,
     durationSeconds: transition.durationSeconds,
+    durationByMode: transition.durationByMode,
     continuePad: transition.continuePad
   }));
   return JSON.stringify({ slots, transitions });
@@ -5482,6 +6304,8 @@ function setlistSongFromLoadedSong(song) {
     selectedKey: canonicalKey(song.key || ""),
     transposeCents: 0,
     padKey: canonicalKey(song.padKey || song.key || ""),
+    padKeyOverride: "",
+    padFileName: "",
     bpm: song.bpm || null,
     timeSignature: song.timeSignature || "",
     trackCount: song.trackCount || null,
@@ -5562,12 +6386,30 @@ function populatePlaybackKeySelect() {
   }
 }
 
+function populatePlaybackPadSelect() {
+  if (!els.playbackPadSelect) return;
+  els.playbackPadSelect.replaceChildren();
+  const auto = document.createElement("option");
+  auto.value = "";
+  auto.textContent = "Auto";
+  els.playbackPadSelect.append(auto);
+  for (const pad of state.padOptions || []) {
+    const option = document.createElement("option");
+    option.value = pad.fileName || "";
+    option.textContent = pad.label || pad.fileName || "";
+    els.playbackPadSelect.append(option);
+  }
+}
+
 function holdPlaybackKeyEditor() {
   state.playbackKeyInteractionUntil = Date.now() + 5000;
 }
 
 function playbackKeyEditorHeld() {
-  return document.activeElement === els.playbackKeySelect || Date.now() < state.playbackKeyInteractionUntil;
+  const active = document.activeElement;
+  return active === els.playbackKeySelect
+    || active === els.playbackPadSelect
+    || Date.now() < state.playbackKeyInteractionUntil;
 }
 
 function renderPlaybackKeyEditor(selected) {
@@ -5580,12 +6422,24 @@ function renderPlaybackKeyEditor(selected) {
   if (!held) {
     els.playbackKeySelect.value = keyOptions().includes(key) ? key : "";
   }
+  if (els.playbackPadSelect && !held) {
+    const padFileName = setlistSong?.padFileName || "";
+    const hasPadFile = !padFileName || [...els.playbackPadSelect.options].some((option) => option.value === padFileName);
+    els.playbackPadSelect.value = hasPadFile ? padFileName : "";
+  }
   const disabled = !selected || state.playbackState?.mode === "performance";
   if (!held || disabled) {
     els.playbackKeySelect.disabled = disabled;
   }
+  if (els.playbackPadSelect && (!held || disabled)) els.playbackPadSelect.disabled = disabled;
   if (els.playbackKeyOriginal) els.playbackKeyOriginal.textContent = `Original: ${originalKey || "--"}`;
   if (els.playbackKeyTranspose) els.playbackKeyTranspose.textContent = `Transpose: ${transposeCents} cents`;
+  if (els.playbackPadStatus) {
+    const padMode = setlistSong?.padFileName
+      ? `Manual: ${setlistSong.padFileName}`
+      : `Auto: ${canonicalKey(setlistSong?.padKey || key || "") || "--"}`;
+    els.playbackPadStatus.textContent = selected ? `Pad: ${padMode}` : "Pad: select a song";
+  }
   if (els.playbackKeyStatus) {
     const padKey = canonicalKey(setlistSong?.padKey || key || "");
     els.playbackKeyStatus.textContent = selected
@@ -5622,6 +6476,58 @@ async function updateSetlistSongKey(index, selectedKey) {
   } catch (error) {
     setAlert(`Key change failed: ${error.message}`);
     renderSetlist();
+  }
+}
+
+async function updateSetlistSongBpm(index, selectedBpm) {
+  const song = state.setlist[index];
+  if (!song || state.playbackState?.mode === "performance") return;
+  try {
+    setAlert(`Preparing ${song.title} at ${selectedBpm} BPM...`);
+    const saved = await api(`/api/setlist/slot/${index + 1}/bpm`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ bpm: selectedBpm })
+    });
+    state.setlist = saved.slots.map((slot) => slot.songId ? setlistSongFromSlot(slot) : null);
+    state.setlistTransitions = normalizeClientTransitions(saved.transitions || state.setlistTransitions);
+    await loadPlaybackState();
+    await loadCacheReport();
+    await loadSetMetadata();
+    renderSetlist();
+    renderSelectedMetadata();
+    renderLoadedSong();
+    setAlert(`Prepared ${song.title} at ${selectedBpm} BPM. Confirm set before Performance.`);
+  } catch (error) {
+    setAlert(`BPM change failed: ${error.message}`);
+    renderSetlist();
+    throw error;
+  }
+}
+
+async function updateSetlistSongPad(index, padFileName) {
+  const song = state.setlist[index];
+  if (!song || state.playbackState?.mode === "performance") return;
+  try {
+    const label = padFileName || "Auto";
+    setAlert(`Saving pad selection: ${label}...`);
+    const saved = await api(`/api/setlist/slot/${index + 1}/pad`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ padFileName, auto: !padFileName })
+    });
+    state.setlist = saved.slots.map((slot) => slot.songId ? setlistSongFromSlot(slot) : null);
+    state.setlistTransitions = normalizeClientTransitions(saved.transitions || state.setlistTransitions);
+    await loadPlaybackState();
+    await loadCacheReport();
+    await loadSetMetadata();
+    renderSetlist();
+    renderSelectedMetadata();
+    renderLoadedSong();
+    setAlert(`Pad selection saved for ${song.title}. Confirm set before Performance.`);
+  } catch (error) {
+    setAlert(`Pad selection failed: ${error.message}`);
+    renderSelectedMetadata();
   }
 }
 
@@ -5892,9 +6798,25 @@ function cleanStemLabel(name) {
 }
 
 function loadSavedMixerHeight() {
-  const saved = Number(window.localStorage?.getItem("playbackV2.mixerPanelHeight") || 0);
+  state.mixerPanelHeightMode = state.playbackState?.mode || "edit";
+  const key = mixerHeightStorageKey();
+  const saved = Number(window.localStorage?.getItem(key) || window.localStorage?.getItem("playbackV2.mixerPanelHeight") || 0);
   state.mixerPanelHeight = saved > 0 ? saved : null;
   applyMixerPanelHeight();
+}
+
+function syncMixerHeightForMode() {
+  const mode = state.playbackState?.mode || "edit";
+  if (state.mixerPanelHeightMode === mode) return;
+  state.mixerPanelHeightMode = mode;
+  const saved = Number(window.localStorage?.getItem(mixerHeightStorageKey()) || 0);
+  state.mixerPanelHeight = saved > 0 ? saved : null;
+}
+
+function mixerHeightStorageKey() {
+  return state.playbackState?.mode === "performance"
+    ? "playbackV2.mixerPanelHeight.performance"
+    : "playbackV2.mixerPanelHeight.edit";
 }
 
 function defaultMixerPanelHeight() {
@@ -5902,22 +6824,30 @@ function defaultMixerPanelHeight() {
   const viewportHeight = window.innerHeight || 800;
   return isPerformance
     ? Math.round(clamp(viewportHeight * 0.38, 320, 540))
-    : 270;
+    : Math.round(clamp(viewportHeight * 0.24, 170, 230));
 }
 
 function mixerPanelHeightBounds() {
   const viewportHeight = window.innerHeight || 800;
   const isPerformance = state.playbackState?.mode === "performance";
   return {
-    min: isPerformance ? 220 : 170,
+    min: isPerformance ? 220 : 150,
     max: Math.max(240, viewportHeight - 190)
   };
 }
 
 function applyMixerPanelHeight() {
+  syncMixerHeightForMode();
   const bounds = mixerPanelHeightBounds();
   const height = Math.round(clamp(state.mixerPanelHeight || defaultMixerPanelHeight(), bounds.min, bounds.max));
   document.documentElement.style.setProperty("--mixer-panel-height", `${height}px`);
+}
+
+function resetMixerHeightForCurrentMode() {
+  state.mixerPanelHeight = null;
+  window.localStorage?.removeItem(mixerHeightStorageKey());
+  applyMixerPanelHeight();
+  setAlert("Mixer height reset.");
 }
 
 function beginMixerResize(event) {
@@ -5931,7 +6861,7 @@ function beginMixerResize(event) {
   };
   const onUp = () => {
     window.removeEventListener("pointermove", onMove);
-    window.localStorage?.setItem("playbackV2.mixerPanelHeight", String(state.mixerPanelHeight || ""));
+    window.localStorage?.setItem(mixerHeightStorageKey(), String(state.mixerPanelHeight || ""));
   };
   window.addEventListener("pointermove", onMove);
   window.addEventListener("pointerup", onUp, { once: true });
@@ -6056,6 +6986,8 @@ async function saveCurrentSetlist() {
       selectedKey: canonicalKey(song.selectedKey || song.key || ""),
       transposeCents: Number(song.transposeCents || 0),
       padKey: canonicalKey(song.padKey || song.selectedKey || song.key || ""),
+      padKeyOverride: canonicalKey(song.padKeyOverride || ""),
+      padFileName: song.padFileName || "",
       bpm: song.bpm || null,
       timeSignature: song.timeSignature || "",
       trackCount: song.trackCount || null
@@ -6099,7 +7031,13 @@ function setlistSongFromSlot(slot) {
     selectedKey: canonicalKey(slot.selectedKey || slot.key || ""),
     transposeCents: Number(slot.transposeCents || 0),
     padKey: canonicalKey(slot.padKey || slot.selectedKey || slot.key || ""),
+    padKeyOverride: canonicalKey(slot.padKeyOverride || ""),
+    padFileName: slot.padFileName || "",
     bpm: slot.bpm || null,
+    originalBpm: slot.originalBpm || slot.bpm || null,
+    selectedBpm: slot.selectedBpm || slot.bpm || null,
+    tempoRatio: Number(slot.tempoRatio || 1),
+    bpmOverride: Boolean(slot.bpmOverride),
     timeSignature: slot.timeSignature || "",
     trackCount: slot.trackCount || null,
     cacheStatus: slot.cacheStatus || "",

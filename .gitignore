@@ -5,6 +5,7 @@ __pycache__/
 *.pyc
 data/
 userData/
+scratch/
 _c-drive-archive/
 third_party/asio-sdk/
 native/juce-audio-engine/build/

@@ -9,7 +9,7 @@
   "scripts": {
     "start": "node server.js",
     "electron": "electron .",
-    "check": "node --check server.js && node --check public/app.js && node --check public/remote.js && node --check electron/main.cjs && node scripts/verify-architecture-alignment.mjs && node scripts/validate-pad-panic.mjs && node scripts/validate-transitions.mjs && node scripts/smoke-live-command-plans.mjs",
+    "check": "node --check server.js && node --check public/app.js && node --check public/remote.js && node --check electron/main.cjs && node scripts/verify-architecture-alignment.mjs && node scripts/validate-pad-panic.mjs && node scripts/validate-transitions.mjs && node scripts/validate-click-grid-profiles.mjs && node scripts/smoke-live-command-plans.mjs",
     "check:pad-panic": "node scripts/validate-pad-panic.mjs",
     "check:transitions": "node scripts/validate-transitions.mjs",
     "build:win": "electron-builder --win portable",
@@ -23,6 +23,7 @@
       "electron/**/*",
       "server.js",
       "package.json",
+      "click-patterns/**/*",
       "public/**/*",
       "docs/**/*",
       "pads/**/*",
@@ -50,5 +51,8 @@
   "devDependencies": {
     "electron": "^43.1.1",
     "electron-builder": "^26.15.3"
+  },
+  "dependencies": {
+    "qrcode": "^1.5.4"
   }
 }

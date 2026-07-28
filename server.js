@@ -6,6 +6,7 @@ import { createServer } from "node:http";
 import { networkInterfaces } from "node:os";
 import { basename, dirname, extname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import QRCode from "qrcode";
 
 const __dirname = fileURLToPath(new URL(".", import.meta.url));
 const PORT = Number(process.env.PORT || 5312);
@@ -28,7 +29,17 @@ const SONG_METADATA_DIR = join(DATA_DIR, "song-metadata");
 const SONG_OVERRIDES_DIR = join(DATA_DIR, "song-overrides");
 const KEY_CACHE_DIR = join(DATA_DIR, "key-cache");
 const APP_PADS_DIR = join(__dirname, "pads");
+const CLICK_PATTERN_DIR = join(__dirname, "click-patterns");
+const CLICK_PATTERN_FILES = {
+  "2/4": "2-4.wav",
+  "3/4": "3-4.wav",
+  "4/4": "4-4.wav",
+  "6/8": "6-8.wav",
+  "9/8": "6-8.wav",
+  "12/8": "12-8.wav"
+};
 const DYNAMIC_PAD_CACHE_DIR = join(CACHE_DIR, "dynamic-pads");
+const DYNAMIC_CLICK_CACHE_DIR = join(CACHE_DIR, "dynamic-clicks");
 const PUBLIC_DIR = join(__dirname, "public");
 const ENGINE_HELPER = "juce-audio-engine";
 const ENGINE_PROTOCOL_VERSION = 1;
@@ -48,11 +59,14 @@ const FFMPEG_EXE_CANDIDATES = [
 ].filter(Boolean);
 const ENGINE_HELPER_CANDIDATES = [
   process.env.JUCE_AUDIO_ENGINE_PATH,
+  join(__dirname, "native", "juce-audio-engine", "build-v2-current", "juce-audio-engine_artefacts", "Debug", "juce-audio-engine.exe"),
   join(__dirname, "native", "juce-audio-engine", "bin", "win-x64", "juce-audio-engine.exe"),
   join(__dirname, "native", "juce-audio-engine", "build", "juce-audio-engine_artefacts", "Release", "juce-audio-engine.exe"),
   join(__dirname, "native", "juce-audio-engine", "build", "juce-audio-engine_artefacts", "Debug", "juce-audio-engine.exe")
 ].filter(Boolean);
 let activePlaybackProcess = null;
+let preloadedPlaybackProcess = null;
+let preloadTransitionInFlight = false;
 let playbackCommandQueue = Promise.resolve();
 let liveSupervisorInFlight = false;
 let liveSupervisorLastError = "";
@@ -82,8 +96,9 @@ const PANIC_STATES = {
 };
 const CUE_MARKER_RULE_VERSION = "cue-marker-snapped-source-v3-2026-07-24";
 const KEY_CHANGE_CACHE_VERSION = "rubberband-key-cache-v1";
+const TEMPO_CHANGE_CACHE_VERSION = "rubberband-tempo-cache-v1";
 const KEY_OPTIONS = ["C", "Db", "D", "Eb", "E", "F", "Gb", "G", "Ab", "A", "Bb", "B"];
-const TRANSITION_MODES = new Set(["cue-next", "stay", "autolink", "crossfade", "overlap"]);
+const TRANSITION_MODES = new Set(["cue-next", "stay", "crossfade"]);
 const TRANSITION_PAD_BEHAVIORS = new Set(["off", "hold-current-key", "next-song-key", "crossfade-to-next-key"]);
 const DEFAULT_SETLIST_SLOT_COUNT = 6;
 
@@ -153,6 +168,9 @@ const httpServer = createServer(async (req, res) => {
     if (req.method === "GET" && url.pathname === "/api/system/info") {
       return json(res, systemInfo());
     }
+    if (req.method === "GET" && url.pathname === "/api/remote/qr") {
+      return remoteQrCode(url, res);
+    }
 
     if (req.method === "GET" && url.pathname === "/api/audio/devices") {
       return json(res, await loadAudioDevices());
@@ -160,6 +178,10 @@ const httpServer = createServer(async (req, res) => {
 
     if (req.method === "GET" && url.pathname === "/api/audio/diagnostics") {
       return json(res, await audioDeviceDiagnostics());
+    }
+
+    if (req.method === "GET" && url.pathname === "/api/pads/options") {
+      return json(res, await listPadOptions());
     }
 
     if (req.method === "PUT" && url.pathname === "/api/settings") {
@@ -180,10 +202,21 @@ const httpServer = createServer(async (req, res) => {
       return json(res, await update);
     }
 
+    if (req.method === "PUT" && url.pathname === "/api/setlist/current/transitions") {
+      const body = await readJsonBody(req);
+      return json(res, await updateCurrentSetlistTransitionsOnly(body.transitions || body));
+    }
+
     const slotKeyMatch = url.pathname.match(/^\/api\/setlist\/slot\/(\d+)\/key$/);
     if (req.method === "PUT" && slotKeyMatch) {
       const body = await readJsonBody(req);
       return json(res, await updateSetlistSlotKey(positiveNumber(slotKeyMatch[1]), body.key));
+    }
+
+    const slotBpmMatch = url.pathname.match(/^\/api\/setlist\/slot\/(\d+)\/bpm$/);
+    if (req.method === "PUT" && slotBpmMatch) {
+      const body = await readJsonBody(req);
+      return json(res, await updateSetlistSlotBpm(positiveNumber(slotBpmMatch[1]), body.bpm));
     }
 
     if (req.method === "GET" && url.pathname === "/api/playback/state") {
@@ -299,6 +332,15 @@ const httpServer = createServer(async (req, res) => {
       return json(res, await saveSlotMixer(Number(mixerSlotMatch[1]), body));
     }
 
+    if (req.method === "GET" && url.pathname === "/api/set-package/export") {
+      return json(res, await buildSetPackage());
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/set-package/import") {
+      const body = await readJsonBody(req);
+      return json(res, await importSetPackage(body.package || body));
+    }
+
     const songMatch = url.pathname.match(/^\/api\/songs\/([^/]+)$/);
     if (req.method === "GET" && songMatch) {
       const library = await loadLibrary();
@@ -371,6 +413,16 @@ async function updateCurrentSetlistTransaction(body) {
   if (nextFingerprint !== previousFingerprint) {
     await markSetUnconfirmed(setlist);
   }
+  return setlist;
+}
+
+async function updateCurrentSetlistTransitionsOnly(transitions) {
+  const current = await loadCurrentSetlist();
+  const setlist = normalizeSetlist({
+    ...current,
+    transitions: Array.isArray(transitions) ? transitions : []
+  });
+  await saveCurrentSetlist(setlist);
   return setlist;
 }
 
@@ -494,8 +546,6 @@ async function updateSettingsTransaction(input) {
 function settingsRequireJuceRestart(previous, next) {
   if (!sameText(previous.audioEngine.selectedDeviceName, next.audioEngine.selectedDeviceName)) return true;
   if (Number(previous.audioEngine.sampleRate) !== Number(next.audioEngine.sampleRate)) return true;
-  if (!sameText(previous.dynamicClick.clickSoundPath, next.dynamicClick.clickSoundPath)) return true;
-  if (!sameText(previous.dynamicClick.accentSoundPath, next.dynamicClick.accentSoundPath)) return true;
   if (!sameText(previous.dynamicCue.folderPath, next.dynamicCue.folderPath)) return true;
   if (!sameText(previous.pads.folderPath, next.pads.folderPath)) return true;
   return requiredOutputsForSettings(next) > requiredOutputsForSettings(previous);
@@ -511,7 +561,8 @@ function mergeSettingsUpdate(current, input = {}) {
     routing: input.routing ? { ...current.routing, ...input.routing } : current.routing,
     dynamicCue: { ...current.dynamicCue, ...(input.dynamicCue || {}) },
     pads: { ...current.pads, ...(input.pads || {}) },
-    dynamicClick: { ...current.dynamicClick, ...(input.dynamicClick || {}) }
+    dynamicClick: { ...current.dynamicClick, ...(input.dynamicClick || {}) },
+    proPresenterMidi: { ...current.proPresenterMidi, ...(input.proPresenterMidi || {}) }
   };
 
   merged.library.rootPath = configuredPath(input.library?.rootPath, current.library.rootPath);
@@ -519,9 +570,7 @@ function mergeSettingsUpdate(current, input = {}) {
   merged.audioEngine.selectedDeviceName = configuredPath(input.audioEngine?.selectedDeviceName, current.audioEngine.selectedDeviceName);
   merged.dynamicCue.folderPath = configuredPath(input.dynamicCue?.folderPath, current.dynamicCue.folderPath);
   merged.pads.folderPath = configuredPath(input.pads?.folderPath, current.pads.folderPath);
-  merged.dynamicClick.soundFolderPath = configuredPath(input.dynamicClick?.soundFolderPath, current.dynamicClick.soundFolderPath);
-  merged.dynamicClick.clickSoundPath = configuredPath(input.dynamicClick?.clickSoundPath, current.dynamicClick.clickSoundPath);
-  merged.dynamicClick.accentSoundPath = configuredPath(input.dynamicClick?.accentSoundPath, current.dynamicClick.accentSoundPath);
+  merged.dynamicClick.soundFolderPath = CLICK_PATTERN_DIR;
   return normalizeSettings(merged);
 }
 
@@ -531,19 +580,11 @@ function configuredPath(nextValue, currentValue) {
 }
 
 async function validateConfiguredAudioAssets(settings) {
-  const files = [
-    ["Normal click WAV", settings.dynamicClick.clickSoundPath],
-    ["Accent click WAV", settings.dynamicClick.accentSoundPath]
-  ];
   const folders = [
     ["Dynamic cue folder", settings.dynamicCue.folderPath],
-    ["Pad folder", settings.pads.folderPath]
+    ["Pad folder", settings.pads.folderPath],
+    ["Dynamic click pattern folder", CLICK_PATTERN_DIR]
   ];
-  for (const [label, filePath] of files) {
-    if (!filePath) continue;
-    const info = await stat(filePath).catch(() => null);
-    if (!info?.isFile()) throw new Error(`${label} is missing: ${filePath}`);
-  }
   for (const [label, folderPath] of folders) {
     if (!folderPath) continue;
     const info = await stat(folderPath).catch(() => null);
@@ -587,11 +628,19 @@ function normalizeSettings(value = {}) {
       fadeOutMs: Math.max(0, Number(value.pads?.fadeOutMs) || 2500)
     },
     dynamicClick: {
-      soundFolderPath: stringValue(value.dynamicClick?.soundFolderPath),
-      clickSoundPath: stringValue(value.dynamicClick?.clickSoundPath || value.dynamicClick?.soundFolderPath),
-      accentSoundPath: stringValue(value.dynamicClick?.accentSoundPath),
+      soundFolderPath: CLICK_PATTERN_DIR,
       outputBus: "click",
       editableInPerformance: false
+    },
+    proPresenterMidi: {
+      enabled: Boolean(value.proPresenterMidi?.enabled),
+      outputId: stringValue(value.proPresenterMidi?.outputId),
+      outputName: stringValue(value.proPresenterMidi?.outputName),
+      channel: clampInteger(value.proPresenterMidi?.channel, 1, 16, 1),
+      nextSlideNote: clampInteger(value.proPresenterMidi?.nextSlideNote, 0, 127, 60),
+      velocity: clampInteger(value.proPresenterMidi?.velocity, 1, 127, 100),
+      noteLengthMs: clampInteger(value.proPresenterMidi?.noteLengthMs, 20, 1000, 80),
+      fireInPanic: false
     }
   };
 }
@@ -625,6 +674,7 @@ function normalizeRoutingPresets(presets) {
 }
 
 function systemInfo() {
+  const remoteLinks = remoteAccessLinks();
   return {
     dataDir: DATA_DIR,
     libraryRoot: ROOT,
@@ -632,20 +682,50 @@ function systemInfo() {
     cacheDir: CACHE_DIR,
     songMetadataDir: SONG_METADATA_DIR,
     setMetadataDir: SET_METADATA_DIR,
-    remoteUrls: remoteAccessUrls()
+    remoteUrls: remoteLinks.performance,
+    remoteLinks
   };
 }
 
 function remoteAccessUrls() {
-  const urls = [`http://127.0.0.1:${PORT}/remote`];
+  return remoteAccessLinks().performance;
+}
+
+function remoteAccessLinks() {
+  const hosts = [`127.0.0.1:${PORT}`];
   for (const addresses of Object.values(networkInterfaces())) {
     for (const address of addresses || []) {
       if (address.family !== "IPv4" || address.internal) continue;
       if (address.address.startsWith("169.254.")) continue;
-      urls.push(`http://${address.address}:${PORT}/remote`);
+      hosts.push(`${address.address}:${PORT}`);
     }
   }
-  return [...new Set(urls)];
+  const uniqueHosts = [...new Set(hosts)];
+  return {
+    performance: uniqueHosts.map((host) => `http://${host}/remote`),
+    rehearsal: uniqueHosts.map((host) => `http://${host}/rehearsal`)
+  };
+}
+
+async function remoteQrCode(url, res) {
+  const value = stringValue(url.searchParams.get("url"));
+  if (!/^https?:\/\/[A-Za-z0-9.:[\]-]+\/(remote|rehearsal)$/.test(value)) {
+    return json(res, { error: "Invalid remote URL." }, 400);
+  }
+  const svg = await QRCode.toString(value, {
+    type: "svg",
+    margin: 1,
+    width: 256,
+    color: {
+      dark: "#f4f0e8",
+      light: "#101418"
+    }
+  });
+  res.writeHead(200, {
+    "Content-Type": "image/svg+xml; charset=utf-8",
+    "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0"
+  });
+  res.end(svg);
 }
 
 async function loadAudioDevices() {
@@ -1634,8 +1714,10 @@ async function startNativeSlotPlayback(slot, options = {}) {
       deviceName: device.name,
       deviceType: device.driver,
       sampleRate: settings.audioEngine?.sampleRate || 48000,
-      startSeconds: nonNegativeNumber(options.startSeconds) ?? 0
-    }, { timeoutMs: 10000 });
+      startSeconds: nonNegativeNumber(options.startSeconds) ?? 0,
+      startPaused: options.startPaused === true,
+      crossfadeDurationMs: Math.max(0, Math.round(Number(options.crossfadeDurationMs || 0)))
+    }, { timeoutMs: 10000, resetOnTimeout: true });
     if (!nativePlayback.ok || nativePlayback.response?.type !== "playbackStarted") {
       return { ok: false, error: nativePlayback.error || nativePlayback.response?.reason || "JUCE playback failed to start." };
     }
@@ -1668,7 +1750,9 @@ async function startNativeSlotPlayback(slot, options = {}) {
     return { ok: true, response: nativePlayback.response };
   }
 
-  await stopNativePlayback();
+  if (options.keepCurrentActive !== true) {
+    await stopNativePlayback();
+  }
 
   const helperPath = await findEngineHelperPath();
   if (!helperPath) {
@@ -1713,40 +1797,48 @@ async function startNativeSlotPlayback(slot, options = {}) {
             continue;
           }
           if (response.type === "playbackStarted") {
-            activePlaybackProcess = {
+            const playbackProcess = {
               child,
               slot,
+              preloaded: options.preload === true,
               stdout,
               stderr,
               pending: new Map(),
               outputChannels: positiveNumber(response.outputChannels),
               requestedOutputChannels: positiveNumber(response.requestedOutputChannels)
             };
-            latestPlaybackMeters = {
-              active: true,
-              slot,
-              title: stringValue(response.title),
-              currentTimeSeconds: nonNegativeNumber(response.currentPositionSeconds) ?? nonNegativeNumber(options.startSeconds) ?? 0,
-              stems: [],
-              updatedAt: new Date().toISOString()
-            };
-            broadcastMeterSnapshot();
-            saveEngineStatus(normalizeEngineStatus({
-              state: "ready",
-              simulated: false,
-              selectedDeviceName: stringValue(response.deviceName || device.name),
-              deviceType: stringValue(response.deviceType || device.driver),
-              requestedOutputChannels: positiveNumber(response.requestedOutputChannels),
-              outputChannels: positiveNumber(response.outputChannels),
-              sampleRate: positiveNumber(response.sampleRate),
-              bufferSize: positiveNumber(response.bufferSize),
-              manifestPath: ENGINE_MANIFEST_FILE,
-              message: `JUCE ready on ${response.deviceName || device.name}.`,
-              lastHeartbeatAt: new Date().toISOString(),
-              updatedAt: new Date().toISOString()
-            }))
-              .catch(() => {})
-              .finally(() => finish({ ok: true, response }));
+            if (options.keepCurrentActive !== true) {
+              activePlaybackProcess = playbackProcess;
+            }
+            if (options.silentStart !== true) {
+              latestPlaybackMeters = {
+                active: true,
+                slot,
+                title: stringValue(response.title),
+                currentTimeSeconds: nonNegativeNumber(response.currentPositionSeconds) ?? nonNegativeNumber(options.startSeconds) ?? 0,
+                stems: [],
+                updatedAt: new Date().toISOString()
+              };
+              broadcastMeterSnapshot();
+              saveEngineStatus(normalizeEngineStatus({
+                state: "ready",
+                simulated: false,
+                selectedDeviceName: stringValue(response.deviceName || device.name),
+                deviceType: stringValue(response.deviceType || device.driver),
+                requestedOutputChannels: positiveNumber(response.requestedOutputChannels),
+                outputChannels: positiveNumber(response.outputChannels),
+                sampleRate: positiveNumber(response.sampleRate),
+                bufferSize: positiveNumber(response.bufferSize),
+                manifestPath: ENGINE_MANIFEST_FILE,
+                message: `JUCE ready on ${response.deviceName || device.name}.`,
+                lastHeartbeatAt: new Date().toISOString(),
+                updatedAt: new Date().toISOString()
+              }))
+                .catch(() => {})
+                .finally(() => finish({ ok: true, response, process: playbackProcess }));
+            } else {
+              finish({ ok: true, response, process: playbackProcess });
+            }
           } else if (response.type === "commandRejected") {
             finish({ ok: false, error: response.reason || "JUCE rejected playback start." });
             child.kill();
@@ -1766,6 +1858,7 @@ async function startNativeSlotPlayback(slot, options = {}) {
     child.stdin.on("error", (error) => {
       stderr += `\nstdin error: ${error.message}`;
       if (activePlaybackProcess?.child === child) activePlaybackProcess = null;
+      if (preloadedPlaybackProcess?.child === child) preloadedPlaybackProcess = null;
       finish({ ok: false, error: error.message });
     });
 
@@ -1775,6 +1868,7 @@ async function startNativeSlotPlayback(slot, options = {}) {
 
     child.on("close", () => {
       if (activePlaybackProcess?.child === child) activePlaybackProcess = null;
+      if (preloadedPlaybackProcess?.child === child) preloadedPlaybackProcess = null;
       finish({ ok: false, error: stderr.trim() || "JUCE playback process exited before start." });
     });
 
@@ -1786,9 +1880,31 @@ async function startNativeSlotPlayback(slot, options = {}) {
       deviceName: device.name,
       deviceType: device.driver,
       sampleRate: settings.audioEngine?.sampleRate || 48000,
-      startSeconds: nonNegativeNumber(options.startSeconds) ?? 0
+      startSeconds: nonNegativeNumber(options.startSeconds) ?? 0,
+      startPaused: options.startPaused === true,
+      crossfadeDurationMs: Math.max(0, Math.round(Number(options.crossfadeDurationMs || 0)))
     })}\n`);
   });
+}
+
+async function quietScheduledDynamicCuesForTransition() {
+  if (!activePlaybackProcess) return;
+  try {
+    await sendNativePlaybackCommand("markDynamicCuesTriggeredNow");
+    await sendNativePlaybackCommand("setScheduledDynamicCuesSuppressed", { suppressed: true });
+  } catch (error) {
+    console.warn(`[transition] could not quiet scheduled dynamic cues: ${error.message}`);
+  }
+}
+
+async function restoreScheduledDynamicCuesAfterTransition() {
+  if (!activePlaybackProcess) return;
+  try {
+    await sendNativePlaybackCommand("setScheduledDynamicCuesSuppressed", { suppressed: false });
+    await sendNativePlaybackCommand("allowScheduledDynamicCuePrefix", { cueIdPrefix: "" });
+  } catch (error) {
+    console.warn(`[transition] could not restore scheduled dynamic cues: ${error.message}`);
+  }
 }
 
 async function sendNativePlaybackCommand(type, body = {}) {
@@ -1818,15 +1934,26 @@ async function sendNativePlaybackCommand(type, body = {}) {
 
 async function requestNativePlaybackCommand(type, body = {}, options = {}) {
   if (!activePlaybackProcess) return { ok: false, active: false, error: "No active playback process." };
-  const { child, pending } = activePlaybackProcess;
+  return requestNativePlaybackCommandForProcess(activePlaybackProcess, type, body, options);
+}
+
+async function requestNativePlaybackCommandForProcess(playbackProcess, type, body = {}, options = {}) {
+  if (!playbackProcess) return { ok: false, active: false, error: "No playback process." };
+  const { child, pending } = playbackProcess;
   if (child.killed || child.stdin.destroyed) {
-    activePlaybackProcess = null;
+    if (activePlaybackProcess?.child === child) activePlaybackProcess = null;
+    if (preloadedPlaybackProcess?.child === child) preloadedPlaybackProcess = null;
     return { ok: false, active: false, error: "Playback process is not active." };
   }
   const requestId = `${type}-${Date.now()}`;
   return new Promise((resolveRequest) => {
     const timeout = setTimeout(() => {
       pending?.delete(requestId);
+      if (options.resetOnTimeout === true && activePlaybackProcess?.child === child) {
+        hardResetNativePlayback(`${type} timed out.`).catch(() => {});
+      } else if (options.resetOnTimeout === true && preloadedPlaybackProcess?.child === child) {
+        stopPreloadedPlayback().catch(() => {});
+      }
       resolveRequest({ ok: false, active: true, error: `${type} timed out.` });
     }, options.timeoutMs || 1000);
     pending?.set(requestId, (response) => {
@@ -1838,7 +1965,8 @@ async function requestNativePlaybackCommand(type, body = {}, options = {}) {
     } catch (error) {
       pending?.delete(requestId);
       clearTimeout(timeout);
-      activePlaybackProcess = null;
+      if (activePlaybackProcess?.child === child) activePlaybackProcess = null;
+      if (preloadedPlaybackProcess?.child === child) preloadedPlaybackProcess = null;
       resolveRequest({ ok: false, active: false, error: error.message });
     }
   });
@@ -1865,6 +1993,12 @@ function handleNativePlaybackResponse(response) {
   if (resolver) {
     activePlaybackProcess.pending.delete(response.requestId);
     resolver(response);
+    return;
+  }
+  const preloadResolver = preloadedPlaybackProcess?.pending?.get(response.requestId);
+  if (preloadResolver) {
+    preloadedPlaybackProcess.pending.delete(response.requestId);
+    preloadResolver(response);
   }
 }
 
@@ -1926,6 +2060,9 @@ async function playbackMeterSnapshot() {
 }
 
 async function stopNativePlayback(options = {}) {
+  if (options.keepPreload !== true) {
+    await stopPreloadedPlayback();
+  }
   if (!activePlaybackProcess) {
     latestPlaybackMeters = { active: false, slot: null, title: "", stems: [], updatedAt: new Date().toISOString() };
     broadcastMeterSnapshot();
@@ -1934,6 +2071,12 @@ async function stopNativePlayback(options = {}) {
 
   const { child } = activePlaybackProcess;
   activePlaybackProcess = null;
+  return stopNativePlaybackProcess({ child }, options);
+}
+
+async function stopNativePlaybackProcess(playbackProcess, options = {}) {
+  if (!playbackProcess?.child) return { ok: true, stopped: false };
+  const { child } = playbackProcess;
   const closeWait = new Promise((resolveClose) => {
     if (child.exitCode !== null || child.killed) {
       resolveClose();
@@ -1959,9 +2102,122 @@ async function stopNativePlayback(options = {}) {
     closeWait,
     new Promise((resolveClose) => setTimeout(resolveClose, (options.fade ? options.durationMs || 400 : 50) + 900))
   ]);
+  if (options.preserveMeters !== true) {
+    latestPlaybackMeters = { active: false, slot: null, title: "", stems: [], updatedAt: new Date().toISOString() };
+    broadcastMeterSnapshot();
+  }
+  return { ok: true, stopped: true };
+}
+
+async function hardResetNativePlayback(reason = "Playback engine reset.") {
+  const stuckProcess = activePlaybackProcess;
+  activePlaybackProcess = null;
+  if (stuckProcess?.pending) {
+    for (const resolver of stuckProcess.pending.values()) {
+      try {
+        resolver({ type: "commandRejected", reason });
+      } catch {
+        // Best effort cleanup.
+      }
+    }
+    stuckProcess.pending.clear();
+  }
+  if (stuckProcess?.child && !stuckProcess.child.killed) {
+    try {
+      stuckProcess.child.kill();
+    } catch {
+      // Best effort cleanup.
+    }
+  }
+  await stopPreloadedPlayback();
   latestPlaybackMeters = { active: false, slot: null, title: "", stems: [], updatedAt: new Date().toISOString() };
   broadcastMeterSnapshot();
-  return { ok: true, stopped: true };
+  await saveEngineStatus(normalizeEngineStatus({
+    state: "offline",
+    simulated: false,
+    message: reason,
+    updatedAt: new Date().toISOString(),
+    lastHeartbeatAt: ""
+  }));
+  return { ok: true, reset: true };
+}
+
+async function stopPreloadedPlayback(options = {}) {
+  const preload = preloadedPlaybackProcess;
+  preloadedPlaybackProcess = null;
+  if (!preload) return { ok: true, stopped: false };
+  return stopNativePlaybackProcess(preload, { ...options, preserveMeters: true });
+}
+
+async function ensureTransitionPreload(state, setlist) {
+  if (preloadTransitionInFlight) return;
+  if (state.transport !== "playing" || !activePlaybackProcess || !state.currentSlot) {
+    await stopPreloadedPlayback();
+    return;
+  }
+  const transition = transitionForFromSlot(setlist, state.currentSlot);
+  if (!transition || !transition.toSlot || transition.mode !== "crossfade") {
+    await stopPreloadedPlayback();
+    return;
+  }
+  if (preloadedPlaybackProcess?.slot === transition.toSlot && !preloadedPlaybackProcess.child?.killed) {
+    return;
+  }
+  preloadTransitionInFlight = true;
+  try {
+    await stopPreloadedPlayback();
+    const prepared = state.mode === "edit" && !(await engineManifestHasPlayableSlot(transition.toSlot))
+      ? await ensureEditPlaybackManifest(transition.toSlot)
+      : { ok: true };
+    if (!prepared.ok) return;
+    const preload = await startNativeSlotPlayback(transition.toSlot, {
+      startSeconds: 0,
+      startPaused: true,
+      keepCurrentActive: true,
+      silentStart: true,
+      preload: true
+    });
+    if (preload.ok && preload.process) {
+      preloadedPlaybackProcess = preload.process;
+    }
+  } finally {
+    preloadTransitionInFlight = false;
+  }
+}
+
+async function promotePreloadedPlayback(slot) {
+  if (!preloadedPlaybackProcess || preloadedPlaybackProcess.slot !== slot) {
+    return { ok: false, error: "No preloaded Engine B is ready." };
+  }
+  const preload = preloadedPlaybackProcess;
+  const resume = await requestNativePlaybackCommandForProcess(preload, "resume", {}, { timeoutMs: 5000, resetOnTimeout: true });
+  if (!resume.ok) {
+    if (preloadedPlaybackProcess === preload) preloadedPlaybackProcess = null;
+    await stopNativePlaybackProcess(preload, { preserveMeters: true });
+    return { ok: false, error: resume.error || "Preloaded Engine B could not start." };
+  }
+  if (preloadedPlaybackProcess === preload) preloadedPlaybackProcess = null;
+  activePlaybackProcess = preload;
+  latestPlaybackMeters = {
+    active: true,
+    slot,
+    title: stringValue(resume.response?.title),
+    currentTimeSeconds: nonNegativeNumber(resume.response?.currentPositionSeconds) ?? 0,
+    stems: [],
+    updatedAt: new Date().toISOString()
+  };
+  broadcastMeterSnapshot();
+  const currentStatus = await loadEngineStatus();
+  await saveEngineStatus(normalizeEngineStatus({
+    ...currentStatus,
+    state: "ready",
+    simulated: false,
+    manifestPath: ENGINE_MANIFEST_FILE,
+    message: "Preloaded Engine B promoted to active playback.",
+    lastHeartbeatAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString()
+  }));
+  return { ok: true, response: { type: "playbackStarted", slot, title: latestPlaybackMeters.title, currentPositionSeconds: 0 }, process: preload, preloaded: true };
 }
 
 async function resolveEngineDevice(selectedDeviceName) {
@@ -2150,7 +2406,7 @@ function normalizePlaybackState(value = {}) {
 
 function normalizeTransitionRuntime(value = {}) {
   value = value || {};
-  const mode = TRANSITION_MODES.has(value.mode) ? value.mode : "cue-next";
+  const mode = normalizeTransitionMode(value.mode, value.toSlot);
   const padBehavior = TRANSITION_PAD_BEHAVIORS.has(value.padBehavior) ? value.padBehavior : "next-song-key";
   const status = ["idle", "waiting-next", "active", "completed", "blocked"].includes(value.status) ? value.status : "idle";
   return {
@@ -2160,7 +2416,8 @@ function normalizeTransitionRuntime(value = {}) {
     mode,
     padBehavior,
     startedAt: value.startedAt === null ? null : stringValue(value.startedAt),
-    durationSeconds: positiveNumber(value.durationSeconds) || 5,
+    durationSeconds: transitionDurationForMode(value, mode),
+    durationByMode: normalizeTransitionDurationByModeForMode(value, mode),
     status,
     message: stringValue(value.message)
   };
@@ -2301,6 +2558,7 @@ async function serviceLiveSupervisor() {
     const state = await loadPlaybackState();
     if (state.transport !== "playing" || !state.currentSlot) return;
     if (!activePlaybackProcess) {
+      if (await serviceSongEndBackend(state)) return;
       await savePlaybackState(normalizePlaybackState({
         ...state,
         transport: "stopped",
@@ -2317,6 +2575,26 @@ async function serviceLiveSupervisor() {
       markLiveSupervisorAction("engine-lost-stop");
       return;
     }
+    if (livePlaybackActivityAgeMs() > ENGINE_HEARTBEAT_GRACE_MS) {
+      await hardResetNativePlayback("Playback engine heartbeat timed out.");
+      await savePlaybackState(normalizePlaybackState({
+        ...state,
+        transport: "stopped",
+        currentTimeSeconds: computedPlaybackTimeSeconds(state),
+        transportAnchorSeconds: computedPlaybackTimeSeconds(state),
+        transportStartedAt: "",
+        liveRepeat: {},
+        panic: {},
+        lastCommand: "engine-heartbeat-timeout",
+        commandStatus: "stopped",
+        lastMessage: "Playback engine reset after heartbeat timed out.",
+        updatedAt: new Date().toISOString()
+      }));
+      markLiveSupervisorAction("engine-heartbeat-reset");
+      return;
+    }
+    const setlist = await loadCurrentSetlist();
+    await ensureTransitionPreload(state, setlist);
 
     if (await servicePanicRecoveryBackend(state)) return;
     if (await serviceLiveRepeatBackend(state)) return;
@@ -2448,11 +2726,11 @@ async function serviceSongEndBackend(state) {
   const setlist = await loadCurrentSetlist();
   const transition = transitionForFromSlot(setlist, state.currentSlot);
   const current = computedPlaybackTimeSeconds(state);
-  const lead = ["crossfade", "overlap"].includes(transition?.mode)
-    ? Math.max(0.25, Number(transition.durationSeconds || 5))
+  const lead = transition
+    ? transitionDurationForMode(transition, transition.mode)
     : 0.08;
   if (current < duration - lead) return false;
-  if (state.mode === "performance" && transition) {
+  if (transition) {
     markLiveSupervisorAction("song-transition");
     await handlePlaybackCommand("songTransition", {
       fromSlot: transition.fromSlot,
@@ -2476,9 +2754,20 @@ function markLiveSupervisorAction(action) {
 
 function manifestSongDurationSeconds(song) {
   if (!song) return 0;
+  const boundsEnd = nonNegativeNumber(song.playbackBounds?.endSeconds);
+  if (boundsEnd !== null && boundsEnd > 0) {
+    return boundsEnd;
+  }
   const explicit = nonNegativeNumber(song.durationSeconds) ?? (nonNegativeNumber(song.durationMs) !== null ? nonNegativeNumber(song.durationMs) / 1000 : null);
   if (explicit) return explicit;
-  return Math.max(0, ...(Array.isArray(song.stems) ? song.stems : [])
+  const stems = Array.isArray(song.stems) ? song.stems : [];
+  const musicStems = stems.filter((stem) => {
+    const role = stringValue(stem.playbackRole || stem.role || stem.id);
+    return !["dynamic-click-render", "dynamic-cue-render", "dynamic-pad-render", "dynamic-click", "dynamic-cue", "dynamic-pad"].includes(role)
+      && !["dynamic-click", "dynamic-cue", "dynamic-pad"].includes(stringValue(stem.id));
+  });
+  const durationStems = musicStems.length ? musicStems : stems;
+  return Math.max(0, ...durationStems
     .map((stem) => nonNegativeNumber(stem.durationMs) !== null ? nonNegativeNumber(stem.durationMs) / 1000 : nonNegativeNumber(stem.durationSeconds) || 0));
 }
 
@@ -2557,6 +2846,8 @@ async function buildReadiness(setlist, settings) {
     ...engineStatus,
     heartbeatRequired,
     heartbeatFresh,
+    nextPreloaded: Boolean(preloadedPlaybackProcess && !preloadedPlaybackProcess.child?.killed),
+    preloadedSlot: positiveNumber(preloadedPlaybackProcess?.slot),
     heartbeatAgeMs: Number.isFinite(effectiveHeartbeatAgeMs) ? effectiveHeartbeatAgeMs : null,
     statusFileHeartbeatAgeMs: Number.isFinite(heartbeatAgeMs) ? heartbeatAgeMs : null,
     liveActivityAgeMs: Number.isFinite(liveActivityAgeMs) ? liveActivityAgeMs : null
@@ -2729,8 +3020,8 @@ async function runSystemCheck() {
         errors.push(`Slot ${song.slot}: dynamic pad cache failed for ${song.tempoMap?.key || "song key"}. ${song.dynamicPad.cacheError || ""}`.trim());
       }
       const click = song.dynamicClick || {};
-      if (click.status === "ready" && Number(click.clickEventCount || 0) === 0 && Number(click.patternLength || 0) < 16) {
-        warnings.push(`Slot ${song.slot}: dynamic click is grid/pattern driven with only ${Number(click.patternLength || 0)} pattern beats. Analyzer should provide first-16/event click data for best click-stem match.`);
+      if (click.status !== "ready") {
+        warnings.push(`Slot ${song.slot}: dynamic click pattern is not ready for ${song.tempoMap?.timeSignature || "unknown time signature"}.`);
       }
       const missingCueCount = (Array.isArray(song.dynamicCues) ? song.dynamicCues : []).filter((cue) => cue.status !== "matched").length;
       if (missingCueCount) {
@@ -2942,15 +3233,25 @@ async function buildEngineManifest(confirmedSet) {
     const soloActive = mixerHasActiveSolo(slotMetadata.mixer, playbackStems);
     const dynamicClickRouting = routeForStem(canonicalBus(dynamicClickMixer?.routeBus || "click"), 0, routingPreset);
     const dynamicCueRouting = routeForStem(canonicalBus(dynamicCueMixer?.routeBus || "dynamicCue"), 0, routingPreset);
-    const manifestTempoMap = arrangementCache
+    const sourceTempoMap = arrangementCache
       ? tempoMapForArrangement(slotMetadata.tempoMap, arrangementCache.blocks)
       : slotMetadata.tempoMap;
+    const sourceDurationSeconds = sourceSongDurationSecondsForManifest(playbackStems, sourceTempoMap);
+    const songDurationSeconds = songDurationSecondsForManifest(arrangementCache, playbackStems, sourceTempoMap, slotMetadata.arrangement);
+    const playbackBounds = playbackBoundsForManifest(slotMetadata.arrangement, arrangementCache, sourceDurationSeconds, songDurationSeconds);
+    const manifestTempoMap = playbackGridTempoMap(sourceTempoMap, songDurationSeconds);
     const manifestCueMarkers = arrangementCache
-      ? cueMarkersForArrangement(slotMetadata.cueMarkers, arrangementCache.blocks, slotMetadata.tempoMap, slotMetadata.arrangement)
+      ? cueMarkersForArrangement(slotMetadata.cueMarkers, arrangementCache.blocks, sourceTempoMap, slotMetadata.arrangement)
       : slotMetadata.cueMarkers;
-    const manifestDynamicCues = arrangementCache
-      ? await buildDynamicCueManifest(manifestCueMarkers, confirmedSet.settings.dynamicCue.folderPath, manifestTempoMap)
-      : slotMetadata.dynamicCues;
+    const manifestDynamicCues = await buildDynamicCueManifest(manifestCueMarkers, confirmedSet.settings.dynamicCue.folderPath, manifestTempoMap);
+    const manifestDynamicClick = await buildDynamicClickManifest(manifestTempoMap);
+    const renderedDynamicClick = await renderDynamicClickTrack({
+      slot,
+      title: slot.title,
+      dynamicClick: manifestDynamicClick,
+      tempoMap: manifestTempoMap,
+      durationSeconds: songDurationSeconds
+    });
     const dynamicPad = await dynamicPadManifestObject({
       folderPath: confirmedSet.settings.pads.folderPath,
       songKey: slotMetadata.padKey || slotMetadata.tempoMap.key || slot.key,
@@ -2973,27 +3274,19 @@ async function buildEngineManifest(confirmedSet) {
       expectedTrackCount: slot.trackCount || 0,
       cachedTrackCount: arrangementCache?.stems?.length || slot.cachedTrackCount || 0,
       missingStems: slot.missingStems || [],
+      durationSeconds: songDurationSeconds,
+      playbackBounds,
       tempoMap: manifestTempoMap,
       regions: slotMetadata.regions,
       cueMarkers: manifestCueMarkers,
       dynamicCues: manifestDynamicCues,
       dynamicCueMap: slotMetadata.dynamicCueMap,
       dynamicClick: {
-        soundFolderPath: confirmedSet.settings.dynamicClick.soundFolderPath,
-        clickSoundPath: confirmedSet.settings.dynamicClick.clickSoundPath,
-        accentSoundPath: confirmedSet.settings.dynamicClick.accentSoundPath,
-        source: slotMetadata.dynamicClick?.source || "click-stem-first-16-pattern",
-        status: slotMetadata.dynamicClick?.status || "missing-click-stem",
-        clickStemPath: slotMetadata.dynamicClick?.clickStemPath || null,
-        patternLength: slotMetadata.dynamicClick?.patternLength || 0,
-        pattern: Array.isArray(slotMetadata.dynamicClick?.pattern) ? slotMetadata.dynamicClick.pattern : [],
-        countPatternLength: slotMetadata.dynamicClick?.countPatternLength || 0,
-        countPattern: Array.isArray(slotMetadata.dynamicClick?.countPattern) ? slotMetadata.dynamicClick.countPattern : [],
-        countPatternSource: slotMetadata.dynamicClick?.countPatternSource || null,
-        clickEventCount: slotMetadata.dynamicClick?.clickEventCount || 0,
-        clickEventsSource: slotMetadata.dynamicClick?.clickEventsSource || null,
-        clickEvents: Array.isArray(slotMetadata.dynamicClick?.clickEvents) ? slotMetadata.dynamicClick.clickEvents : [],
-        confidence: positiveNumber(slotMetadata.dynamicClick?.confidence),
+        ...manifestDynamicClick,
+        renderedAudioPath: renderedDynamicClick?.cachePath || "",
+        renderedAudioSourcePath: renderedDynamicClick?.sourcePatternFile || "",
+        renderedAudioEventCount: renderedDynamicClick?.eventCount || 0,
+        renderedAudioMode: renderedDynamicClick?.renderMode || "",
         tempoMap: manifestTempoMap,
         volume: dynamicClickRouting.outputChannels.length ? mixerOutputVolume(dynamicClickMixer, 80, soloActive) : 0,
         solo: Boolean(dynamicClickMixer?.solo),
@@ -3008,12 +3301,17 @@ async function buildEngineManifest(confirmedSet) {
       },
       pad: dynamicPad.pad,
       dynamicPad,
-      stems: playbackStems
+      stems: [
+        ...playbackStems
         .map((stem, index) => {
           const mixerStem = matchMixerStem(stem, slotMetadata.mixer);
           return stemManifestEntry(stem, index, routingPreset, mixerStem, soloActive);
         })
-        .filter((stem) => stem.role !== "click")
+        .filter((stem) => stem.role !== "click"),
+        ...(renderedDynamicClick
+          ? [stemManifestEntry(renderedDynamicClick, playbackStems.length, routingPreset, dynamicClickMixer, soloActive)]
+          : [])
+      ]
     });
   }
   return {
@@ -3028,9 +3326,7 @@ async function buildEngineManifest(confirmedSet) {
     routingPreset,
     dynamicCueFolder: confirmedSet.settings.dynamicCue.folderPath,
     padsFolder: confirmedSet.settings.pads.folderPath,
-    dynamicClickSoundFolder: confirmedSet.settings.dynamicClick.soundFolderPath,
-    dynamicClickSoundPath: confirmedSet.settings.dynamicClick.clickSoundPath,
-    dynamicClickAccentSoundPath: confirmedSet.settings.dynamicClick.accentSoundPath,
+    dynamicClickSoundFolder: CLICK_PATTERN_DIR,
     readiness: confirmedSet.readiness,
     songs
   };
@@ -3047,10 +3343,7 @@ async function readSlotManifestMetadata(slot, settings) {
   const songMetadata = slot.folderPath ? await readSongMetadata(slot.folderPath) : null;
   const normalizedRegions = normalizeRegions(regions.regions || []);
   const normalizedCues = normalizeCueMarkers(cues.cueMarkers || []);
-  const normalizedTempoMap = extendTempoMapForSongPositions(
-    normalizeTempoMap(tempoMap, slot),
-    songGridPositions(normalizedRegions, normalizedCues)
-  );
+  const normalizedTempoMap = appGridTempoMapForSlot(tempoMap, slot, songGridPositions(normalizedRegions, normalizedCues));
   return {
     regions: normalizedRegions,
     cueMarkers: normalizedCues,
@@ -3058,10 +3351,464 @@ async function readSlotManifestMetadata(slot, settings) {
     padKey: stringValue(songMetadata?.padKey || songMetadata?.key || tempoMap.key || slot.key),
     mixer: normalizeMixer(mixer, slot),
     arrangement: normalizeArrangement(arrangement),
-    dynamicClick: songMetadata?.dynamicClick || normalizeSongDynamicClick(null),
+    dynamicClick: null,
     dynamicCueMap,
     dynamicCues: await buildDynamicCueManifest(normalizedCues, settings.dynamicCue.folderPath, normalizedTempoMap)
   };
+}
+
+async function buildDynamicClickManifest(tempoMap = {}) {
+  const timeSignature = displayTimeSignature(tempoMap.timeSignature || "4/4");
+  const fileName = clickPatternFileForTempoMap(timeSignature, tempoMap);
+  const patternFile = fileName ? join(CLICK_PATTERN_DIR, fileName) : "";
+  const template = patternFile ? await readClickPatternTemplate(patternFile, timeSignature).catch(() => null) : null;
+  if (!template) {
+    return {
+      soundFolderPath: CLICK_PATTERN_DIR,
+      source: "app-time-signature-click-pattern-template",
+      status: "review",
+      patternTemplateFile: patternFile,
+      patternTemplateTimeSignature: timeSignature,
+      patternLength: 0,
+      pattern: [],
+      clickEventCount: 0,
+      clickEventsSource: "time-signature-click-pattern-template",
+      clickEvents: [],
+      confidence: 0,
+      warnings: [`missing-click-pattern-template:${timeSignature}`]
+    };
+  }
+  const events = clickEventsFromPatternTemplate(template, tempoMap);
+  return {
+    soundFolderPath: CLICK_PATTERN_DIR,
+    source: "app-time-signature-click-pattern-template",
+    status: events.length ? "ready" : "review",
+    patternTemplateFile: template.filePath,
+    patternTemplateTimeSignature: template.timeSignature,
+    patternLength: template.pattern.length,
+    pattern: template.pattern,
+    clickEventCount: events.length,
+    clickEventsSource: "time-signature-click-pattern-template",
+    clickEvents: events,
+    confidence: events.length ? 1 : 0,
+    warnings: events.length ? [] : ["click-pattern-template-produced-no-events"]
+  };
+}
+
+function clickPatternFileForTempoMap(timeSignature, tempoMap = {}) {
+  const clickBeats = Array.isArray(tempoMap.clickBeats)
+    ? tempoMap.clickBeats.map((beat) => Number(beat)).filter((beat) => Number.isInteger(beat) && beat > 0)
+    : [];
+  if (displayTimeSignature(timeSignature) === "6/8" && clickBeats.length === 6) {
+    return "6-8-six-clicks.wav";
+  }
+  return CLICK_PATTERN_FILES[timeSignature];
+}
+
+async function renderDynamicClickTrack({ slot, title, dynamicClick = {}, tempoMap = {}, durationSeconds }) {
+  const events = Array.isArray(dynamicClick.clickEvents) ? dynamicClick.clickEvents : [];
+  const patternFile = stringValue(dynamicClick.patternTemplateFile);
+  const outputDurationSeconds = positiveNumber(durationSeconds);
+  if (!patternFile || !outputDurationSeconds || !events.length) return null;
+  const source = await readClickPatternAudio(patternFile, dynamicClick.patternTemplateTimeSignature || tempoMap.timeSignature).catch(() => null);
+  if (!source?.frames?.length) return null;
+  const slices = clickPatternHitSlices(source);
+  if (!slices.length) return null;
+
+  await mkdir(DYNAMIC_CLICK_CACHE_DIR, { recursive: true });
+  const safeSlot = String(slot.slot || 0).padStart(2, "0");
+  const safeSongId = safeFilePart(slot.songId || title || "song");
+  const outputPath = join(DYNAMIC_CLICK_CACHE_DIR, `slot-${safeSlot}-${safeSongId}.wav`);
+  assertInsideCache(outputPath);
+
+  const sampleRate = source.sampleRate;
+  const channels = source.channels;
+  const outputFrames = Math.max(1, Math.ceil((outputDurationSeconds + 1) * sampleRate));
+  const output = new Float32Array(outputFrames * channels);
+  for (const event of events) {
+    const destinationFrame = Math.max(0, Math.round((nonNegativeNumber(event.timeSeconds) ?? 0) * sampleRate));
+    const slice = slices[Number(event.sourceTransientIndex) || 0] || slices[0];
+    mixClickSlice(output, outputFrames, source, slice.startFrame, slice.frameCount, destinationFrame);
+  }
+
+  const info = { audioFormat: 3, channels, sampleRate, bitsPerSample: 32, blockAlign: channels * 4 };
+  const header = wavHeaderForInfo(info, output.length * 4);
+  const data = Buffer.alloc(output.length * 4);
+  for (let index = 0; index < output.length; index += 1) {
+    data.writeFloatLE(Math.max(-1, Math.min(1, output[index])), index * 4);
+  }
+  await writeFile(outputPath, Buffer.concat([header, data]));
+  return {
+    id: "dynamic-click",
+    name: "Dynamic Click",
+    fileName: basename(outputPath),
+    relativePath: basename(outputPath),
+    cacheRelativePath: relative(CACHE_DIR, outputPath),
+    cachePath: outputPath,
+    role: "click",
+    bus: "click",
+    playbackRole: "dynamic-click-render",
+    stemGroup: "click",
+    playLive: true,
+    sampleRate,
+    channels,
+    durationMs: Math.round((outputFrames / sampleRate) * 1000),
+    sha256: await fileSha1(outputPath),
+    sourcePatternFile: patternFile,
+    eventCount: events.length,
+    renderMode: "pattern-transients-on-playback-grid-start-zero"
+  };
+}
+
+function sourceSongDurationSecondsForManifest(playbackStems = [], tempoMap = {}) {
+  const fromStems = Math.max(0, ...playbackStems.map((stem) => positiveNumber(stem.durationMs) || 0)) / 1000;
+  if (fromStems > 0) return fromStems;
+  const lastBeat = nonNegativeNumber((Array.isArray(tempoMap.beatGrid) ? tempoMap.beatGrid : []).at(-1)?.timeSeconds);
+  const bpm = positiveNumber(tempoMap.bpm);
+  return lastBeat !== null ? lastBeat + (bpm ? 60 / bpm : 2) : 0;
+}
+
+function songDurationSecondsForManifest(arrangementCache, playbackStems = [], tempoMap = {}, arrangement = {}) {
+  const fromArrangement = positiveNumber(arrangementCache?.durationSeconds);
+  if (fromArrangement) return fromArrangement;
+  const sourceDuration = sourceSongDurationSecondsForManifest(playbackStems, tempoMap);
+  const trimStart = nonNegativeNumber(arrangement?.trimStartSeconds) ?? 0;
+  const trimEnd = nonNegativeNumber(arrangement?.trimEndSeconds);
+  if (trimEnd !== null && trimEnd > trimStart) return trimEnd - trimStart;
+  return sourceDuration;
+}
+
+function playbackBoundsForManifest(arrangement = {}, arrangementCache = null, sourceDurationSeconds = 0, playbackDurationSeconds = 0) {
+  const sourceDuration = positiveNumber(sourceDurationSeconds) || positiveNumber(playbackDurationSeconds) || 0;
+  const playbackDuration = positiveNumber(arrangementCache?.durationSeconds) || positiveNumber(playbackDurationSeconds) || sourceDuration;
+  const startSeconds = arrangementCache?.ready
+    ? 0
+    : nonNegativeNumber(arrangement?.trimStartSeconds) ?? 0;
+  const explicitEnd = nonNegativeNumber(arrangement?.trimEndSeconds);
+  const endSeconds = arrangementCache?.ready
+    ? playbackDuration
+    : explicitEnd !== null ? explicitEnd : sourceDuration;
+  const hasOperatorTrim = startSeconds > 0.0005 || (explicitEnd !== null && sourceDuration && Math.abs(explicitEnd - sourceDuration) > 0.0005);
+  return {
+    startSeconds,
+    endSeconds: Math.max(startSeconds, endSeconds),
+    durationSeconds: Math.max(0, playbackDuration),
+    sourceDurationSeconds: sourceDuration,
+    fadeInSeconds: nonNegativeNumber(arrangement?.fadeInSeconds) ?? 0,
+    fadeOutSeconds: nonNegativeNumber(arrangement?.fadeOutSeconds) ?? 0,
+    source: hasOperatorTrim ? "operator" : arrangementCache?.ready ? "arrangement-cache" : "full-source",
+    arrangementCacheReady: Boolean(arrangementCache?.ready),
+    updatedAt: stringValue(arrangement?.updatedAt)
+  };
+}
+
+function playbackGridTempoMap(sourceTempoMap = {}, durationSeconds = 0) {
+  const bpm = positiveNumber(sourceTempoMap.bpm);
+  const timeSignature = displayTimeSignature(sourceTempoMap.timeSignature || "4/4");
+  const [numeratorText, denominatorText] = timeSignature.split("/");
+  const beatsPerMeasure = Math.max(1, Math.floor(positiveNumber(numeratorText) || 4));
+  const denominator = Math.max(1, Math.floor(positiveNumber(denominatorText) || 4));
+  const duration = positiveNumber(durationSeconds) || 0;
+  if (!bpm || !duration) {
+    return normalizeTempoMapStartZero({
+      ...sourceTempoMap,
+      bpm,
+      timeSignature,
+      beatGrid: []
+    });
+  }
+
+  const gridBeatSeconds = positiveNumber(sourceTempoMap.gridBeatSeconds)
+    || gridBeatSecondsForPlayback(bpm, beatsPerMeasure, denominator);
+  const totalBeats = Math.max(1, Math.ceil(duration / gridBeatSeconds) + beatsPerMeasure);
+  const beatGrid = [];
+  for (let index = 0; index < totalBeats; index += 1) {
+    const timeSeconds = Number((index * gridBeatSeconds).toFixed(6));
+    if (timeSeconds > duration + gridBeatSeconds) break;
+    const beat = (index % beatsPerMeasure) + 1;
+    beatGrid.push({
+      index: index + 1,
+      timeSeconds,
+      measure: Math.floor(index / beatsPerMeasure) + 1,
+      beat,
+      beatInMeasure: beat,
+      gridBeatInMeasure: beat,
+      globalBeat: index,
+      isDownbeat: beat === 1,
+      isCountIn: false,
+      source: "app-playback-grid-bpm-duration-start-zero"
+    });
+  }
+
+  const diagnostics = playbackGridDiagnostics(sourceTempoMap);
+  return {
+    ...sourceTempoMap,
+    key: stringValue(sourceTempoMap.key),
+    bpm,
+    timeSignature,
+    gridStatus: diagnostics.length ? "diagnostic-warning" : "app-generated",
+    source: "app-playback-grid-bpm-duration-start-zero",
+    bpmInterpretation: stringValue(sourceTempoMap.bpmInterpretation),
+    gridBeatSeconds,
+    measureSeconds: Number((gridBeatSeconds * beatsPerMeasure).toFixed(6)),
+    confidence: 1,
+    measureOne: {
+      ...(sourceTempoMap.measureOne || {}),
+      timeSeconds: 0,
+      globalBeat: 0
+    },
+    countIn: {
+      status: "none",
+      startTimeSeconds: null,
+      endTimeSeconds: null,
+      startGlobalBeat: null,
+      endGlobalBeat: null,
+      measureCount: 0,
+      partialMeasure: false,
+      confidence: 1
+    },
+    tempoChanges: [{
+      segmentIndex: 0,
+      startTimeSeconds: 0,
+      startGlobalBeat: 0,
+      bpm,
+      confidence: 1
+    }],
+    timeSignatureChanges: [],
+    beatGrid,
+    diagnostics,
+    warnings: diagnostics.map((item) => item.warning)
+  };
+}
+
+function playbackGridDiagnostics(sourceTempoMap = {}) {
+  const beatGrid = Array.isArray(sourceTempoMap.beatGrid) ? sourceTempoMap.beatGrid : [];
+  const firstBeat = beatGrid.find((beat) => Number(beat.measure) === 1 && Number(beat.beat || beat.beatInMeasure) === 1) || beatGrid[0];
+  const sourceClickOffsetSeconds = nonNegativeNumber(firstBeat?.timeSeconds);
+  if (sourceClickOffsetSeconds !== null && sourceClickOffsetSeconds > 0.002) {
+    return [{
+      warning: "source-click-offset-detected",
+      sourceClickOffsetSeconds: Number(sourceClickOffsetSeconds.toFixed(6))
+    }];
+  }
+  return [];
+}
+
+function gridBeatSecondsForPlayback(bpm, numerator, denominator) {
+  const quarterSeconds = 60 / bpm;
+  const compoundEighthMeter = denominator === 8 && [6, 9, 12].includes(numerator);
+  if (compoundEighthMeter && bpm < 100) {
+    return quarterSeconds / 3;
+  }
+  return quarterSeconds * (4 / denominator);
+}
+
+function appGridTempoMapForSlot(sourceTempoMap = {}, slot = {}, positions = []) {
+  const normalized = normalizeTempoMap(sourceTempoMap || {}, slot || {});
+  const durationSeconds = songDurationSecondsForManifest(null, slot?.cachedStems || [], normalized)
+    || positiveNumber(slot?.durationSeconds)
+    || positiveNumber(sourceTempoMap?.durationSeconds)
+    || 0;
+  const appGrid = playbackGridTempoMap(normalized, durationSeconds);
+  return extendTempoMapForSongPositions(appGrid, positions);
+}
+
+function safeFilePart(value) {
+  return stringValue(value).replace(/[^a-z0-9_-]+/gi, "_").replace(/^_+|_+$/g, "").slice(0, 80) || "song";
+}
+
+function clickEventsFromPatternTemplate(template, tempoMap = {}) {
+  const beatGrid = Array.isArray(tempoMap.beatGrid) ? tempoMap.beatGrid : [];
+  const beatTargets = clickPatternBeatTargets(template);
+  const events = [];
+  const beatsByMeasure = new Map();
+  for (const beat of beatGrid) {
+    const measure = positiveNumber(beat.measure);
+    const beatNumber = positiveNumber(beat.beat || beat.beatInMeasure);
+    const timeSeconds = nonNegativeNumber(beat.timeSeconds);
+    if (!measure || !beatNumber || timeSeconds === null) continue;
+    if (!beatsByMeasure.has(measure)) beatsByMeasure.set(measure, new Map());
+    beatsByMeasure.get(measure).set(beatNumber, beat);
+  }
+
+  const spanMeasures = clickPatternSpanMeasures(template);
+  for (const [measure, beats] of beatsByMeasure.entries()) {
+    if (spanMeasures > 1 && ((measure - 1) % spanMeasures) !== 0) continue;
+    for (const target of beatTargets) {
+      const targetMeasure = measure + (positiveNumber(target.measureOffset) || 0);
+      const targetBeats = targetMeasure === measure ? beats : beatsByMeasure.get(targetMeasure);
+      const beat = targetBeats?.get(target.beat);
+      const timeSeconds = nonNegativeNumber(beat?.timeSeconds);
+      const hit = template.hits[target.hitIndex];
+      if (!hit || timeSeconds === null) continue;
+      events.push({
+        index: events.length,
+        timeSeconds: Number(timeSeconds.toFixed(6)),
+        type: hit.type,
+        sourceTransientIndex: target.hitIndex,
+        source: "click-pattern-template-measure-position",
+        measure: targetMeasure,
+        beat: target.beat
+      });
+    }
+  }
+
+  return events.sort((left, right) => left.timeSeconds - right.timeSeconds)
+    .map((event, index) => ({ ...event, index }));
+}
+
+function clickPatternBeatTargets(template = {}) {
+  const beatsPerMeasure = clickPatternBeatCount(template.timeSignature);
+  const hits = Array.isArray(template.hits) ? template.hits : [];
+  if (!hits.length) return [];
+  if (displayTimeSignature(template.timeSignature) === "6/8") {
+    if (hits.length >= 6) {
+      return hits.slice(0, 6).map((hit, hitIndex) => ({ hitIndex, beat: hitIndex + 1 }));
+    }
+    return [
+      { beat: 1, measureOffset: 0 },
+      { beat: 3, measureOffset: 0 },
+      { beat: 5, measureOffset: 0 }
+    ].map((target, index) => {
+      const hitIndex = hits.length >= 6 ? index * 2 : index;
+      return { ...target, hitIndex: Math.min(hitIndex, hits.length - 1) };
+    });
+  }
+  if (hits.length === beatsPerMeasure) {
+    return hits.map((hit, hitIndex) => ({ hitIndex, beat: hitIndex + 1 }));
+  }
+  const duration = positiveNumber(template.durationSeconds);
+  const used = new Set();
+  return hits.map((hit, hitIndex) => {
+    const hitTime = nonNegativeNumber(hit.timeSeconds);
+    const normalized = duration ? Math.max(0, Math.min(0.999999, (hitTime || 0) / duration)) : hitIndex / hits.length;
+    let beat = Math.floor(normalized * beatsPerMeasure) + 1;
+    while (used.has(beat) && beat < beatsPerMeasure) beat += 1;
+    used.add(beat);
+    return { hitIndex, beat };
+  }).filter((target) => {
+    return target.beat >= 1 && target.beat <= beatsPerMeasure;
+  });
+}
+
+function clickPatternSpanMeasures(template = {}) {
+  return 1;
+}
+
+function expectedClickPatternHits(timeSignature, filePath = "") {
+  const [numeratorText, denominatorText] = displayTimeSignature(timeSignature || "4/4").split("/");
+  const numerator = Math.max(1, Math.floor(positiveNumber(numeratorText) || 4));
+  const denominator = Math.max(1, Math.floor(positiveNumber(denominatorText) || 4));
+  if (/6-8-six-clicks\.wav$/i.test(stringValue(filePath))) return 6;
+  if (denominator === 8 && [6, 9, 12].includes(numerator)) {
+    return Math.max(1, numerator / 2);
+  }
+  return numerator;
+}
+
+async function readClickPatternTemplate(filePath, timeSignature) {
+  const source = await readClickPatternAudio(filePath, timeSignature);
+  const hits = source.hits.map((hit, index) => ({ ...hit, type: index === 0 ? "accent" : "normal" }));
+  return {
+    timeSignature,
+    filePath,
+    sampleRate: source.sampleRate,
+    durationSeconds: source.durationSeconds,
+    hits,
+    pattern: hits.map((hit) => hit.type)
+  };
+}
+
+async function readClickPatternAudio(filePath, timeSignature = "") {
+  const buffer = await readFile(filePath);
+  const info = parseWavHeader(buffer);
+  if (!info?.dataBytes || !info.blockAlign || !info.sampleRate) throw new Error("Unsupported click pattern WAV.");
+  const bytesPerSample = info.bitsPerSample / 8;
+  const frameCount = Math.floor(info.dataBytes / info.blockAlign);
+  const frames = new Float32Array(frameCount * info.channels);
+  const mono = new Float32Array(frameCount);
+  for (let frame = 0; frame < frameCount; frame += 1) {
+    let sum = 0;
+    for (let channel = 0; channel < info.channels; channel += 1) {
+      const offset = info.dataOffset + (frame * info.channels + channel) * bytesPerSample;
+      const sample = readWavSample(buffer, offset, info);
+      frames[(frame * info.channels) + channel] = sample;
+      sum += sample;
+    }
+    mono[frame] = sum / Math.max(1, info.channels);
+  }
+  const hits = detectClickPatternHits(mono, info.sampleRate, expectedClickPatternHits(timeSignature, filePath));
+  return { sampleRate: info.sampleRate, channels: info.channels, frameCount, frames, durationSeconds: frameCount / info.sampleRate, hits };
+}
+
+function detectClickPatternHits(samples, sampleRate, expectedHits = 0) {
+  const windowSize = Math.max(1, Math.floor(sampleRate * 0.005));
+  const envelope = [];
+  for (let index = 0; index < samples.length; index += windowSize) {
+    let sumSquares = 0;
+    let count = 0;
+    for (let sampleIndex = index; sampleIndex < Math.min(samples.length, index + windowSize); sampleIndex += 1) {
+      sumSquares += samples[sampleIndex] * samples[sampleIndex];
+      count += 1;
+    }
+    envelope.push(Math.sqrt(sumSquares / Math.max(1, count)));
+  }
+  const maxEnvelope = Math.max(...envelope, 0);
+  if (!maxEnvelope) return [];
+  const expectedCount = Math.max(0, Math.floor(Number(expectedHits || 0)));
+  const threshold = maxEnvelope * (expectedCount ? 0.25 : 0.6);
+  const candidates = [];
+  for (let index = 0; index < envelope.length; index += 1) {
+    const previous = index > 0 ? envelope[index - 1] : 0;
+    const next = index < envelope.length - 1 ? envelope[index + 1] : 0;
+    if (envelope[index] >= threshold && envelope[index] >= previous && envelope[index] >= next) {
+      candidates.push({ timeSeconds: (index * windowSize) / sampleRate, level: envelope[index] });
+    }
+  }
+  const selected = [];
+  const durationSeconds = samples.length / sampleRate;
+  const minimumGapSeconds = expectedCount ? Math.max(0.03, durationSeconds / (expectedCount * 2.2)) : 0.2;
+  for (const candidate of candidates.sort((left, right) => right.level - left.level)) {
+    if (selected.every((hit) => Math.abs(candidate.timeSeconds - hit.timeSeconds) >= minimumGapSeconds)) selected.push(candidate);
+    if (expectedCount && selected.length >= expectedCount) break;
+  }
+  return selected.sort((left, right) => left.timeSeconds - right.timeSeconds);
+}
+
+function clickPatternHitSlices(source) {
+  const hits = Array.isArray(source.hits) ? source.hits : [];
+  if (!hits.length || !source.sampleRate || !source.frameCount) return [];
+  const preRollFrames = Math.floor(source.sampleRate * 0.004);
+  const maxHitFrames = Math.floor(source.sampleRate * 0.16);
+  return hits.map((hit, index) => {
+    const hitFrame = Math.max(0, Math.round((nonNegativeNumber(hit.timeSeconds) ?? 0) * source.sampleRate));
+    const nextHit = hits[index + 1];
+    const nextHitFrame = nextHit
+      ? Math.round((nonNegativeNumber(nextHit.timeSeconds) ?? source.durationSeconds) * source.sampleRate)
+      : source.frameCount;
+    const startFrame = Math.max(0, hitFrame - preRollFrames);
+    const endFrame = Math.min(source.frameCount, nextHitFrame - preRollFrames, startFrame + maxHitFrames);
+    return { startFrame, frameCount: Math.max(1, endFrame - startFrame) };
+  });
+}
+
+function mixClickSlice(output, outputFrames, source, sourceStartFrame, sliceFrames, destinationStartFrame) {
+  const channels = source.channels;
+  for (let frame = 0; frame < sliceFrames; frame += 1) {
+    const destinationFrame = destinationStartFrame + frame;
+    if (destinationFrame < 0 || destinationFrame >= outputFrames) continue;
+    const fade = frame > sliceFrames - 64 ? Math.max(0, (sliceFrames - frame) / 64) : 1;
+    for (let channel = 0; channel < channels; channel += 1) {
+      const sourceValue = source.frames[((sourceStartFrame + frame) * channels) + channel] || 0;
+      const outputIndex = (destinationFrame * channels) + channel;
+      output[outputIndex] += sourceValue * fade;
+    }
+  }
+}
+
+function clickPatternBeatCount(timeSignature) {
+  const numerator = positiveNumber(String(timeSignature || "").split("/")[0]);
+  return Math.max(1, Math.floor(numerator || 4));
 }
 
 async function buildDynamicCueManifest(cueMarkers, folderPath, tempoMap = {}) {
@@ -3422,6 +4169,30 @@ async function dynamicPadFilePath(folderPath, songKey) {
     if (exact) return exact.filePath;
   }
   return "";
+}
+
+async function listPadOptions() {
+  const settings = await loadSettings();
+  const folderPath = stringValue(settings.pads?.folderPath || APP_PADS_DIR);
+  let entries = [];
+  try {
+    entries = await readdir(folderPath, { withFileTypes: true });
+  } catch {
+    return { folderPath, pads: [] };
+  }
+  const pads = entries
+    .filter((entry) => entry.isFile() && entry.name.toLowerCase().endsWith(".wav"))
+    .map((entry) => {
+      const key = padFileMatchKey(entry.name.replace(/\.wav$/i, ""));
+      return {
+        fileName: entry.name,
+        filePath: join(folderPath, entry.name),
+        key,
+        label: key ? `${entry.name.replace(/\.wav$/i, "")} (${key.toUpperCase()})` : entry.name
+      };
+    })
+    .sort((left, right) => left.fileName.localeCompare(right.fileName));
+  return { folderPath, pads };
 }
 
 async function dynamicPadManifestObject({ folderPath, songKey, mixer, routingPreset, settings = {}, soloActive = false }) {
@@ -3790,6 +4561,7 @@ async function handlePlaybackCommandLocked(command, payload = {}) {
     "stop",
     "fadeOut",
     "panic",
+    "clearPanicRecovery",
     "togglePad",
     "exitPanic",
     "restart",
@@ -3927,6 +4699,30 @@ async function handlePlaybackCommandLocked(command, payload = {}) {
       };
     }
   }
+  if (action === "clearPanicRecovery") {
+    const nextState = normalizePlaybackState({
+      ...state,
+      panic: normalizePanicRuntime({
+        ...state.panic,
+        recoveryTarget: null,
+        detail: "Recovery target cleared.",
+        updatedAt: new Date().toISOString()
+      }),
+      lastCommand: action,
+      commandStatus: "accepted",
+      lastMessage: "Panic recovery target cleared.",
+      updatedAt: new Date().toISOString()
+    });
+    await savePlaybackState(nextState);
+    return {
+      state: await playbackStateSnapshot(),
+      command: action,
+      accepted: true,
+      engine: ENGINE_HELPER,
+      protocolVersion: ENGINE_PROTOCOL_VERSION,
+      nativeEngineConnected: Boolean(activePlaybackProcess)
+    };
+  }
   if (action === "songTransition") {
     return applySetlistTransitionLocked(state, setlist, payload);
   }
@@ -4055,7 +4851,9 @@ async function handlePlaybackCommandLocked(command, payload = {}) {
     await sendNativePlaybackCommand("pause");
   }
   if (action === "seek") {
-    await sendNativePlaybackCommand("seek", { seconds: nonNegativeNumber(payload.seconds) ?? 0 });
+    if (activePlaybackProcess) {
+      await sendNativePlaybackCommand("seek", { seconds: nonNegativeNumber(payload.seconds) ?? 0 });
+    }
   }
   if (action === "exitPanic") {
     const recoverySeconds = nonNegativeNumber(payload.targetSeconds ?? payload.recoveryTargetSeconds ?? payload.seekSeconds);
@@ -4155,15 +4953,15 @@ async function handlePlaybackCommandLocked(command, payload = {}) {
     : action === "exitPanic"
       ? nonNegativeNumber(payload.targetSeconds ?? payload.recoveryTargetSeconds ?? payload.seekSeconds)
       : null;
-  const nextTimeSeconds = nextTransport === "stopped"
-    ? 0
-    : seekSeconds !== null
-      ? seekSeconds
-      : playStartSeconds !== null
-      ? playStartSeconds
-      : startsFromZero
+  const nextTimeSeconds = seekSeconds !== null
+    ? seekSeconds
+    : nextTransport === "stopped"
       ? 0
-      : previousTimeSeconds;
+      : playStartSeconds !== null
+        ? playStartSeconds
+        : startsFromZero
+          ? 0
+          : previousTimeSeconds;
   const nextStartedAt = nextTransport === "playing" ? new Date().toISOString() : "";
   const nextState = normalizePlaybackState({
     ...state,
@@ -4263,46 +5061,42 @@ async function applySetlistTransitionLocked(state, setlist, payload = {}) {
     };
   }
 
-  if (["crossfade", "overlap"].includes(transition.mode)) {
-    await stopNativePlayback({ fade: true, durationMs: 250 });
-    const blocked = normalizePlaybackState({
-      ...state,
-      transport: "stopped",
-      currentSlot: transition.fromSlot,
-      currentTimeSeconds: 0,
-      transportAnchorSeconds: 0,
-      transportStartedAt: "",
-      transition: {
-        ...transition,
-        active: false,
-        status: "blocked",
-        message: `${transition.mode} needs deeper engine support and is planned.`
-      },
-      lastCommand: "songTransition",
-      commandStatus: "rejected",
-      lastMessage: `${transition.mode} transition is planned but not enabled yet.`,
-      updatedAt: new Date().toISOString()
-    });
-    await savePlaybackState(blocked);
-    return {
-      state: await playbackStateSnapshot(),
-      command: "songTransition",
-      accepted: false,
-      reason: blocked.lastMessage,
-      engine: ENGINE_HELPER,
-      protocolVersion: ENGINE_PROTOCOL_VERSION,
-      nativeEngineConnected: false
-    };
-  }
-
   const pad = transitionPadRuntime(transition, currentSlot, nextSlot);
   let nativePlayback = { ok: true };
   let transport = "stopped";
   let currentSlotNumber = transition.mode === "stay" ? transition.fromSlot : transition.toSlot;
   let status = transition.mode === "cue-next" ? "waiting-next" : "completed";
   let message = transitionMessage(transition, currentSlot, nextSlot);
-  if (transition.mode === "autolink") {
-    nativePlayback = await startNativeSlotPlayback(transition.toSlot, { startSeconds: 0 });
+  if (state.mode === "edit" && transition.toSlot && transition.mode === "crossfade" && !(await engineManifestHasPlayableSlot(transition.toSlot))) {
+    const prepared = await ensureEditPlaybackManifest(transition.toSlot);
+    if (!prepared.ok) {
+      status = "blocked";
+      message = prepared.error || "The next song could not be prepared for editor transition playback.";
+      nativePlayback = { ok: false, error: message };
+    }
+  }
+  if (transition.mode === "crossfade") {
+    if (nativePlayback.ok) {
+      await quietScheduledDynamicCuesForTransition();
+      const outgoingPlaybackProcess = activePlaybackProcess;
+      nativePlayback = preloadedPlaybackProcess?.slot === transition.toSlot
+        ? await promotePreloadedPlayback(transition.toSlot)
+        : await startNativeSlotPlayback(transition.toSlot, {
+            startSeconds: 0,
+            keepCurrentActive: true
+          });
+      if (nativePlayback.ok && nativePlayback.process) {
+        activePlaybackProcess = nativePlayback.process;
+        if (outgoingPlaybackProcess && outgoingPlaybackProcess !== activePlaybackProcess) {
+          stopNativePlaybackProcess(outgoingPlaybackProcess, {
+            fade: true,
+            durationMs: Math.max(250, transitionDurationForMode(transition, "crossfade") * 1000),
+            preserveMeters: true
+          }).catch((error) => console.warn(`[transition] could not fade outgoing engine: ${error.message}`));
+        }
+      }
+      await restoreScheduledDynamicCuesAfterTransition();
+    }
     if (!nativePlayback.ok) {
       status = "blocked";
       message = nativePlayback.error || `${transitionModeLabel(transition.mode)} could not start the next song.`;
@@ -4329,7 +5123,7 @@ async function applySetlistTransitionLocked(state, setlist, payload = {}) {
     panic: normalizePanicRuntime({}),
     transition: {
       ...transition,
-      active: transition.mode === "autolink" && transport === "playing",
+      active: transition.mode === "crossfade" && transport === "playing",
       startedAt: new Date().toISOString(),
       status,
       message
@@ -4361,6 +5155,12 @@ function transitionForFromSlot(setlist, fromSlot) {
   return normalized.find((transition) => transition.fromSlot === fromSlot) || null;
 }
 
+async function engineManifestHasPlayableSlot(slotNumber) {
+  const manifestResult = await loadEngineManifest();
+  const song = (manifestResult.manifest?.songs || []).find((item) => Number(item.slot) === Number(slotNumber));
+  return Boolean(song && Array.isArray(song.stems) && song.stems.length);
+}
+
 function transitionPadRuntime(transition, currentSlot, nextSlot) {
   if (!transition.continuePad || transition.padBehavior === "off") {
     return normalizePadRuntime({
@@ -4383,8 +5183,16 @@ function transitionPadRuntime(transition, currentSlot, nextSlot) {
 
 function transitionMessage(transition, currentSlot, nextSlot) {
   if (transition.mode === "stay") return `Transition Stay: ${currentSlot.title} stopped and remains selected.`;
-  if (transition.mode === "autolink") return `AutoLink: starting ${nextSlot.title}.`;
+  if (transition.mode === "crossfade") return `Crossfade: fading ${currentSlot.title} into ${nextSlot.title}.`;
   return `Cue Next: ${nextSlot.title} selected.`;
+}
+
+function transitionModeLabel(mode) {
+  return {
+    "cue-next": "Cue Next",
+    stay: "Stay",
+    crossfade: "Crossfade"
+  }[mode] || "Cue Next";
 }
 
 async function applyTransitionPadHold(currentSlot, nextSlot, padRuntime) {
@@ -4768,10 +5576,7 @@ async function saveSlotMetadata(slotNumber, metadata) {
   await mkdir(slotDir, { recursive: true });
   const regions = normalizeRegions(metadata.regions?.regions || metadata.regions || []);
   const cueMarkers = normalizeCueMarkers(metadata.cues?.cueMarkers || metadata.cueMarkers || []);
-  const tempoMap = extendTempoMapForSongPositions(
-    normalizeTempoMap(metadata.tempoMap || {}, slot),
-    songGridPositions(regions, cueMarkers)
-  );
+  const tempoMap = appGridTempoMapForSlot(metadata.tempoMap || {}, slot, songGridPositions(regions, cueMarkers));
   const mixer = normalizeMixer(metadata.mixer || {}, slot);
   const arrangement = normalizeArrangement(metadata.arrangement || {});
 
@@ -5068,6 +5873,43 @@ async function applyWavShiftIfNeeded(filePath, shiftSeconds) {
   return shiftWavFileInPlace(filePath, seconds);
 }
 
+async function applyWavTempoIfNeeded(filePath, tempoRatio, sampleRate, ffmpeg) {
+  const ratio = Number(tempoRatio || 1);
+  if (Math.abs(ratio - 1) < 0.0005) return null;
+  if (!ffmpeg) throw new Error("FFmpeg with Rubber Band is required for BPM changes.");
+  return renderTempoChangedWavInPlace({ ffmpeg, filePath, sampleRate, tempoRatio: ratio });
+}
+
+async function renderTempoChangedWavInPlace({ ffmpeg, filePath, sampleRate, tempoRatio }) {
+  assertInsideCache(filePath);
+  const temporaryPath = `${filePath}.${process.pid}.${Date.now()}.tempo`;
+  assertInsideCache(temporaryPath);
+  const args = [
+    "-y",
+    "-i", filePath,
+    "-af", `rubberband=tempo=${Number(tempoRatio).toFixed(8)}`,
+    "-ar", String(sampleRate || 48000),
+    temporaryPath
+  ];
+  try {
+    await new Promise((resolvePromise, rejectPromise) => {
+      const child = spawn(ffmpeg, args, { windowsHide: true });
+      let stderr = "";
+      child.stderr.on("data", (chunk) => { stderr += chunk.toString(); });
+      child.on("error", rejectPromise);
+      child.on("close", (code) => {
+        if (code === 0) resolvePromise();
+        else rejectPromise(new Error(`FFmpeg BPM change failed (${code}): ${stderr.trim()}`));
+      });
+    });
+    await rm(filePath, { force: true });
+    await rename(temporaryPath, filePath);
+    return readWavSummary(filePath);
+  } finally {
+    await rm(temporaryPath, { force: true }).catch(() => {});
+  }
+}
+
 async function shiftWavFileInPlace(filePath, shiftSeconds) {
   assertInsideCache(filePath);
   const source = await open(filePath, "r");
@@ -5175,6 +6017,154 @@ async function saveSlotMixer(slotNumber, value) {
   return readCurrentSetMetadata();
 }
 
+async function buildSetPackage() {
+  const setlist = await loadCurrentSetlist();
+  const filledSlots = (setlist.slots || []).filter((slot) => slot?.songId);
+  const songIds = new Set(filledSlots.map((slot) => slot.songId).filter(Boolean));
+  const songFolders = filledSlots.map((slot) => slot.folderPath).filter(Boolean);
+  const packageJson = await readJsonFile(join(__dirname, "package.json"), {});
+  return {
+    schema: "playback-v2-set-package",
+    version: 1,
+    exportedAt: new Date().toISOString(),
+    app: {
+      name: packageJson.name || "playback-app-v2",
+      version: packageJson.version || "",
+      dataDir: DATA_DIR
+    },
+    summary: {
+      songCount: filledSlots.length,
+      titles: filledSlots.map((slot) => slot.title).filter(Boolean)
+    },
+    setlist,
+    confirmedSet: await readJsonFile(CONFIRMED_SET_FILE, null),
+    setMetadata: await readJsonTree(SET_METADATA_DIR),
+    songOverrides: await readSongOverridePackage(songIds),
+    songMetadata: await readSongMetadataPackage(songFolders)
+  };
+}
+
+async function importSetPackage(payload) {
+  if (!payload || payload.schema !== "playback-v2-set-package") {
+    throw new Error("This is not a Playback App V2 set package.");
+  }
+  const setlist = normalizeSetlist(payload.setlist || {});
+  const filledSlots = (setlist.slots || []).filter((slot) => slot?.songId);
+  await stopNativePlayback();
+  await writeJsonTree(SONG_METADATA_DIR, payload.songMetadata);
+  await writeJsonTree(SONG_OVERRIDES_DIR, payload.songOverrides);
+  const prepared = await prepareSetlistCache(setlist);
+  await saveCurrentSetlist(prepared);
+  await replaceJsonTree(SET_METADATA_DIR, payload.setMetadata);
+  await ensureSetMetadata(prepared, { allowAnalysis: false });
+  await cleanupSetlistGeneratedArtifacts(prepared);
+  await markSetUnconfirmed(prepared);
+  await refreshEngineManifestForMixer();
+  const missing = await importedSetMissingSongs(prepared);
+  return {
+    ok: true,
+    importedAt: new Date().toISOString(),
+    songCount: filledSlots.length,
+    missingSongCount: missing.length,
+    missingSongs: missing,
+    message: missing.length
+      ? `Imported with ${missing.length} missing song folder(s).`
+      : "Imported set package. Confirm Set on this PC before Performance."
+  };
+}
+
+async function importedSetMissingSongs(setlist) {
+  const missing = [];
+  for (const slot of setlist.slots || []) {
+    if (!slot?.songId) continue;
+    if (!slot.folderPath) {
+      missing.push({ slot: slot.slot, title: slot.title, reason: "missing-folder-path" });
+      continue;
+    }
+    try {
+      const folderStat = await stat(slot.folderPath);
+      if (!folderStat.isDirectory()) missing.push({ slot: slot.slot, title: slot.title, folderPath: slot.folderPath, reason: "not-a-folder" });
+    } catch {
+      missing.push({ slot: slot.slot, title: slot.title, folderPath: slot.folderPath, reason: "folder-not-found" });
+    }
+  }
+  return missing;
+}
+
+async function readSongOverridePackage(songIds) {
+  const files = [];
+  for (const songIdValue of songIds) {
+    const tree = await readJsonTree(appSongOverridesDir(songIdValue));
+    for (const file of tree.files || []) {
+      files.push({ ...file, relativePath: join(songIdValue, file.relativePath).replace(/\\/g, "/") });
+    }
+  }
+  return { files };
+}
+
+async function readSongMetadataPackage(songFolders) {
+  const files = [];
+  for (const folderPath of songFolders) {
+    const tree = await readJsonTree(appSongMetadataDir(folderPath));
+    for (const file of tree.files || []) {
+      files.push({ ...file, relativePath: join(songId(folderPath), file.relativePath).replace(/\\/g, "/") });
+    }
+  }
+  return { files };
+}
+
+async function readJsonTree(rootDir) {
+  const root = resolve(rootDir);
+  const files = [];
+  let entries;
+  try {
+    entries = await readdir(root, { withFileTypes: true });
+  } catch (error) {
+    if (error.code === "ENOENT") return { files };
+    throw error;
+  }
+  await readJsonTreeEntries(root, root, entries, files);
+  files.sort((left, right) => left.relativePath.localeCompare(right.relativePath));
+  return { files };
+}
+
+async function readJsonTreeEntries(root, current, entries, files) {
+  for (const entry of entries) {
+    if (isHiddenName(entry.name)) continue;
+    const fullPath = join(current, entry.name);
+    if (entry.isDirectory()) {
+      await readJsonTreeEntries(root, fullPath, await readdir(fullPath, { withFileTypes: true }), files);
+      continue;
+    }
+    if (!entry.isFile() || extname(entry.name).toLowerCase() !== ".json") continue;
+    files.push({
+      relativePath: relative(root, fullPath).replace(/\\/g, "/"),
+      value: await readJsonFile(fullPath, null)
+    });
+  }
+}
+
+async function replaceJsonTree(rootDir, tree) {
+  const root = resolve(rootDir);
+  assertInsideData(root);
+  await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+  await writeJsonTree(root, tree);
+}
+
+async function writeJsonTree(rootDir, tree) {
+  const root = resolve(rootDir);
+  assertInsideData(root);
+  await mkdir(root, { recursive: true });
+  for (const file of Array.isArray(tree?.files) ? tree.files : []) {
+    const relativePath = stringValue(file.relativePath).replace(/\\/g, "/");
+    if (!relativePath || relativePath.startsWith("/") || relativePath.includes("..")) continue;
+    const targetPath = resolve(root, relativePath);
+    if (!targetPath.toLowerCase().startsWith(root.toLowerCase())) continue;
+    await mkdir(dirname(targetPath), { recursive: true });
+    await writeFile(targetPath, `${JSON.stringify(file.value ?? null, null, 2)}\n`, "utf8");
+  }
+}
+
 async function applyLiveMixerUpdate(slotNumber, value) {
   if (!slotNumber) throw new Error("Live mixer update needs a setlist slot.");
   const setlist = await loadCurrentSetlist();
@@ -5210,7 +6200,6 @@ async function liveDynamicMixerObjects(slot, mixer, routingPreset, settings, sol
   const dynamicPadMixer = matchMixerStem({ id: "dynamic-pad" }, mixer);
   const dynamicClickRouting = routeForStem(canonicalBus(dynamicClickMixer?.routeBus || "click"), 0, routingPreset);
   const dynamicCueRouting = routeForStem(canonicalBus(dynamicCueMixer?.routeBus || "dynamicCue"), 0, routingPreset);
-  const songMetadata = slot.folderPath ? await readSongMetadata(slot.folderPath) : null;
   const dynamicPad = await dynamicPadManifestObject({
     folderPath: settings.pads.folderPath,
     songKey: slot.padKey || slot.key,
@@ -5221,7 +6210,7 @@ async function liveDynamicMixerObjects(slot, mixer, routingPreset, settings, sol
   });
   return {
     dynamicClick: {
-      ...(base.dynamicClick || songMetadata?.dynamicClick || {}),
+      ...(base.dynamicClick || {}),
       volume: dynamicClickRouting.outputChannels.length ? mixerOutputVolume(dynamicClickMixer, 80, soloActive) : 0,
       solo: Boolean(dynamicClickMixer?.solo),
       mute: Boolean(dynamicClickMixer?.mute),
@@ -5416,6 +6405,7 @@ async function queuePanicReleaseFromState(state, slotNumber, payload = {}) {
   const requestedId = stringValue(payload.regionId);
   const requestedName = stringValue(payload.regionName);
   const targetSeconds = nonNegativeNumber(payload.targetSeconds ?? payload.recoveryTargetSeconds ?? payload.seekSeconds);
+  const recoveryMode = stringValue(payload.recoveryMode) === "now" ? "now" : "boundary";
   const requested = requestedId
     ? starts.find((entry) => stringValue(entry.region.id) === requestedId)
     : requestedName
@@ -5425,6 +6415,9 @@ async function queuePanicReleaseFromState(state, slotNumber, payload = {}) {
       : null;
   const execute = starts.find((entry) => entry.seconds > currentSeconds + 0.25);
   const target = requested || execute;
+  const executeTarget = requested && recoveryMode === "boundary"
+    ? execute || requested
+    : target;
   if (!target) {
     return {
       ok: false,
@@ -5451,7 +6444,8 @@ async function queuePanicReleaseFromState(state, slotNumber, payload = {}) {
   const recoveryTarget = {
     pending: true,
     slot: slotNumber,
-    executeSeconds: target.seconds,
+    recoveryMode,
+    executeSeconds: executeTarget.seconds,
     targetSeconds: target.seconds,
     cueSeconds: Number.isFinite(cue?.seconds) ? cue.seconds : null,
     cueFired: Number.isFinite(cue?.seconds) && cue.seconds < currentSeconds - 0.1,
@@ -5627,6 +6621,7 @@ function normalizeCueMarkers(cueMarkers) {
 function normalizeArrangement(value = {}) {
   return {
     enabled: value.enabled !== false,
+    updatedAt: stringValue(value.updatedAt),
     trimStartBar: positiveNumber(value.trimStartBar),
     trimStartBeat: positiveNumber(value.trimStartBeat),
     trimEndBar: positiveNumber(value.trimEndBar),
@@ -5675,6 +6670,13 @@ function normalizeTempoMap(value, slot) {
     confidence: positiveNumber(value.confidence),
     measureOne: normalizeMeasureOne(value.measureOne),
     countIn: value.countIn && typeof value.countIn === "object" ? value.countIn : null,
+    bpmInterpretation: stringValue(value.bpmInterpretation),
+    gridBeatSeconds: positiveNumber(value.gridBeatSeconds),
+    measureSeconds: positiveNumber(value.measureSeconds),
+    clickBeats: Array.isArray(value.clickBeats)
+      ? value.clickBeats.map((beat) => Number(beat)).filter((beat) => Number.isInteger(beat) && beat > 0)
+      : [],
+    clickProfile: value.clickProfile && typeof value.clickProfile === "object" ? value.clickProfile : null,
     tempoChanges: normalizeTempoChanges(value.tempoChanges),
     timeSignatureChanges: Array.isArray(value.timeSignatureChanges) ? value.timeSignatureChanges : [],
     beatGrid: normalizeBeatGrid(value.beatGrid)
@@ -5869,11 +6871,14 @@ async function ensureSetMetadata(setlist, options = {}) {
     await ensureSongCueAnalysis(slot, song, { allowAnalysis });
     await ensureSongDefaultMetadata(slot, song, { allowAnalysis });
     await migrateExistingSlotMetadataToSongDefaults(slot, files);
-    const analyzerTempoMap = await readAnalyzerTempoMapForSlot(slot, song);
     await hydrateSlotRegionsFromDefaults(files.regions, await readSongDefaultRegions(slot));
     await hydrateSlotCuesFromDefaults(files.cues, await readSongDefaultCueMarkers(slot));
     await syncCueAnalysisToSlot(slot, files);
-    await writeIfMissing(files.tempoMap, analyzerTempoMap);
+    const analyzerTempoMap = await readAnalyzerTempoMapForSlot(slot, song);
+    const currentRegions = normalizeRegions((await readJsonFile(files.regions, { regions: [] })).regions || []);
+    const currentCues = normalizeCueMarkers((await readJsonFile(files.cues, { cueMarkers: [] })).cueMarkers || []);
+    const appTempoMap = appGridTempoMapForSlot(analyzerTempoMap, slot, songGridPositions(currentRegions, currentCues));
+    await writeFile(files.tempoMap, `${JSON.stringify(appTempoMap, null, 2)}\n`, "utf8");
     await ensureMixerMetadata(files.mixer, slot, library);
     if (includeWaveforms && slot.cachedStems?.length) {
       await writeSlotWaveformBaseline(slot, files.waveform, WAVEFORM_BUCKETS);
@@ -5902,11 +6907,11 @@ async function ensureSetMetadata(setlist, options = {}) {
 
 async function readAnalyzerTempoMapForSlot(slot, song) {
   if (!song?.folderPath && !slot.folderPath) {
-    return normalizeTempoMap({}, slot);
+    return appGridTempoMapForSlot({}, slot);
   }
   const folderPath = song?.folderPath || slot.folderPath;
   const metadata = await readSongMetadata(folderPath);
-  return normalizeTempoMap(metadata.tempoMap || {}, {
+  return appGridTempoMapForSlot(metadata.tempoMap || {}, {
     ...slot,
     key: slot.key || metadata.key,
     bpm: slot.bpm || metadata.bpm,
@@ -6105,6 +7110,7 @@ async function rehydrateCurrentSetMetadata(options = {}) {
     const paths = [
       join(slotDir, "cue-markers.json"),
       join(slotDir, "regions.json"),
+      join(slotDir, "tempo-map.json"),
       join(slotDir, "cue-recognition-report.json"),
       join(slotDir, "dynamic-cue-map.json"),
       join(slotDir, "slot-info.json"),
@@ -6704,7 +7710,14 @@ async function writeSlotWaveformBaseline(slot, filePath, bucketCount = WAVEFORM_
   const stems = waveformStems(slot);
   const fingerprint = waveformFingerprint(slot, stems, buckets);
   const existing = await readJsonFile(filePath, null);
-  if (existing?.fingerprint === fingerprint && Array.isArray(existing.peaks)) return existing;
+  if (
+    existing?.fingerprint === fingerprint
+    && Array.isArray(existing.peaks)
+    && positiveNumber(existing.tracksUsed) > 0
+    && existing.peaks.some((peak) => Number(peak) > 0)
+  ) {
+    return existing;
+  }
 
   const combined = new Float32Array(buckets);
   let tracksUsed = 0;
@@ -6768,7 +7781,7 @@ function isMusicWaveformStem(stem) {
 
 function waveformFingerprint(slot, stems, bucketCount) {
   return [
-    "waveform-v2-music-only:4",
+    "waveform-v2-music-only:5",
     `slot:${slot.slot}`,
     `song:${slot.songId}`,
     `buckets:${bucketCount}`,
@@ -6803,6 +7816,25 @@ async function readWavPeaks(filePath, bucketCount) {
       peaks[bucket] = peak;
     }
     return { peaks, durationSeconds: totalFrames / info.sampleRate };
+  } finally {
+    await handle.close();
+  }
+}
+
+async function readWavSummary(filePath) {
+  const handle = await open(filePath, "r");
+  try {
+    const header = Buffer.alloc(1024 * 1024);
+    const headerRead = await handle.read(header, 0, header.length, 0);
+    const info = parseWavHeader(header.subarray(0, headerRead.bytesRead));
+    if (!info?.dataBytes || !info.blockAlign || !info.sampleRate) throw new Error("Unsupported WAV file.");
+    const totalFrames = Math.floor(info.dataBytes / info.blockAlign);
+    return {
+      filePath,
+      durationSeconds: totalFrames / info.sampleRate,
+      sampleRate: info.sampleRate,
+      channels: info.channels
+    };
   } finally {
     await handle.close();
   }
@@ -6907,7 +7939,8 @@ function setFingerprint(setlist) {
       mode: transition.mode,
       padBehavior: transition.padBehavior,
       continuePad: transition.continuePad,
-      durationSeconds: transition.durationSeconds
+      durationSeconds: transition.durationSeconds,
+      durationByMode: transition.durationByMode
   }));
   return createHash("sha1").update(JSON.stringify({ slots: payload, transitions })).digest("hex");
 }
@@ -6961,16 +7994,69 @@ function normalizeSetlistTransition(value = {}) {
   const toSlot = positiveNumber(value.toSlot) || null;
   if (!fromSlot || fromSlot === toSlot) return null;
   const terminal = !toSlot;
-  const mode = terminal ? "stay" : (TRANSITION_MODES.has(value.mode) ? value.mode : "cue-next");
+  const mode = normalizeTransitionMode(value.mode, toSlot);
   const padBehavior = terminal ? "off" : (TRANSITION_PAD_BEHAVIORS.has(value.padBehavior) ? value.padBehavior : "next-song-key");
+  const durationByMode = normalizeTransitionDurationByModeForMode(value, terminal ? "stay" : mode);
   return {
     fromSlot,
     toSlot,
-    mode,
+    mode: terminal ? "stay" : mode,
     padBehavior,
-    durationSeconds: positiveNumber(value.durationSeconds) || 5,
+    durationSeconds: transitionDurationForMode({ ...value, durationByMode }, terminal ? "stay" : mode),
+    durationByMode,
     continuePad: terminal ? false : value.continuePad !== false
   };
+}
+
+function normalizeTransitionMode(mode, toSlot = true) {
+  if (!toSlot) return "stay";
+  const value = stringValue(mode);
+  if (value === "overlap") return "crossfade";
+  if (value === "autolink") return "cue-next";
+  return TRANSITION_MODES.has(value) ? value : "cue-next";
+}
+
+function normalizeTransitionDurationByMode(value = {}) {
+  const legacy = value.durationSeconds;
+  return {
+    crossfade: normalizeTransitionDurationSeconds(value.crossfade ?? value.crossfadeSeconds ?? legacy, 5, 0.25),
+    cueNext: normalizeTransitionDurationSeconds(value.cueNext ?? value.cueNextSeconds ?? legacy, 0.25, 0),
+    stay: normalizeTransitionDurationSeconds(value.stay ?? value.staySeconds ?? legacy, 0, 0)
+  };
+}
+
+function normalizeTransitionDurationByModeForMode(value = {}, mode = "cue-next") {
+  if (value.durationByMode && typeof value.durationByMode === "object") {
+    return normalizeTransitionDurationByMode(value.durationByMode);
+  }
+  const defaults = normalizeTransitionDurationByMode({});
+  if (value.durationSeconds !== undefined) {
+    defaults[transitionDurationKey(mode)] = normalizeTransitionDurationSeconds(
+      value.durationSeconds,
+      defaultTransitionDurationForMode(mode),
+      mode === "crossfade" ? 0.25 : 0
+    );
+  }
+  return defaults;
+}
+
+function defaultTransitionDurationForMode(mode) {
+  if (mode === "crossfade") return 5;
+  if (mode === "stay") return 0;
+  return 0.25;
+}
+
+function transitionDurationForMode(transition = {}, mode = "") {
+  const durations = normalizeTransitionDurationByMode(transition.durationByMode || transition);
+  if (mode === "crossfade") return durations.crossfade;
+  if (mode === "stay") return durations.stay;
+  return durations.cueNext;
+}
+
+function normalizeTransitionDurationSeconds(value, fallback = 5, minimum = 0.25) {
+  const number = Number(value);
+  const selected = Number.isFinite(number) && number >= 0 ? number : fallback;
+  return Math.max(minimum, Math.min(30, Math.round(selected * 4) / 4));
 }
 
 function normalizeSetlistSlot(slot, index) {
@@ -6990,6 +8076,9 @@ function normalizeSetlistSlot(slot, index) {
     transposeCents: Number.isFinite(Number(slot.transposeCents)) ? Number(slot.transposeCents) : 0,
     padKey: stringValue(slot.padKey || slot.key),
     bpm: positiveNumber(slot.bpm),
+    originalBpm: positiveNumber(slot.originalBpm || slot.bpm),
+    selectedBpm: positiveNumber(slot.selectedBpm || slot.bpm),
+    bpmOverride: Boolean(slot.bpmOverride),
     timeSignature: stringValue(slot.timeSignature),
     trackCount: positiveNumber(slot.trackCount),
     metadataVersionInfo: normalizeMetadataVersionInfo(slot.metadataVersionInfo),
@@ -7012,6 +8101,10 @@ function syncSetlistWithLibrary(setlist, library) {
       if (!slot?.songId) return slot;
       const song = songsById.get(slot.songId);
       if (!song) return slot;
+      const sourceBpm = positiveNumber(song.bpm);
+      const selectedBpm = slot.bpmOverride
+        ? (positiveNumber(slot.selectedBpm || slot.bpm) || sourceBpm)
+        : sourceBpm;
       return {
         ...slot,
         title: song.title,
@@ -7022,7 +8115,10 @@ function syncSetlistWithLibrary(setlist, library) {
         selectedKey: canonicalMajorKey(slot.selectedKey || song.key) || song.key,
         transposeCents: effectiveTransposeCents(song.key, slot.selectedKey || song.key, slot.transposeCents),
         padKey: canonicalMajorKey(slot.selectedKey || song.padKey || song.key) || song.padKey || song.key,
-        bpm: song.bpm,
+        bpm: selectedBpm,
+        originalBpm: sourceBpm,
+        selectedBpm,
+        bpmOverride: Boolean(slot.bpmOverride),
         timeSignature: song.timeSignature,
         trackCount: song.trackCount,
         metadataVersionInfo: song.metadataVersionInfo
@@ -7058,6 +8154,10 @@ function normalizeCachedStem(stem) {
     playLive: stem.playLive !== false,
     transposeCached: Boolean(stem.transposeCached),
     transposeCents: Number.isFinite(Number(stem.transposeCents)) ? Number(stem.transposeCents) : 0,
+    tempoCached: Boolean(stem.tempoCached),
+    tempoRatio: Number.isFinite(Number(stem.tempoRatio)) ? Number(stem.tempoRatio) : 1,
+    originalBpm: positiveNumber(stem.originalBpm),
+    selectedBpm: positiveNumber(stem.selectedBpm),
     audioShiftSeconds: Number.isFinite(Number(stem.audioShiftSeconds)) ? Number(stem.audioShiftSeconds) : 0,
     durationMs: positiveNumber(stem.durationMs),
     sampleRate: positiveNumber(stem.sampleRate),
@@ -7112,6 +8212,11 @@ async function prepareSetlistCache(setlist, options = {}) {
         selectedKey: cache.selectedKey || slot.selectedKey || song.key,
         transposeCents: Number(cache.transposeCents || 0),
         padKey: cache.selectedKey || slot.padKey || song.padKey || song.key,
+        bpm: cache.selectedBpm || slot.bpm || song.bpm,
+        originalBpm: cache.originalBpm || slot.originalBpm || song.bpm,
+        selectedBpm: cache.selectedBpm || slot.selectedBpm || slot.bpm || song.bpm,
+        tempoRatio: cache.tempoRatio || 1,
+        bpmOverride: Boolean(slot.bpmOverride),
         trackCount: cache.expectedTrackCount,
         cacheStatus: cache.missingStems.length ? "cached-with-warnings" : "cached",
         readinessState: cache.missingStems.length ? "warning" : "ready",
@@ -7181,6 +8286,47 @@ async function updateSetlistSlotKey(slotNumber, selectedKeyInput) {
   return prepared;
 }
 
+async function updateSetlistSlotBpm(slotNumber, selectedBpmInput) {
+  if (!slotNumber) throw new Error("A setlist slot is required for BPM change.");
+  const playback = await loadPlaybackState();
+  if (playback.mode === "performance") {
+    throw new Error("Leave Performance Mode before changing a song BPM.");
+  }
+  const selectedBpm = Math.round(positiveNumber(selectedBpmInput) || 0);
+  if (!selectedBpm || selectedBpm < 20 || selectedBpm > 300) {
+    throw new Error("Choose a BPM between 20 and 300.");
+  }
+  const setlist = await loadCurrentSetlist();
+  const library = await loadLibrary();
+  const slot = (setlist.slots || []).find((item) => Number(item.slot) === Number(slotNumber) && item.songId);
+  if (!slot) throw new Error(`Setlist slot ${slotNumber} is empty.`);
+  const song = (library.songs || []).find((item) => item.id === slot.songId);
+  if (!song) throw new Error("Song is no longer available in the library.");
+  const originalBpm = positiveNumber(slot.originalBpm || song.bpm || slot.bpm);
+  if (!originalBpm) throw new Error("Original song BPM is missing.");
+  await stopNativePlayback();
+  const next = normalizeSetlist({
+    ...setlist,
+    slots: (setlist.slots || []).map((item) => Number(item.slot) === Number(slotNumber)
+      ? {
+          ...item,
+          bpm: selectedBpm,
+          originalBpm,
+          selectedBpm,
+          tempoRatio: selectedBpm / originalBpm,
+          bpmOverride: Math.abs(selectedBpm - originalBpm) >= 0.001
+        }
+      : item)
+  });
+  const prepared = await prepareSetlistCache(next, { slotNumbers: [slotNumber] });
+  await saveCurrentSetlist(prepared);
+  await ensureSetMetadata(prepared, { allowAnalysis: false });
+  await cleanupSetlistGeneratedArtifacts(prepared);
+  await markSetUnconfirmed(prepared);
+  await refreshEngineManifestForMixer();
+  return prepared;
+}
+
 async function cacheSongForSetlistSlot(song, slot, options = {}) {
   const slotNumber = positiveNumber(slot?.slot) || 1;
   const tracks = Array.isArray(song.tracks) ? song.tracks : [];
@@ -7188,14 +8334,22 @@ async function cacheSongForSetlistSlot(song, slot, options = {}) {
     throw new Error("No metadata WAV files found for song.");
   }
   const alignment = await readSongAudioAlignment(song.folderPath);
+  const settings = await loadSettings();
+  const sampleRate = positiveNumber(settings.audioEngine?.sampleRate) || 48000;
   const originalKey = canonicalMajorKey(slot.originalKey || song.key || "");
   const selectedKey = canonicalMajorKey(slot.selectedKey || slot.key || song.key || "") || originalKey;
   const transposeCents = effectiveTransposeCents(originalKey, selectedKey, slot.transposeCents);
+  const originalBpm = positiveNumber(slot.originalBpm || song.bpm || slot.bpm);
+  const selectedBpm = positiveNumber(slot.selectedBpm || slot.bpm || song.bpm) || originalBpm;
+  const tempoRatio = originalBpm && selectedBpm ? selectedBpm / originalBpm : 1;
+  const tempoChanged = Math.abs(tempoRatio - 1) >= 0.0005;
+  const ffmpegForTempo = tempoChanged ? await firstExistingFile(FFMPEG_EXE_CANDIDATES) : "";
+  if (tempoChanged && !ffmpegForTempo) throw new Error("FFmpeg with Rubber Band is required for BPM changes.");
   const keyChange = await prepareKeyChangeCacheForSong(song, {
     originalKey,
     selectedKey,
     transposeCents,
-    sampleRate: positiveNumber((await loadSettings()).audioEngine?.sampleRate) || 48000
+    sampleRate
   });
   const cacheFolder = resolve(CACHE_DIR, "current-setlist", `slot-${String(slotNumber).padStart(2, "0")}-${song.id}`);
   assertInsideCache(cacheFolder);
@@ -7224,24 +8378,33 @@ async function cacheSongForSetlistSlot(song, slot, options = {}) {
         sourceSha256: track.sha256,
         keyChanged: Boolean(keyChangedTrack),
         transposeCents,
+        tempoChanged,
+        tempoRatio,
+        originalBpm,
+        selectedBpm,
         audioShiftSeconds: alignment.shiftSeconds
       });
-      let shifted = null;
+      let rendered = null;
       if (!reusable) {
         await replaceCachedFile(sourcePath, targetPath);
-        shifted = await applyWavShiftIfNeeded(targetPath, alignment.shiftSeconds);
+        rendered = await applyWavTempoIfNeeded(targetPath, tempoRatio, sampleRate, ffmpegForTempo);
+        rendered = await applyWavShiftIfNeeded(targetPath, alignment.shiftSeconds) || rendered;
       }
       cachedStems.push({
         ...trackSummary(track),
         transposeCached: Boolean(keyChangedTrack),
         transposeCents,
+        tempoCached: tempoChanged,
+        tempoRatio,
+        originalBpm,
+        selectedBpm,
         audioShiftSeconds: Number(alignment.shiftSeconds || 0),
         cacheRelativePath: track.relativePath,
         cachePath: targetPath,
-        durationMs: shifted ? Math.round(shifted.durationSeconds * 1000) : (priorStem?.durationMs || track.durationMs),
-        sampleRate: shifted?.sampleRate || priorStem?.sampleRate || track.sampleRate,
-        channels: shifted?.channels || priorStem?.channels || track.channels,
-        sha256: shifted ? await fileSha1(targetPath) : (priorStem?.sha256 || track.sha256)
+        durationMs: rendered ? Math.round(rendered.durationSeconds * 1000) : (priorStem?.durationMs || track.durationMs),
+        sampleRate: rendered?.sampleRate || priorStem?.sampleRate || track.sampleRate,
+        channels: rendered?.channels || priorStem?.channels || track.channels,
+        sha256: !reusable ? await fileSha1(targetPath) : (priorStem?.sha256 || track.sha256)
       });
     } catch {
       missingStems.push(track.relativePath);
@@ -7258,6 +8421,9 @@ async function cacheSongForSetlistSlot(song, slot, options = {}) {
     originalKey,
     selectedKey,
     transposeCents,
+    originalBpm,
+    selectedBpm,
+    tempoRatio,
     keyChangeCache: keyChange.summary,
     expectedTrackCount: tracks.length,
     cachedTrackCount,
@@ -7277,7 +8443,8 @@ async function cachedStemCanBeReused(context) {
   }
   if (!sourceStat.isFile() || !targetStat.isFile()) return false;
   const shiftSeconds = Number(context.audioShiftSeconds || 0);
-  if (!context.keyChanged && Math.abs(shiftSeconds) < 0.000001) {
+  const tempoChanged = Boolean(context.tempoChanged);
+  if (!context.keyChanged && !tempoChanged && Math.abs(shiftSeconds) < 0.000001) {
     if (context.priorStem?.sha256 && context.sourceSha256 && context.priorStem.sha256 !== context.sourceSha256) {
       return false;
     }
@@ -7286,6 +8453,10 @@ async function cachedStemCanBeReused(context) {
   if (!context.priorStem) return false;
   return Boolean(context.priorStem.transposeCached) === context.keyChanged
     && Math.abs(Number(context.priorStem.transposeCents || 0) - Number(context.transposeCents || 0)) < 0.01
+    && Boolean(context.priorStem.tempoCached) === tempoChanged
+    && Math.abs(Number(context.priorStem.tempoRatio || 1) - Number(context.tempoRatio || 1)) < 0.000001
+    && Math.abs(Number(context.priorStem.originalBpm || 0) - Number(context.originalBpm || 0)) < 0.001
+    && Math.abs(Number(context.priorStem.selectedBpm || 0) - Number(context.selectedBpm || 0)) < 0.001
     && Math.abs(Number(context.priorStem.audioShiftSeconds || 0) - shiftSeconds) < 0.000001;
 }
 
@@ -8008,52 +9179,14 @@ async function parseSongMetadata(songFolder, parsed, metadataDir) {
     padKey,
     bpm,
     timeSignature,
-    dynamicClick: normalizeSongDynamicClick(parsed.dynamicClick),
+    dynamicClick: null,
     tempoMap: analyzerTempoMap({ key, bpm, timeSignature, parsed, gridAnalysis }),
     tracks
   };
 }
 
-function normalizeSongDynamicClick(value) {
-  const source = value && typeof value === "object" ? value : {};
-  const pattern = (Array.isArray(source.pattern) ? source.pattern : [])
-    .map((entry) => stringValue(entry).toLowerCase())
-    .filter((entry) => entry === "accent" || entry === "normal");
-  const countPattern = (Array.isArray(source.countPattern) ? source.countPattern : [])
-    .map((entry) => stringValue(entry).trim())
-    .filter((entry) => /^[1-9]\d*$/.test(entry));
-  const clickEvents = (Array.isArray(source.clickEvents) ? source.clickEvents : [])
-    .map((entry, index) => {
-      const timeSeconds = nonNegativeNumber(entry?.timeSeconds);
-      if (timeSeconds === null) return null;
-      const type = stringValue(entry?.type || entry?.clickType).toLowerCase() === "accent" ? "accent" : "normal";
-      return {
-        index: Number.isInteger(entry?.index) ? entry.index : index,
-        timeSeconds,
-        type,
-        sourceTransientIndex: Number.isInteger(entry?.sourceTransientIndex) ? entry.sourceTransientIndex : null
-      };
-    })
-    .filter(Boolean)
-    .sort((left, right) => left.timeSeconds - right.timeSeconds);
-  const status = ["ready", "review", "missing-click-stem"].includes(source.status)
-    ? source.status
-    : pattern.length ? "review" : "missing-click-stem";
-  return {
-    source: stringValue(source.source || "click-stem-first-16-pattern"),
-    clickStemPath: source.clickStemPath === null ? null : stringValue(source.clickStemPath),
-    status,
-    patternLength: pattern.length,
-    pattern,
-    countPatternLength: countPattern.length,
-    countPattern,
-    countPatternSource: countPattern.length ? stringValue(source.countPatternSource || "accent-cadence-repeat") : null,
-    clickEventCount: clickEvents.length,
-    clickEventsSource: clickEvents.length ? stringValue(source.clickEventsSource || "click-stem-transients") : null,
-    clickEvents,
-    confidence: positiveNumber(source.confidence),
-    warnings: Array.isArray(source.warnings) ? source.warnings : []
-  };
+function normalizeSongDynamicClick() {
+  return null;
 }
 
 function displayTimeSignature(value) {
@@ -8158,6 +9291,11 @@ function analyzerTempoMap({ key, bpm, timeSignature, parsed, gridAnalysis }) {
     gridStatus: stringValue(grid.status || parsed.gridStatus || parsed.gridAnalysis?.status),
     source: stringValue(grid.authoritySource || grid.sourceProvider || "analyzer"),
     confidence: positiveNumber(grid.confidence),
+    bpmInterpretation: stringValue(grid.gridTiming?.bpmInterpretation),
+    gridBeatSeconds: positiveNumber(grid.gridTiming?.gridBeatSeconds),
+    measureSeconds: positiveNumber(grid.gridTiming?.measureSeconds),
+    clickBeats: Array.isArray(grid.gridTiming?.clickBeats) ? grid.gridTiming.clickBeats : [],
+    clickProfile: grid.gridTiming?.clickProfile || null,
     measureOne: grid.measureOne || (grid.measureOneBeatOneSeconds ? {
       timeSeconds: grid.measureOneBeatOneSeconds,
       globalBeat: 0,
@@ -8436,6 +9574,10 @@ function clampNumber(value, min, max, fallback) {
   return Math.max(min, Math.min(max, number));
 }
 
+function clampInteger(value, min, max, fallback) {
+  return Math.round(clampNumber(value, min, max, fallback));
+}
+
 function sameText(left, right) {
   return stringValue(left).toLowerCase() === stringValue(right).toLowerCase();
 }
@@ -8545,7 +9687,13 @@ function assertInsideArrangementCache(filePath) {
 }
 
 async function serveStatic(pathname, res) {
-  const requested = pathname === "/" ? "/index.html" : pathname === "/remote" ? "/remote.html" : pathname;
+  const requested = pathname === "/"
+    ? "/index.html"
+    : pathname === "/remote"
+      ? "/remote.html"
+      : pathname === "/rehearsal"
+        ? "/rehearsal.html"
+        : pathname;
   const filePath = resolve(PUBLIC_DIR, `.${decodeURIComponent(requested)}`);
   if (!filePath.toLowerCase().startsWith(PUBLIC_DIR.toLowerCase())) {
     return json(res, { error: "Forbidden." }, 403);
