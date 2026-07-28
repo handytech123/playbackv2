@@ -24,6 +24,7 @@
       "server.js",
       "package.json",
       "click-patterns/**/*",
+      "cues/**/*",
       "public/**/*",
       "docs/**/*",
       "pads/**/*",

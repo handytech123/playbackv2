@@ -29,6 +29,7 @@ const SONG_METADATA_DIR = join(DATA_DIR, "song-metadata");
 const SONG_OVERRIDES_DIR = join(DATA_DIR, "song-overrides");
 const KEY_CACHE_DIR = join(DATA_DIR, "key-cache");
 const APP_PADS_DIR = join(__dirname, "pads");
+const APP_CUES_DIR = join(__dirname, "cues");
 const CLICK_PATTERN_DIR = join(__dirname, "click-patterns");
 const CLICK_PATTERN_FILES = {
   "2/4": "2-4.wav",
@@ -618,7 +619,7 @@ function normalizeSettings(value = {}) {
       presets: normalizeRoutingPresets(value.routing?.presets)
     },
     dynamicCue: {
-      folderPath: stringValue(value.dynamicCue?.folderPath),
+      folderPath: stringValue(value.dynamicCue?.folderPath || APP_CUES_DIR),
       outputBus: "dynamic-cue"
     },
     pads: {
@@ -2204,11 +2205,47 @@ async function ensureTransitionPreload(state, setlist) {
   }
 }
 
-async function promotePreloadedPlayback(slot) {
+async function ensureSelectedSlotPreload(state, setlist, slotNumber) {
+  if (preloadTransitionInFlight) return;
+  const slot = positiveNumber(slotNumber);
+  if (!slot || state.transport === "playing" || activePlaybackProcess) return;
+  if (preloadedPlaybackProcess?.slot === slot && !preloadedPlaybackProcess.child?.killed) return;
+  preloadTransitionInFlight = true;
+  try {
+    await stopPreloadedPlayback();
+    const prepared = state.mode === "edit" && !(await engineManifestHasPlayableSlot(slot))
+      ? await ensureEditPlaybackManifest(slot)
+      : { ok: true };
+    if (!prepared.ok) return;
+    const preload = await startNativeSlotPlayback(slot, {
+      startSeconds: nonNegativeNumber(state.currentTimeSeconds) ?? 0,
+      startPaused: true,
+      keepCurrentActive: true,
+      silentStart: true,
+      preload: true
+    });
+    if (preload.ok && preload.process) {
+      preloadedPlaybackProcess = preload.process;
+    }
+  } finally {
+    preloadTransitionInFlight = false;
+  }
+}
+
+async function promotePreloadedPlayback(slot, options = {}) {
   if (!preloadedPlaybackProcess || preloadedPlaybackProcess.slot !== slot) {
     return { ok: false, error: "No preloaded Engine B is ready." };
   }
   const preload = preloadedPlaybackProcess;
+  const startSeconds = nonNegativeNumber(options.startSeconds) ?? 0;
+  if (startSeconds > 0) {
+    const seek = await requestNativePlaybackCommandForProcess(preload, "seek", { seconds: startSeconds }, { timeoutMs: 1500, resetOnTimeout: true });
+    if (!seek.ok) {
+      if (preloadedPlaybackProcess === preload) preloadedPlaybackProcess = null;
+      await stopNativePlaybackProcess(preload, { preserveMeters: true });
+      return { ok: false, error: seek.error || "Preloaded Engine B could not seek." };
+    }
+  }
   const resume = await requestNativePlaybackCommandForProcess(preload, "resume", {}, { timeoutMs: 5000, resetOnTimeout: true });
   if (!resume.ok) {
     if (preloadedPlaybackProcess === preload) preloadedPlaybackProcess = null;
@@ -2221,7 +2258,7 @@ async function promotePreloadedPlayback(slot) {
     active: true,
     slot,
     title: stringValue(resume.response?.title),
-    currentTimeSeconds: nonNegativeNumber(resume.response?.currentPositionSeconds) ?? 0,
+    currentTimeSeconds: nonNegativeNumber(resume.response?.currentPositionSeconds) ?? startSeconds,
     stems: [],
     updatedAt: new Date().toISOString()
   };
@@ -2236,7 +2273,7 @@ async function promotePreloadedPlayback(slot) {
     lastHeartbeatAt: new Date().toISOString(),
     updatedAt: new Date().toISOString()
   }));
-  return { ok: true, response: { type: "playbackStarted", slot, title: latestPlaybackMeters.title, currentPositionSeconds: 0 }, process: preload, preloaded: true };
+  return { ok: true, response: { type: "playbackStarted", slot, title: latestPlaybackMeters.title, currentPositionSeconds: startSeconds }, process: preload, preloaded: true };
 }
 
 async function resolveEngineDevice(selectedDeviceName) {
@@ -4735,6 +4772,7 @@ async function handlePlaybackCommandLocked(command, payload = {}) {
       updatedAt: new Date().toISOString()
     });
     await savePlaybackState(nextState);
+    await ensureSelectedSlotPreload(nextState, setlist, targetSlotNumber);
     return {
       state: await playbackStateSnapshot(),
       command: action,
@@ -4838,6 +4876,8 @@ async function handlePlaybackCommandLocked(command, payload = {}) {
     if (resumesPausedPlay) {
       nativePlayback = await sendNativePlaybackCommand("resume");
       nativePlayback.response = { type: "playbackResumed", stemCount: null };
+    } else if (action === "play" && preloadedPlaybackProcess?.slot === currentSlot && !preloadedPlaybackProcess.child?.killed) {
+      nativePlayback = await promotePreloadedPlayback(currentSlot, { startSeconds: playStartSeconds ?? 0 });
     } else {
       nativePlayback = await startNativeSlotPlayback(currentSlot, {
         startSeconds: playStartSeconds ?? 0,
