@@ -1561,12 +1561,38 @@ function buildDefaultRegionsFromReport(report) {
     };
   }
 
+  const timing = cueTimingContextForReport(report);
+  const candidates = (report.candidates || [])
+    .filter((candidate) => ["trusted", "review", "verified"].includes(stringValue(candidate.status)))
+    .map((candidate, index) => {
+      const cue = cueMarkerFromAnalysisCandidate(candidate, report, index);
+      const start = predictedRegionStartFromCandidate(candidate)
+        || shiftBarBeatByBeats(cue.bar, cue.beat, timing.sectionCueLeadBeats, timing.beatsPerMeasure);
+      return { candidate, cue, start, index };
+    })
+    .filter((entry) => entry.cue.name && entry.start.bar > 0 && entry.start.beat > 0)
+    .sort((a, b) => (a.start.bar - b.start.bar) || (a.start.beat - b.start.beat));
+  const endMeasure = positiveNumber(report.gridReference?.measureCount);
+  const regions = candidates.map((entry, index) => {
+    const next = candidates[index + 1];
+    const candidateId = entry.candidate.id || entry.index + 1;
+    return {
+      id: `region-${candidateId}`,
+      name: entry.cue.name,
+      startBar: entry.start.bar,
+      startBeat: entry.start.beat,
+      endBar: next?.start.bar || endMeasure || entry.start.bar + 1,
+      endBeat: next?.start.beat || 1,
+      sourceCueId: `cue-${candidateId}`,
+      source: predictedRegionStartFromCandidate(entry.candidate) ? "derived-from-analyzer-predicted-region-start" : "derived-from-cue-lead-rule",
+      cueLeadBeats: timing.sectionCueLeadBeats
+    };
+  }).filter((region) => region.endBar > region.startBar || (region.endBar === region.startBar && region.endBeat > region.startBeat));
   return {
-    regions: [],
-    source: "empty-default",
+    regions,
+    source: regions.length ? "derived-from-cue-lead-rule" : "empty-default",
     sourceFingerprint: stringValue(report.sourceFingerprint),
-    updatedAt: new Date().toISOString(),
-    reason: "Analyzer did not provide verified regions. Playback does not infer regions from cue markers."
+    updatedAt: new Date().toISOString()
   };
 }
 
@@ -6212,7 +6238,7 @@ async function saveSlotMixer(slotNumber, value) {
 }
 
 async function buildSetPackage() {
-  let setlist = await loadCurrentSetlist();
+  const setlist = await loadCurrentSetlist();
   const filledSlots = (setlist.slots || []).filter((slot) => slot?.songId);
   const songIds = new Set(filledSlots.map((slot) => slot.songId).filter(Boolean));
   const songFolders = filledSlots.map((slot) => slot.folderPath).filter(Boolean);
