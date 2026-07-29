@@ -7,6 +7,7 @@ import { networkInterfaces } from "node:os";
 import { basename, dirname, extname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import QRCode from "qrcode";
+import { runInternalAnalyzerForLibrary } from "./lib/internal-analyzer.js";
 
 const __dirname = fileURLToPath(new URL(".", import.meta.url));
 const PORT = Number(process.env.PORT || 5312);
@@ -248,6 +249,11 @@ const httpServer = createServer(async (req, res) => {
       return json(res, await cueAnalyzerStatus());
     }
 
+    if (req.method === "POST" && url.pathname === "/api/analyzer/compile-library") {
+      const body = await readJsonBody(req);
+      return json(res, await compileLibraryMetadata(body));
+    }
+
     if (req.method === "POST" && url.pathname === "/api/analyzer/dynamic-cues") {
       const body = await readJsonBody(req);
       return json(res, await analyzeDynamicCuesForSlot(positiveNumber(body.slot)));
@@ -443,6 +449,19 @@ function libraryForClient(library) {
   };
 }
 
+async function compileLibraryMetadata(input = {}) {
+  const settings = await loadSettings();
+  const rootPath = selectedLibraryRoot(settings);
+  const result = await runInternalAnalyzerForLibrary({
+    rootPath,
+    masterWorkbookPath: stringValue(input.masterWorkbookPath || settings.library?.masterWorkbookPath)
+  });
+  return {
+    ...result,
+    rootPath
+  };
+}
+
 async function loadSettings() {
   try {
     return normalizeSettings(await readJsonFile(SETTINGS_FILE, null));
@@ -576,6 +595,7 @@ function mergeSettingsUpdate(current, input = {}) {
   };
 
   merged.library.rootPath = configuredPath(input.library?.rootPath, current.library.rootPath);
+  merged.library.masterWorkbookPath = configuredPath(input.library?.masterWorkbookPath, current.library.masterWorkbookPath);
   merged.audioEngine.selectedDeviceId = configuredPath(input.audioEngine?.selectedDeviceId, current.audioEngine.selectedDeviceId);
   merged.audioEngine.selectedDeviceName = configuredPath(input.audioEngine?.selectedDeviceName, current.audioEngine.selectedDeviceName);
   merged.dynamicCue.folderPath = configuredPath(input.dynamicCue?.folderPath, current.dynamicCue.folderPath);
@@ -608,7 +628,8 @@ function normalizeSettings(value = {}) {
   const activeRoutingPresetId = stringValue(value.routing?.activePresetId || (isDanteDeviceName(selectedDeviceName) ? "dante-32" : "tracks-click-cue"));
   return {
     library: {
-      rootPath: stringValue(value.library?.rootPath || ROOT)
+      rootPath: stringValue(value.library?.rootPath || ROOT),
+      masterWorkbookPath: stringValue(value.library?.masterWorkbookPath || "D:\\church_song_master_updated.xlsx")
     },
     audioEngine: {
       helper: ENGINE_HELPER,

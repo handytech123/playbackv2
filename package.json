@@ -21,6 +21,7 @@
     "asar": false,
     "files": [
       "electron/**/*",
+      "lib/**/*",
       "server.js",
       "package.json",
       "click-patterns/**/*",
@@ -54,6 +55,7 @@
     "electron-builder": "^26.15.3"
   },
   "dependencies": {
-    "qrcode": "^1.5.4"
+    "qrcode": "^1.5.4",
+    "xlsx": "^0.18.5"
   }
 }

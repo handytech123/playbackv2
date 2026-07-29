@@ -594,10 +594,15 @@ async function refreshLibrary() {
 async function syncAnalyzerMetadata() {
   if (!els.syncAnalyzerMetadata) return;
   els.syncAnalyzerMetadata.disabled = true;
-  els.syncAnalyzerMetadata.textContent = "Syncing...";
-  if (els.settingsStatus) els.settingsStatus.textContent = "Syncing analyzer metadata: refresh, rehydrate, check...";
+  els.syncAnalyzerMetadata.textContent = "Compiling...";
+  if (els.settingsStatus) els.settingsStatus.textContent = "Compiling analyzer metadata from trusted song facts...";
   try {
     await flushPendingAppSaves();
+    const compile = await api("/api/analyzer/compile-library", { method: "POST" });
+    els.syncAnalyzerMetadata.textContent = "Syncing...";
+    if (els.settingsStatus) {
+      els.settingsStatus.textContent = `Compiled ${compile.checked || 0} song(s): ${compile.ready || 0} ready, ${compile.review || 0} review, ${compile.partial || 0} partial, ${compile.failed || 0} failed. Refreshing app data...`;
+    }
     const library = await api("/api/library/refresh", { method: "POST" });
     state.library = library;
     renderLibraryStatus();
@@ -619,7 +624,7 @@ async function syncAnalyzerMetadata() {
       setAlert("Analyzer sync found errors. Fix them before Confirm Set.");
     } else {
       const warningText = warnings.length ? ` Warnings: ${warnings.join(" | ")}` : "";
-      if (els.settingsStatus) els.settingsStatus.textContent = `Analyzer metadata synced. Confirm Set is safe.${warningText}`;
+      if (els.settingsStatus) els.settingsStatus.textContent = `Analyzer metadata synced. Compiled ${compile.checked || 0} song(s). Confirm Set is safe.${warningText}`;
       setAlert("Analyzer metadata synced. Confirm Set is ready.");
     }
   } catch (error) {
