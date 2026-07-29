@@ -5477,7 +5477,10 @@ async function rehydrateMetadataCache() {
     await loadSetMetadata();
     renderMetadataAuditReport(result.audit || result);
     if (els.settingsStatus) {
-      els.settingsStatus.textContent = `Rehydrated ${result.slotCount || 0} song(s), cleared ${result.clearedCount || 0} generated file(s).`;
+      const issues = (result.cacheIssues || []).map((issue) => `Slot ${issue.slot}: ${issue.message}`).join(" ");
+      els.settingsStatus.textContent = result.ok === false || result.cacheReady === false
+        ? `Rehydrate blocked. ${issues || "Cache is not ready."}`
+        : `Rehydrated ${result.slotCount || 0} song(s), cleared ${result.clearedCount || 0} generated file(s).`;
     }
     return result;
   } catch (error) {

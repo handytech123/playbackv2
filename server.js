@@ -1566,7 +1566,8 @@ function buildDefaultRegionsFromReport(report) {
     .filter((candidate) => ["trusted", "review", "verified"].includes(stringValue(candidate.status)))
     .map((candidate, index) => {
       const cue = cueMarkerFromAnalysisCandidate(candidate, report, index);
-      const start = shiftBarBeatByBeats(cue.bar, cue.beat, timing.sectionCueLeadBeats, timing.beatsPerMeasure);
+      const start = predictedRegionStartFromCandidate(candidate)
+        || shiftBarBeatByBeats(cue.bar, cue.beat, timing.sectionCueLeadBeats, timing.beatsPerMeasure);
       return { candidate, cue, start, index };
     })
     .filter((entry) => entry.cue.name && entry.start.bar > 0 && entry.start.beat > 0)
@@ -1593,6 +1594,13 @@ function buildDefaultRegionsFromReport(report) {
     sourceFingerprint: stringValue(report.sourceFingerprint),
     updatedAt: new Date().toISOString()
   };
+}
+
+function predictedRegionStartFromCandidate(candidate) {
+  const prediction = candidate?.predictedRegionStart || candidate?.regionPrediction?.predictedRegionStart || candidate?.alignment?.predictedRegionStart || null;
+  const bar = positiveNumber(prediction?.measure || prediction?.bar || prediction?.startMeasure);
+  const beat = positiveNumber(prediction?.beatInMeasure || prediction?.beat || prediction?.startBeat);
+  return bar && beat ? { bar, beat } : null;
 }
 
 function analyzerRegionsFromReport(report) {
@@ -1664,15 +1672,27 @@ async function seedRegionsFromAnalysisIfEmpty(slotDir, report) {
 }
 
 function cueMarkerName(candidate, index) {
-  const label = stringValue(candidate.label);
+  const label = cleanedCueSectionPhrase(candidate.label);
   if (label) return label;
-  const phrase = stringValue(candidate.normalizedPhrase || candidate.rawTranscript);
+  const phrase = cleanedCueSectionPhrase(candidate.normalizedPhrase || candidate.rawTranscript);
   if (!phrase) return `Cue ${index + 1}`;
   return phrase
     .split(/\s+/)
     .filter(Boolean)
     .map((word) => `${word.slice(0, 1).toUpperCase()}${word.slice(1).toLowerCase()}`)
     .join(" ");
+}
+
+function cleanedCueSectionPhrase(value) {
+  const phrase = normalizeCuePhrase(value)
+    .replace(/\bunknown\b/g, " ")
+    .replace(/\bunk\b/g, " ")
+    .replace(/\bto\b.*$/g, " ")
+    .replace(/\b(count|countin|count in|one|two|three|four|five|six|seven|eight)\b.*$/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  const section = phrase.match(/\b(intro|verse|pre chorus|prechorus|chorus|bridge|instrumental|interlude|turn around|turnaround|tag|vamp|outro|ending|end|repeat)\b/);
+  return stringValue(section?.[1] || phrase);
 }
 
 async function availableDynamicCueFiles(folderPath) {
@@ -3574,6 +3594,50 @@ function playbackGridTempoMap(sourceTempoMap = {}, durationSeconds = 0) {
     });
   }
 
+  const sourceGrid = normalizedSourcePlaybackBeatGrid(sourceTempoMap, beatsPerMeasure, duration);
+  if (sourceGrid.length >= 2) {
+    const diagnostics = playbackGridDiagnostics(sourceTempoMap);
+    const gridBeatSeconds = medianBeatSpacingSeconds(sourceGrid) || gridBeatSecondsForPlayback(bpm, beatsPerMeasure, denominator);
+    return {
+      ...sourceTempoMap,
+      key: stringValue(sourceTempoMap.key),
+      bpm,
+      timeSignature,
+      gridStatus: diagnostics.length ? "diagnostic-warning" : "source-grid-normalized",
+      source: "source-beat-grid-normalized-start-zero",
+      bpmInterpretation: stringValue(sourceTempoMap.bpmInterpretation),
+      gridBeatSeconds,
+      measureSeconds: Number((gridBeatSeconds * beatsPerMeasure).toFixed(6)),
+      confidence: positiveNumber(sourceTempoMap.confidence) || 1,
+      measureOne: {
+        ...(sourceTempoMap.measureOne || {}),
+        timeSeconds: 0,
+        globalBeat: 0
+      },
+      countIn: {
+        status: "none",
+        startTimeSeconds: null,
+        endTimeSeconds: null,
+        startGlobalBeat: null,
+        endGlobalBeat: null,
+        measureCount: 0,
+        partialMeasure: false,
+        confidence: 1
+      },
+      tempoChanges: [{
+        segmentIndex: 0,
+        startTimeSeconds: 0,
+        startGlobalBeat: 0,
+        bpm,
+        confidence: 1
+      }],
+      timeSignatureChanges: [],
+      beatGrid: sourceGrid,
+      diagnostics,
+      warnings: diagnostics.map((item) => item.warning)
+    };
+  }
+
   const gridBeatSeconds = positiveNumber(sourceTempoMap.gridBeatSeconds)
     || gridBeatSecondsForPlayback(bpm, beatsPerMeasure, denominator);
   const totalBeats = Math.max(1, Math.ceil(duration / gridBeatSeconds) + beatsPerMeasure);
@@ -3650,11 +3714,72 @@ function playbackGridDiagnostics(sourceTempoMap = {}) {
   return [];
 }
 
+function normalizedSourcePlaybackBeatGrid(sourceTempoMap = {}, beatsPerMeasure = 4, durationSeconds = 0) {
+  const sourceBeats = Array.isArray(sourceTempoMap.beatGrid) ? sourceTempoMap.beatGrid : [];
+  if (sourceBeats.length < 2) return [];
+  const first = sourceBeats.find((beat) => Number(beat.measure) === 1 && Number(beat.beat || beat.beatInMeasure) === 1) || sourceBeats[0];
+  const offset = nonNegativeNumber(first?.timeSeconds) ?? 0;
+  const duration = positiveNumber(durationSeconds) || 0;
+  const scale = compoundGridTimeScale(sourceTempoMap, sourceBeats);
+  return sourceBeats
+    .map((beat, index) => {
+      const time = nonNegativeNumber(beat.timeSeconds);
+      const measure = positiveNumber(beat.measure) || Math.floor(index / beatsPerMeasure) + 1;
+      const beatNumber = positiveNumber(beat.beat || beat.beatInMeasure) || ((index % beatsPerMeasure) + 1);
+      if (time === null) return null;
+      const timeSeconds = Number(Math.max(0, (time - offset) * scale).toFixed(6));
+      if (duration && timeSeconds > duration + 5) return null;
+      return {
+        ...beat,
+        index: index + 1,
+        timeSeconds,
+        measure,
+        beat: beatNumber,
+        beatInMeasure: beatNumber,
+        gridBeatInMeasure: beatNumber,
+        globalBeat: Number.isFinite(Number(beat.globalBeat)) ? Number(beat.globalBeat) : index,
+        isDownbeat: beatNumber === 1,
+        source: "source-beat-grid-normalized-start-zero"
+      };
+    })
+    .filter(Boolean)
+    .sort((left, right) => left.timeSeconds - right.timeSeconds);
+}
+
+function compoundGridTimeScale(sourceTempoMap = {}, sourceBeats = []) {
+  const timeSignature = displayTimeSignature(sourceTempoMap.timeSignature || "4/4");
+  const [numeratorText, denominatorText] = timeSignature.split("/");
+  const numerator = positiveNumber(numeratorText);
+  const denominator = positiveNumber(denominatorText);
+  const bpm = positiveNumber(sourceTempoMap.bpm);
+  if (!bpm || denominator !== 8 || ![6, 9, 12].includes(numerator)) return 1;
+  const median = medianBeatSpacingSeconds(sourceBeats);
+  if (!median) return 1;
+  const expected = gridBeatSecondsForPlayback(bpm, numerator, denominator);
+  if (median > 0 && median < expected * 0.67) {
+    return Number((expected / median).toFixed(6));
+  }
+  return 1;
+}
+
+function medianBeatSpacingSeconds(beatGrid = []) {
+  const spacings = [];
+  for (let index = 1; index < beatGrid.length; index += 1) {
+    const previous = nonNegativeNumber(beatGrid[index - 1]?.timeSeconds);
+    const current = nonNegativeNumber(beatGrid[index]?.timeSeconds);
+    if (previous === null || current === null || current <= previous) continue;
+    spacings.push(Number((current - previous).toFixed(6)));
+  }
+  if (!spacings.length) return null;
+  spacings.sort((left, right) => left - right);
+  return spacings[Math.floor(spacings.length / 2)];
+}
+
 function gridBeatSecondsForPlayback(bpm, numerator, denominator) {
   const quarterSeconds = 60 / bpm;
   const compoundEighthMeter = denominator === 8 && [6, 9, 12].includes(numerator);
-  if (compoundEighthMeter && bpm < 100) {
-    return quarterSeconds / 3;
+  if (compoundEighthMeter) {
+    return quarterSeconds * 1.5;
   }
   return quarterSeconds * (4 / denominator);
 }
@@ -7221,13 +7346,19 @@ async function rehydrateCurrentSetMetadata(options = {}) {
       cleared.push(filePath);
     }
   }
+  setlist = await prepareSetlistCache(setlist);
+  await saveCurrentSetlist(setlist);
   await ensureSetMetadata(setlist, { allowAnalysis: false, includeWaveforms });
+  const readiness = await buildReadiness(setlist, await loadSettings());
+  const blocked = !readiness.cacheReady;
   return {
-    ok: true,
+    ok: !blocked,
     rehydratedAt: new Date().toISOString(),
     slotCount: filledSlots.length,
     clearedCount: cleared.length,
     cleared,
+    cacheReady: readiness.cacheReady,
+    cacheIssues: readiness.cacheIssues || [],
     audit: await auditCurrentSetMetadata()
   };
 }
@@ -7766,14 +7897,19 @@ async function clearAnalyzerDerivedSongDefaults(songFolder) {
   }
 }
 
-async function cleanupGeneratedArtifactsForSong(songIdValue) {
+async function cleanupGeneratedArtifactsForSong(songIdValue, options = {}) {
   if (!songIdValue) return;
+  const deleteStemCache = options.deleteStemCache === true;
   const setlist = await loadCurrentSetlist();
   for (const slot of setlist.slots || []) {
     if (slot?.songId !== songIdValue) continue;
     const slotDir = join(SET_METADATA_DIR, `slot-${String(slot.slot).padStart(2, "0")}`);
     await removeGeneratedPath(slotDir);
     await removeGeneratedPath(arrangementCacheSlotDir(slot.slot));
+  }
+  if (!deleteStemCache) {
+    await removeConfirmedArtifacts();
+    return;
   }
   const currentCacheRoot = join(CACHE_DIR, "current-setlist");
   let entries = [];
@@ -9029,7 +9165,7 @@ async function importSongMetadata(songFolder, options = {}) {
       await clearAnalyzerDerivedSongDefaults(songFolder);
       await rm(appCueRecognitionReportPath(songFolder), { force: true });
       await rm(appDynamicCueMapPath(songFolder), { force: true });
-      await cleanupGeneratedArtifactsForSong(songId(songFolder));
+      await cleanupGeneratedArtifactsForSong(songId(songFolder), { deleteStemCache: false });
     }
     await writeFile(appSongMetadataPath(songFolder), raw, "utf8");
     await writeFile(sourceManifestPath, `${JSON.stringify({
