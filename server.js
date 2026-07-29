@@ -309,6 +309,11 @@ const httpServer = createServer(async (req, res) => {
       return json(res, await auditCurrentSetMetadata());
     }
 
+    const resetSlotFromAnalyzerMatch = url.pathname.match(/^\/api\/set-metadata\/current\/slot\/(\d+)\/reset-from-analyzer$/);
+    if (resetSlotFromAnalyzerMatch && req.method === "POST") {
+      return json(res, await resetSlotMetadataFromAnalyzer(Number(resetSlotFromAnalyzerMatch[1])));
+    }
+
     const metadataSlotMatch = url.pathname.match(/^\/api\/set-metadata\/current\/slot\/(\d+)$/);
     if (metadataSlotMatch && req.method === "PUT") {
       const body = await readJsonBody(req);
@@ -1532,12 +1537,15 @@ function buildDefaultRegionsFromReport(report) {
   }
 
   const regionCandidates = (report.regionCandidates || [])
-    .filter((candidate) => candidate.status === "verified" && candidate.startMeasure && candidate.startBeat)
+    .filter((candidate) => ["verified", "review"].includes(stringValue(candidate.status)) && candidate.startMeasure && candidate.startBeat)
     .sort((a, b) => (a.startMeasure - b.startMeasure) || (a.startBeat - b.startBeat));
   if (regionCandidates.length) {
     const endMeasure = positiveNumber(report.gridReference?.measureCount);
+    const hasOnlyReviewRegions = !regionCandidates.some((candidate) => stringValue(candidate.status) === "verified");
+    const source = hasOnlyReviewRegions ? "analyzer-review-region-suggestions" : "derived-from-analyzer-region-candidates";
     const regions = regionCandidates.map((candidate, index) => {
       const next = regionCandidates[index + 1];
+      const status = stringValue(candidate.status) === "verified" ? "verified" : "review";
       return {
         id: `region-${candidate.sourceCueCandidateId || candidate.id || index + 1}`,
         name: cueMarkerName({
@@ -1547,52 +1555,31 @@ function buildDefaultRegionsFromReport(report) {
         }, index),
         startBar: candidate.startMeasure,
         startBeat: candidate.startBeat,
-        endBar: next?.startMeasure || endMeasure || candidate.startMeasure + 1,
-        endBeat: next?.startBeat || 1,
+        endBar: candidate.endMeasure || next?.startMeasure || endMeasure || candidate.startMeasure + 1,
+        endBeat: candidate.endBeat || next?.startBeat || 1,
         sourceCueId: `cue-${candidate.sourceCueCandidateId || candidate.id || index + 1}`,
-        source: "derived-from-analyzer-region-candidates"
+        source,
+        status,
+        approvalStatus: status,
+        reviewReasons: Array.isArray(candidate.reviewReasons) ? candidate.reviewReasons : [],
+        cueSnap: candidate.cueSnap || null
       };
     }).filter((region) => region.endBar > region.startBar || (region.endBar === region.startBar && region.endBeat > region.startBeat));
     return {
       regions,
-      source: regions.length ? "derived-from-analyzer-region-candidates" : "empty-default",
+      source: regions.length ? source : "empty-default",
       sourceFingerprint: stringValue(report.sourceFingerprint),
+      status: hasOnlyReviewRegions ? "review" : "verified",
       updatedAt: new Date().toISOString()
     };
   }
 
-  const timing = cueTimingContextForReport(report);
-  const candidates = (report.candidates || [])
-    .filter((candidate) => ["trusted", "review", "verified"].includes(stringValue(candidate.status)))
-    .map((candidate, index) => {
-      const cue = cueMarkerFromAnalysisCandidate(candidate, report, index);
-      const start = predictedRegionStartFromCandidate(candidate)
-        || shiftBarBeatByBeats(cue.bar, cue.beat, timing.sectionCueLeadBeats, timing.beatsPerMeasure);
-      return { candidate, cue, start, index };
-    })
-    .filter((entry) => entry.cue.name && entry.start.bar > 0 && entry.start.beat > 0)
-    .sort((a, b) => (a.start.bar - b.start.bar) || (a.start.beat - b.start.beat));
-  const endMeasure = positiveNumber(report.gridReference?.measureCount);
-  const regions = candidates.map((entry, index) => {
-    const next = candidates[index + 1];
-    const candidateId = entry.candidate.id || entry.index + 1;
-    return {
-      id: `region-${candidateId}`,
-      name: entry.cue.name,
-      startBar: entry.start.bar,
-      startBeat: entry.start.beat,
-      endBar: next?.start.bar || endMeasure || entry.start.bar + 1,
-      endBeat: next?.start.beat || 1,
-      sourceCueId: `cue-${candidateId}`,
-      source: predictedRegionStartFromCandidate(entry.candidate) ? "derived-from-analyzer-predicted-region-start" : "derived-from-cue-lead-rule",
-      cueLeadBeats: timing.sectionCueLeadBeats
-    };
-  }).filter((region) => region.endBar > region.startBar || (region.endBar === region.startBar && region.endBeat > region.startBeat));
   return {
-    regions,
-    source: regions.length ? "derived-from-cue-lead-rule" : "empty-default",
+    regions: [],
+    source: "empty-default",
     sourceFingerprint: stringValue(report.sourceFingerprint),
-    updatedAt: new Date().toISOString()
+    updatedAt: new Date().toISOString(),
+    reason: "Analyzer did not provide verified regions. Playback does not infer regions from cue markers."
   };
 }
 
@@ -1604,7 +1591,10 @@ function predictedRegionStartFromCandidate(candidate) {
 }
 
 function analyzerRegionsFromReport(report) {
-  const sourceRegions = Array.isArray(report?.inferredRegions?.regions) ? report.inferredRegions.regions : [];
+  const inferredRegions = report?.inferredRegions && typeof report.inferredRegions === "object" ? report.inferredRegions : null;
+  const inferredRegionsApproved = inferredRegions
+    && (metadataMapIsOperatorApproved(inferredRegions) || stringValue(inferredRegions.status) === "approved");
+  const sourceRegions = inferredRegionsApproved && Array.isArray(inferredRegions.regions) ? inferredRegions.regions : [];
   const regions = sourceRegions.map((region, index) => ({
     id: stringValue(region.id || `region-${region.sourceCueId || index + 1}`),
     name: stringValue(region.name || region.label || `Region ${index + 1}`),
@@ -1620,7 +1610,8 @@ function analyzerRegionsFromReport(report) {
     source: regions.length ? "analyzer-cue-intelligence-inferred-regions" : "empty-default",
     regionSource: regions.length ? "inferred-from-cues" : "",
     sourceFingerprint: stringValue(report?.sourceFingerprint),
-    updatedAt: new Date().toISOString()
+    updatedAt: new Date().toISOString(),
+    reason: regions.length ? "" : "Analyzer inferred regions were not approved for playback."
   };
 }
 
@@ -1634,6 +1625,8 @@ function analyzerDefaultNeedsRefresh(current, sourceFingerprint) {
     "empty-default",
     "dynamic-cue-analysis",
     "derived-from-analyzer-region-candidates",
+    "analyzer-review-region-suggestions",
+    "analyzer-review-cue-suggestion",
     "analyzer-cue-phrase-marker-refresh",
     "analyzer-cue-intelligence",
     "analyzer-cue-intelligence-inferred-regions",
@@ -3596,9 +3589,12 @@ function playbackGridTempoMap(sourceTempoMap = {}, durationSeconds = 0) {
   }
 
   const sourceGrid = normalizedSourcePlaybackBeatGrid(sourceTempoMap, beatsPerMeasure, duration);
-  if (sourceGrid.length >= 2) {
+  const expectedGridBeatSeconds = gridBeatSecondsForPlayback(bpm, beatsPerMeasure, denominator);
+  const sourceGridBeatSeconds = medianBeatSpacingSeconds(sourceGrid);
+  const sourceGridSpacingOk = gridSpacingMatchesExpected(sourceGridBeatSeconds, expectedGridBeatSeconds);
+  if (sourceGrid.length >= 2 && sourceGridSpacingOk) {
     const diagnostics = playbackGridDiagnostics(sourceTempoMap);
-    const gridBeatSeconds = medianBeatSpacingSeconds(sourceGrid) || gridBeatSecondsForPlayback(bpm, beatsPerMeasure, denominator);
+    const gridBeatSeconds = sourceGridBeatSeconds || expectedGridBeatSeconds;
     return {
       ...sourceTempoMap,
       key: stringValue(sourceTempoMap.key),
@@ -3639,8 +3635,9 @@ function playbackGridTempoMap(sourceTempoMap = {}, durationSeconds = 0) {
     };
   }
 
-  const gridBeatSeconds = positiveNumber(sourceTempoMap.gridBeatSeconds)
-    || gridBeatSecondsForPlayback(bpm, beatsPerMeasure, denominator);
+  const metadataGridBeatSeconds = positiveNumber(sourceTempoMap.gridBeatSeconds);
+  const metadataGridBeatSecondsOk = gridSpacingMatchesExpected(metadataGridBeatSeconds, expectedGridBeatSeconds);
+  const gridBeatSeconds = metadataGridBeatSecondsOk ? metadataGridBeatSeconds : expectedGridBeatSeconds;
   const totalBeats = Math.max(1, Math.ceil(duration / gridBeatSeconds) + beatsPerMeasure);
   const beatGrid = [];
   for (let index = 0; index < totalBeats; index += 1) {
@@ -3661,7 +3658,10 @@ function playbackGridTempoMap(sourceTempoMap = {}, durationSeconds = 0) {
     });
   }
 
-  const diagnostics = playbackGridDiagnostics(sourceTempoMap);
+  const diagnostics = [
+    ...playbackGridDiagnostics(sourceTempoMap),
+    ...gridSpacingDiagnostics(sourceGridBeatSeconds || metadataGridBeatSeconds, expectedGridBeatSeconds)
+  ];
   return {
     ...sourceTempoMap,
     key: stringValue(sourceTempoMap.key),
@@ -3776,11 +3776,29 @@ function medianBeatSpacingSeconds(beatGrid = []) {
   return spacings[Math.floor(spacings.length / 2)];
 }
 
+function gridSpacingMatchesExpected(actual, expected, toleranceRatio = 0.02) {
+  const actualSeconds = positiveNumber(actual);
+  const expectedSeconds = positiveNumber(expected);
+  if (!actualSeconds || !expectedSeconds) return false;
+  return Math.abs(actualSeconds - expectedSeconds) / expectedSeconds <= toleranceRatio;
+}
+
+function gridSpacingDiagnostics(actual, expected) {
+  const actualSeconds = positiveNumber(actual);
+  const expectedSeconds = positiveNumber(expected);
+  if (!actualSeconds || !expectedSeconds || gridSpacingMatchesExpected(actualSeconds, expectedSeconds)) return [];
+  return [{
+    warning: "source-grid-spacing-mismatch-rebuilt-from-bpm-time-signature",
+    sourceGridBeatSeconds: Number(actualSeconds.toFixed(6)),
+    expectedGridBeatSeconds: Number(expectedSeconds.toFixed(6))
+  }];
+}
+
 function gridBeatSecondsForPlayback(bpm, numerator, denominator) {
   const quarterSeconds = 60 / bpm;
   const compoundEighthMeter = denominator === 8 && [6, 9, 12].includes(numerator);
   if (compoundEighthMeter) {
-    return quarterSeconds * 1.5;
+    return bpm < 100 ? quarterSeconds / 3 : quarterSeconds * (4 / denominator);
   }
   return quarterSeconds * (4 / denominator);
 }
@@ -7285,20 +7303,54 @@ async function cueReportFromSourceCueIntelligence(folderPath, slot) {
       rejectionReasons: Array.isArray(marker.phraseRecognition?.rejectionReasons) ? marker.phraseRecognition.rejectionReasons.map(stringValue).filter(Boolean) : [],
       words: []
     }));
-  const regions = source.inferredRegions && Array.isArray(source.inferredRegions.regions) ? source.inferredRegions.regions : [];
-  const regionCandidates = regions.map((region, index) => ({
+  const inferredRegions = source.inferredRegions && typeof source.inferredRegions === "object" ? source.inferredRegions : null;
+  const inferredRegionsApproved = inferredRegions
+    && (metadataMapIsOperatorApproved(inferredRegions) || stringValue(inferredRegions.status) === "approved");
+  const regions = inferredRegionsApproved && Array.isArray(inferredRegions.regions) ? inferredRegions.regions : [];
+  const approvedRegionCandidates = regions.map((region, index) => ({
     id: stringValue(region.id || `region_${index + 1}`),
     sourceCueCandidateId: stringValue(region.sourceCueCandidateId || candidates[index]?.id || `cue_${index + 1}`),
     sourceCueText: stringValue(region.name || candidates[index]?.label),
-    status: ["trusted", "verified", "draft"].includes(stringValue(region.status)) ? "verified" : stringValue(region.status || "review"),
+    status: ["trusted", "verified", "approved"].includes(stringValue(region.status)) ? "verified" : stringValue(region.status || "review"),
     cueMeasure: positiveNumber(candidates[index]?.targetMeasure),
     cueBeat: positiveNumber(candidates[index]?.targetBeat),
     startMeasure: positiveNumber(region.startMeasure || region.startBar),
     startBeat: positiveNumber(region.startBeat),
+    endMeasure: positiveNumber(region.endMeasure || region.endBar),
+    endBeat: positiveNumber(region.endBeat),
     leadInMeasures: 0,
     gridBeats: positiveNumber(source.gridReference?.timeSignature?.gridBeatsPerMeasure),
     reason: stringValue(region.source || "cue-intelligence")
   })).filter((candidate) => candidate.id && candidate.startMeasure && candidate.startBeat);
+  const cueCandidateById = new Map(candidates.map((candidate) => [candidate.id, candidate]));
+  const reviewRegionCandidates = Array.isArray(source.cueToRegionCandidates)
+    ? source.cueToRegionCandidates.map((candidate, index) => {
+      const cueId = stringValue(candidate.cueId || candidate.cueMarkerId || `cue_${index + 1}`);
+      const cue = cueCandidateById.get(cueId) || candidates[index] || null;
+      const predicted = candidate.predictedRegion && typeof candidate.predictedRegion === "object" ? candidate.predictedRegion : {};
+      const marker = candidate.cueMarker && typeof candidate.cueMarker === "object" ? candidate.cueMarker : {};
+      const status = ["trusted", "verified", "approved"].includes(stringValue(candidate.status)) ? "verified" : stringValue(candidate.status || "review");
+      return {
+        id: stringValue(candidate.id || `region_candidate_${index + 1}`),
+        sourceCueCandidateId: cueId,
+        sourceCueText: stringValue(candidate.cueName || cue?.label || cue?.normalizedPhrase),
+        status,
+        cueMeasure: positiveNumber(marker.measure || cue?.targetMeasure),
+        cueBeat: positiveNumber(marker.beat || cue?.targetBeat),
+        startMeasure: positiveNumber(predicted.startMeasure || candidate.startMeasure),
+        startBeat: positiveNumber(predicted.startBeat || candidate.startBeat),
+        endMeasure: positiveNumber(predicted.endMeasure || candidate.endMeasure),
+        endBeat: positiveNumber(predicted.endBeat || candidate.endBeat),
+        confidence: positiveNumber(candidate.confidence),
+        cueSnap: candidate.cueSnap || null,
+        reviewReasons: Array.isArray(candidate.reviewReasons) ? candidate.reviewReasons.map(stringValue).filter(Boolean) : [],
+        leadInMeasures: 0,
+        gridBeats: positiveNumber(source.gridReference?.timeSignature?.gridBeatsPerMeasure),
+        reason: stringValue(candidate.reason || candidate.status || "cue-to-region")
+      };
+    }).filter((candidate) => candidate.id && candidate.startMeasure && candidate.startBeat)
+    : [];
+  const regionCandidates = approvedRegionCandidates.length ? approvedRegionCandidates : reviewRegionCandidates;
   return {
     generatedAt: new Date().toISOString(),
     slot: slot.slot,
@@ -7314,6 +7366,7 @@ async function cueReportFromSourceCueIntelligence(folderPath, slot) {
     summary: source.summary || {},
     gridReference: source.gridReference || null,
     source: source.source || null,
+    inferredRegions: inferredRegionsApproved ? inferredRegions : null,
     candidates,
     regionCandidates
   };
@@ -7321,9 +7374,12 @@ async function cueReportFromSourceCueIntelligence(folderPath, slot) {
 
 async function rehydrateCurrentSetMetadata(options = {}) {
   const includeWaveforms = options.includeWaveforms === true;
+  const force = options.force === true;
+  const slotFilter = new Set((Array.isArray(options.slots) ? options.slots : []).map((slot) => Number(slot)).filter((slot) => Number.isInteger(slot) && slot > 0));
   let setlist = await loadCurrentSetlist();
-  const filledSlots = (setlist.slots || []).filter((slot) => slot.songId);
+  const filledSlots = (setlist.slots || []).filter((slot) => slot.songId && (!slotFilter.size || slotFilter.has(Number(slot.slot))));
   const cleared = [];
+  const preserved = [];
   for (const slot of filledSlots) {
     const slotDir = join(SET_METADATA_DIR, `slot-${String(slot.slot).padStart(2, "0")}`);
     const songDir = appSongMetadataDir(slot.folderPath);
@@ -7342,7 +7398,10 @@ async function rehydrateCurrentSetMetadata(options = {}) {
     if (includeWaveforms) paths.push(join(slotDir, "waveform-summary.json"));
     for (const filePath of paths) {
       const current = await readJsonFile(filePath, null);
-      if (metadataMapIsOperatorApproved(current)) continue;
+      if (!force && (metadataMapIsOperatorApproved(current) || metadataMapIsOperatorWorkingDraft(current))) {
+        preserved.push(filePath);
+        continue;
+      }
       await rm(filePath, { force: true });
       cleared.push(filePath);
     }
@@ -7358,10 +7417,27 @@ async function rehydrateCurrentSetMetadata(options = {}) {
     slotCount: filledSlots.length,
     clearedCount: cleared.length,
     cleared,
+    preservedCount: preserved.length,
+    preserved,
     cacheReady: readiness.cacheReady,
     cacheIssues: readiness.cacheIssues || [],
     audit: await auditCurrentSetMetadata()
   };
+}
+
+async function resetSlotMetadataFromAnalyzer(slotNumber) {
+  const state = await playbackStateSnapshot();
+  if (state.mode === "performance") {
+    throw new Error("Reset from analyzer is locked in Performance mode.");
+  }
+  const setlist = await loadCurrentSetlist();
+  const slot = (setlist.slots || []).find((item) => Number(item.slot) === Number(slotNumber) && item.songId);
+  if (!slot) throw new Error(`Setlist slot ${slotNumber} is empty.`);
+  return rehydrateCurrentSetMetadata({
+    includeWaveforms: true,
+    force: true,
+    slots: [Number(slotNumber)]
+  });
 }
 
 async function auditCurrentSetMetadata() {
@@ -7376,6 +7452,11 @@ async function auditCurrentSetMetadata() {
     const appCues = appCueMap.cueMarkers || [];
     const appRegions = appRegionMap.regions || [];
     const approvedOverride = metadataMapIsOperatorApproved(appCueMap) || metadataMapIsOperatorApproved(appRegionMap);
+    const workingDraft = metadataMapIsOperatorWorkingDraft(appCueMap) || metadataMapIsOperatorWorkingDraft(appRegionMap);
+    const reviewSuggestions = stringValue(appRegionMap.source) === "analyzer-review-region-suggestions"
+      || stringValue(appCueMap.source) === "analyzer-review-cue-suggestion"
+      || appRegions.some((region) => stringValue(region.status) === "review" || stringValue(region.source).includes("analyzer-review"))
+      || appCues.some((cue) => stringValue(cue.status) === "review" || stringValue(cue.source).includes("analyzer-review"));
     const sourceCues = (source?.candidates || [])
       .filter((candidate) => ["trusted", "review", "verified"].includes(stringValue(candidate.status)))
       .map((candidate, index) => cueMarkerFromAnalysisCandidate(candidate, source, index));
@@ -7393,13 +7474,24 @@ async function auditCurrentSetMetadata() {
     const cuePositionOk = appCuePosition === sourceCuePosition;
     const regionPositionOk = appRegionPosition === sourceRegionPosition;
     const ok = Boolean(source && cueCountOk && regionCountOk && cuePositionOk && regionPositionOk);
+    const status = ok
+      ? (reviewSuggestions ? "review-suggestions" : "ok")
+      : approvedOverride
+        ? "approved-override"
+        : workingDraft
+          ? "working-draft"
+          : reviewSuggestions
+            ? "review-suggestions"
+            : "mismatch";
     rows.push({
       slot: slot.slot,
       songId: slot.songId,
       title: slot.title,
-      status: ok ? "ok" : approvedOverride ? "approved-override" : "mismatch",
+      status,
       sourceExists: Boolean(source),
       approvedOverride,
+      workingDraft,
+      reviewSuggestions,
       cueCountOk,
       regionCountOk,
       cuePositionOk,
@@ -7416,15 +7508,21 @@ async function auditCurrentSetMetadata() {
   }
   const mismatches = rows.filter((row) => row.status === "mismatch");
   const approvedOverrides = rows.filter((row) => row.status === "approved-override");
+  const reviewSuggestions = rows.filter((row) => row.status === "review-suggestions");
+  const workingDrafts = rows.filter((row) => row.status === "working-draft");
   return {
     ok: mismatches.length === 0,
     checkedAt: new Date().toISOString(),
     checked: rows.length,
     mismatchCount: mismatches.length,
     approvedOverrideCount: approvedOverrides.length,
+    reviewSuggestionCount: reviewSuggestions.length,
+    workingDraftCount: workingDrafts.length,
     rows,
     mismatches,
-    approvedOverrides
+    approvedOverrides,
+    reviewSuggestions,
+    workingDrafts
   };
 }
 
@@ -7593,11 +7691,15 @@ async function cueReportWithSongTiming(report, folderPath, slot = {}) {
 function cueMarkerFromAnalysisCandidate(candidate, report, index) {
   const timing = cueTimingContextForReport(report);
   const position = sectionCuePositionFromReport(candidate, report, timing);
+  const status = ["trusted", "verified"].includes(stringValue(candidate.status)) ? "verified" : "review";
   return {
     id: `cue-${candidate.id || index + 1}`,
     name: cueMarkerName(candidate, index),
     bar: position.bar,
-    beat: position.beat
+    beat: position.beat,
+    status,
+    approvalStatus: status,
+    source: status === "review" ? "analyzer-review-cue-suggestion" : "analyzer-cue-intelligence"
   };
 }
 
@@ -7888,7 +7990,13 @@ async function clearAnalyzerDerivedSongDefaults(songFolder) {
     "empty-default",
     "dynamic-cue-analysis",
     "derived-from-analyzer-region-candidates",
-    "analyzer-cue-phrase-marker-refresh"
+    "analyzer-review-region-suggestions",
+    "analyzer-review-cue-suggestion",
+    "analyzer-cue-phrase-marker-refresh",
+    "analyzer-cue-intelligence",
+    "analyzer-cue-intelligence-inferred-regions",
+    "derived-from-cue-lead-rule",
+    "editor-autosave"
   ]);
   for (const filePath of [appDefaultRegionsPath(songFolder), appDefaultCueMarkersPath(songFolder)]) {
     const current = await readJsonFile(filePath, null);

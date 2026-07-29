@@ -170,6 +170,7 @@ const els = {
   audioAlignmentStatus: document.querySelector("#audioAlignmentStatus"),
   saveMetadata: document.querySelector("#saveMetadataButton"),
   approveMetadata: document.querySelector("#approveMetadataButton"),
+  resetFromAnalyzer: document.querySelector("#resetFromAnalyzerButton"),
   addRegion: document.querySelector("#addRegionButton"),
   removeRegion: document.querySelector("#removeRegionButton"),
   reorderRegions: document.querySelector("#reorderRegionsButton"),
@@ -447,6 +448,7 @@ function wireEvents() {
   els.regionDelete.addEventListener("click", deleteSelectedRegion);
   els.saveMetadata.addEventListener("click", saveSelectedMetadata);
   els.approveMetadata?.addEventListener("click", approveSelectedMetadata);
+  els.resetFromAnalyzer?.addEventListener("click", resetSelectedMetadataFromAnalyzer);
   els.setAudioAlignSource?.addEventListener("click", setAudioAlignmentSourceMarker);
   els.setAudioAlignTarget?.addEventListener("click", setAudioAlignmentTargetMarker);
   els.alignAudioStart?.addEventListener("click", alignAudioStartToPlayhead);
@@ -1985,6 +1987,7 @@ function setPlanningLocked(locked) {
   els.setlistSlots.classList.toggle("locked", locked);
   els.saveMetadata.disabled = locked || !selectedMetadata();
   if (els.approveMetadata) els.approveMetadata.disabled = locked || !selectedMetadata();
+  if (els.resetFromAnalyzer) els.resetFromAnalyzer.disabled = locked || !selectedMetadata();
   els.addRegion.disabled = locked || !selectedMetadata();
   els.addCue.disabled = locked || !selectedMetadata();
   updateCueUndoControl();
@@ -2185,6 +2188,7 @@ function renderSelectedMetadata() {
   }
   els.metadataSlot.disabled = !state.setMetadata?.slots?.length;
   els.saveMetadata.disabled = locked || !selected;
+  if (els.resetFromAnalyzer) els.resetFromAnalyzer.disabled = locked || !selected;
   if (els.setAudioAlignSource) els.setAudioAlignSource.disabled = locked || !selected;
   if (els.setAudioAlignTarget) els.setAudioAlignTarget.disabled = locked || !selected;
   if (els.alignAudioStart) els.alignAudioStart.disabled = locked || !selected;
@@ -2341,6 +2345,7 @@ function renderTimeline(slot) {
     item.classList.toggle("performance-action-region", showPerformanceActions);
     item.classList.toggle("repeat-queued", isQueuedRepeat);
     item.classList.toggle("selected-region", selectedArrangedEntryMatches(index, entry.blockId));
+    item.classList.toggle("analyzer-review-region", isAnalyzerReviewItem(region));
     item.dataset.regionIndex = String(index);
     const start = Number(region.startBar || 1);
     const end = Math.max(start + 0.25, Number(region.endBar || start + 1));
@@ -2422,6 +2427,7 @@ function renderTimeline(slot) {
     const item = document.createElement("div");
     item.className = "timeline-cue";
     item.classList.toggle("selected-cue", state.selectedCueIndex === index);
+    item.classList.toggle("analyzer-review-cue", isAnalyzerReviewItem(cue));
     item.dataset.cueIndex = String(index);
     item.style.left = `${percentForTime(timeForBarBeat(slot, Number(cue.bar || 1), Number(cue.beat || 1)), duration)}%`;
     item.innerHTML = `<span>${escapeHtml(cue.name)}</span>`;
@@ -2447,6 +2453,20 @@ function selectedArrangedEntryMatches(index, blockId = "") {
   if (state.selectedRegionIndex !== index) return false;
   const selectedBlockId = state.selectedArrangedRegionRange?.blockId || "";
   return !selectedBlockId || !blockId || selectedBlockId === blockId;
+}
+
+function isAnalyzerReviewItem(item) {
+  return ["review", "needs-review"].includes(String(item?.status || item?.approvalStatus || "").toLowerCase())
+    || String(item?.source || "").includes("analyzer-review");
+}
+
+function markItemOperatorEdited(item) {
+  if (!item || typeof item !== "object") return;
+  delete item.cueSnap;
+  delete item.reviewReasons;
+  item.status = "edited";
+  item.approvalStatus = "operator-working-draft";
+  item.source = "operator-working-draft";
 }
 
 function regionLiveActions(region, liveRepeat, panicActive = false) {
@@ -3784,6 +3804,7 @@ function beginCuePointerEdit(event, index, slot) {
     if (!point) return;
     if (!moved) pushEditorUndo("Move cue");
     moved = true;
+    markItemOperatorEdited(cue);
     cue.bar = Number(point.measure || 1);
     cue.beat = Number(point.beat || 1);
     setTimelineTransportPoint(slot, point);
@@ -4116,6 +4137,7 @@ function beginRegionPointerEdit(event, index, maxBar, selected, arrangedRange = 
     if (!didDrag && Math.abs(moveEvent.clientX - startX) <= 4) return;
     if (!didDrag) pushEditorUndo(action === "move" ? "Move region" : "Resize region");
     didDrag = true;
+    markItemOperatorEdited(region);
     if (action === "move") {
       reorderArrangementBlockByPointer(moveEvent, selected, arrangedRange);
       return;
@@ -4380,6 +4402,7 @@ function cueRow(cue, index, locked, key = editorRowKey("cue", cue, index)) {
 
 function syncRegionRow(row, region, index, locked, active = null) {
   row.classList.toggle("selected-editor-row", state.selectedRegionIndex === index);
+  row.classList.toggle("analyzer-review-row", isAnalyzerReviewItem(region));
   row.dataset.regionIndex = String(index);
   const fields = row.querySelectorAll("[data-region-field]");
   fields.forEach((input) => {
@@ -4401,6 +4424,7 @@ function syncRegionRow(row, region, index, locked, active = null) {
 
 function syncCueRow(row, cue, index, locked, active = null) {
   row.classList.toggle("selected-editor-row", state.selectedCueIndex === index);
+  row.classList.toggle("analyzer-review-row", isAnalyzerReviewItem(cue));
   row.dataset.cueIndex = String(index);
   const fields = row.querySelectorAll("[data-cue-field]");
   fields.forEach((input) => {
@@ -5315,6 +5339,7 @@ function updateSelectedRegionNameFromEditor(event) {
   const selected = selectedMetadata();
   const region = selected?.regions?.regions?.[state.selectedRegionIndex];
   if (!region) return;
+  markItemOperatorEdited(region);
   region.name = event.target.value;
   updateSelectedRegionNameDisplays(region.name);
   scheduleMetadataAutosave();
@@ -5324,6 +5349,7 @@ function updateSelectedCueNameFromEditor(event) {
   const selected = selectedMetadata();
   const cue = selected?.cues?.cueMarkers?.[state.selectedCueIndex];
   if (!cue) return;
+  markItemOperatorEdited(cue);
   cue.name = event.target.value;
   updateSelectedCueNameDisplays(cue.name);
   scheduleMetadataAutosave();
@@ -5356,6 +5382,7 @@ function updateRegionDraftFromInput(event) {
   const index = Number(event.target.dataset.index);
   const region = selected?.regions?.regions?.[index];
   if (!region) return;
+  markItemOperatorEdited(region);
   state.selectedRegionIndex = index;
   state.selectedCueIndex = null;
   const value = event.target.value;
@@ -5390,6 +5417,7 @@ function updateCueDraftFromInput(event) {
   const selected = selectedMetadata();
   const cue = selected?.cues?.cueMarkers?.[Number(event.target.dataset.index)];
   if (!cue) return;
+  markItemOperatorEdited(cue);
   if (field === "name") {
     cue.name = event.target.value;
     if (els.selectedCueName && document.activeElement !== els.selectedCueName) {
@@ -5490,15 +5518,31 @@ async function approveSelectedMetadata() {
   }
 }
 
+async function resetSelectedMetadataFromAnalyzer() {
+  const selected = selectedMetadata();
+  if (!selected || state.playbackState?.mode === "performance") return;
+  const title = selected.title || `slot ${selected.slot}`;
+  if (!window.confirm(`Reset ${title} from analyzer suggestions? This discards the current cue/region draft for this song.`)) return;
+  clearTimeout(state.metadataSaveTimer);
+  try {
+    const result = await api(`/api/set-metadata/current/slot/${selected.slot}/reset-from-analyzer`, { method: "POST" });
+    state.setMetadata = null;
+    state.waveformLoadInFlight.clear();
+    await loadSetMetadata();
+    renderMetadataAuditReport(result.audit || result);
+    setAlert(`Reset ${title} from analyzer.`);
+  } catch (error) {
+    setAlert(`Reset failed: ${error.message}`);
+  }
+}
+
 async function auditMetadataCache() {
   if (els.settingsStatus) els.settingsStatus.textContent = "Auditing cue/region cache...";
   try {
     const result = await api("/api/set-metadata/current/audit");
     renderMetadataAuditReport(result);
     if (els.settingsStatus) {
-      els.settingsStatus.textContent = result.mismatchCount
-        ? `Cue/region audit found ${result.mismatchCount} mismatch(es).`
-        : `Cue/region audit clean: ${result.checked} song(s).`;
+      els.settingsStatus.textContent = metadataAuditStatusText(result);
     }
     return result;
   } catch (error) {
@@ -5525,7 +5569,7 @@ async function rehydrateMetadataCache(options = {}) {
       const issues = (result.cacheIssues || []).map((issue) => `Slot ${issue.slot}: ${issue.message}`).join(" ");
       els.settingsStatus.textContent = result.ok === false || result.cacheReady === false
         ? `Rehydrate blocked. ${issues || "Cache is not ready."}`
-        : `Rehydrated ${result.slotCount || 0} song(s), cleared ${result.clearedCount || 0} generated file(s).`;
+        : `Rehydrated ${result.slotCount || 0} song(s), cleared ${result.clearedCount || 0} generated file(s), preserved ${result.preservedCount || 0} working draft file(s).`;
     }
     return result;
   } catch (error) {
@@ -5535,16 +5579,34 @@ async function rehydrateMetadataCache(options = {}) {
   }
 }
 
+function metadataAuditStatusText(result) {
+  if (!result) return "Cue/region audit unavailable.";
+  const parts = [];
+  if (result.reviewSuggestionCount) parts.push(`${result.reviewSuggestionCount} review suggestion song(s)`);
+  if (result.workingDraftCount) parts.push(`${result.workingDraftCount} working draft song(s)`);
+  if (result.approvedOverrideCount) parts.push(`${result.approvedOverrideCount} approved override song(s)`);
+  if (result.mismatchCount) parts.push(`${result.mismatchCount} real mismatch(es)`);
+  return parts.length
+    ? `Cue/region audit: ${parts.join(", ")}.`
+    : `Cue/region audit clean: ${result.checked || 0} song(s).`;
+}
+
 function renderMetadataAuditReport(result) {
   if (!els.metadataAuditReport) return;
   els.metadataAuditReport.classList.remove("hidden");
   const mismatches = Array.isArray(result?.mismatches) ? result.mismatches.slice(0, 12) : [];
+  const reviewSuggestions = Array.isArray(result?.reviewSuggestions) ? result.reviewSuggestions.slice(0, 12) : [];
+  const workingDrafts = Array.isArray(result?.workingDrafts) ? result.workingDrafts.slice(0, 12) : [];
   els.metadataAuditReport.textContent = JSON.stringify({
     ok: Boolean(result?.ok),
     checked: result?.checked || 0,
     mismatchCount: result?.mismatchCount || 0,
+    reviewSuggestionCount: result?.reviewSuggestionCount || 0,
+    workingDraftCount: result?.workingDraftCount || 0,
     error: result?.error || "",
-    mismatches
+    mismatches,
+    reviewSuggestions,
+    workingDrafts
   }, null, 2);
 }
 

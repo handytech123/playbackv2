@@ -1334,6 +1334,12 @@ body:not(.performance-mode) .region-lane {
   color: #ffe7a8;
 }
 
+.timeline-region.analyzer-review-region {
+  border-color: #ff5a5f;
+  background: rgba(122, 20, 28, 0.62);
+  color: #ffe4e6;
+}
+
 .timeline-region.current-live-region {
   border-color: #42b7ff;
   background: rgba(12, 33, 48, 0.92);
@@ -1541,6 +1547,16 @@ body:not(.performance-mode) .region-sketch-selection {
   box-shadow: 0 8px 18px rgba(0, 0, 0, 0.22);
 }
 
+.timeline-cue.analyzer-review-cue {
+  color: #ffc9cf;
+}
+
+.timeline-cue.analyzer-review-cue span {
+  border-color: #ff5a5f;
+  background: #3a1118;
+  color: #ffe4e6;
+}
+
 .timeline-cue::after {
   content: "";
   position: absolute;
@@ -1549,6 +1565,10 @@ body:not(.performance-mode) .region-sketch-selection {
   width: 1px;
   height: 214px;
   background: #68d391;
+}
+
+.timeline-cue.analyzer-review-cue::after {
+  background: #ff5a5f;
 }
 
 .timeline-cue.selected-cue span {
@@ -1591,6 +1611,11 @@ body:not(.performance-mode) .region-sketch-selection {
   display: grid;
   grid-template-columns: 1fr;
   gap: 8px;
+}
+
+.edit-row.analyzer-review-row {
+  border-color: rgba(255, 90, 95, 0.72);
+  background: rgba(122, 20, 28, 0.22);
 }
 
 .editor-split {
