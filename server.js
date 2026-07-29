@@ -7,7 +7,7 @@ import { networkInterfaces } from "node:os";
 import { basename, dirname, extname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import QRCode from "qrcode";
-import { runInternalAnalyzerForLibrary } from "./lib/internal-analyzer.js";
+import { previewInternalAnalyzerForSongFolders, runInternalAnalyzerForLibrary } from "./lib/internal-analyzer.js";
 
 const __dirname = fileURLToPath(new URL(".", import.meta.url));
 const PORT = Number(process.env.PORT || 5312);
@@ -254,6 +254,11 @@ const httpServer = createServer(async (req, res) => {
       return json(res, await compileLibraryMetadata(body));
     }
 
+    if (req.method === "POST" && url.pathname === "/api/analyzer/preview-current-set") {
+      const body = await readJsonBody(req);
+      return json(res, await previewCurrentSetAnalyzerMetadata(body));
+    }
+
     if (req.method === "POST" && url.pathname === "/api/analyzer/dynamic-cues") {
       const body = await readJsonBody(req);
       return json(res, await analyzeDynamicCuesForSlot(positiveNumber(body.slot)));
@@ -459,6 +464,32 @@ async function compileLibraryMetadata(input = {}) {
   return {
     ...result,
     rootPath
+  };
+}
+
+async function previewCurrentSetAnalyzerMetadata(input = {}) {
+  const settings = await loadSettings();
+  const setlist = await loadCurrentSetlist();
+  const filledSlots = (setlist.slots || []).filter((slot) => slot.songId && slot.folderPath);
+  const preview = await previewInternalAnalyzerForSongFolders(filledSlots.map((slot) => slot.folderPath), {
+    masterWorkbookPath: stringValue(input.masterWorkbookPath || settings.library?.masterWorkbookPath)
+  });
+  const byFolder = new Map(preview.songs.map((song) => [resolve(song.folderPath).toLowerCase(), song]));
+  return {
+    ...preview,
+    source: "live-current-set",
+    dataDir: DATA_DIR,
+    setlistUpdatedAt: setlist.updatedAt || "",
+    slots: filledSlots.map((slot) => ({
+      slot: slot.slot,
+      setlistTitle: slot.title,
+      songId: slot.songId,
+      folderPath: slot.folderPath,
+      currentKey: slot.key || slot.selectedKey || "",
+      currentBpm: slot.bpm || slot.selectedBpm || null,
+      currentTimeSignature: slot.timeSignature || "",
+      analyzer: byFolder.get(resolve(slot.folderPath).toLowerCase()) || null
+    }))
   };
 }
 
