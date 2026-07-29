@@ -90,6 +90,7 @@ const els = {
   status: document.querySelector("#libraryStatus"),
   engineStatus: document.querySelector("#engineStatus"),
   refresh: document.querySelector("#refreshButton"),
+  syncAnalyzerMetadata: document.querySelector("#syncAnalyzerMetadataButton"),
   tabs: [...document.querySelectorAll(".tab")],
   search: document.querySelector("#songSearch"),
   select: document.querySelector("#songSelect"),
@@ -341,6 +342,7 @@ function wireEvents() {
     button.addEventListener("click", () => showView(button.dataset.view));
   }
   els.refresh.addEventListener("click", refreshLibrary);
+  els.syncAnalyzerMetadata?.addEventListener("click", syncAnalyzerMetadata);
   els.reloadData.addEventListener("click", reloadAppData);
   els.helpBack?.addEventListener("click", () => showView("setlistView"));
   els.helpSearch?.addEventListener("input", filterHelpTopics);
@@ -585,6 +587,46 @@ async function refreshLibrary() {
   await loadSetMetadata();
   await runSystemCheck();
   closeSettingsDrawer();
+}
+
+async function syncAnalyzerMetadata() {
+  if (!els.syncAnalyzerMetadata) return;
+  els.syncAnalyzerMetadata.disabled = true;
+  els.syncAnalyzerMetadata.textContent = "Syncing...";
+  if (els.settingsStatus) els.settingsStatus.textContent = "Syncing analyzer metadata: refresh, rehydrate, check...";
+  try {
+    await flushPendingAppSaves();
+    const library = await api("/api/library/refresh", { method: "POST" });
+    state.library = library;
+    renderLibraryStatus();
+    renderSongs();
+    await loadCurrentSetlist();
+    const rehydrate = await rehydrateMetadataCache({ silent: true });
+    await loadCacheReport();
+    await loadPlaybackState();
+    await loadEngineManifestPreview();
+    const check = await runSystemCheck();
+    const errors = check?.errors || [];
+    const warnings = check?.warnings || [];
+    if (rehydrate?.ok === false || rehydrate?.cacheReady === false) {
+      const issues = (rehydrate.cacheIssues || []).map((issue) => `Slot ${issue.slot}: ${issue.message}`).join(" ");
+      if (els.settingsStatus) els.settingsStatus.textContent = `Sync blocked. ${issues || "Cache is not ready."}`;
+      setAlert("Analyzer sync found cache issues. Check Error Check before confirming the set.");
+    } else if (errors.length) {
+      if (els.settingsStatus) els.settingsStatus.textContent = `Sync blocked. ${errors.join(" | ")}`;
+      setAlert("Analyzer sync found errors. Fix them before Confirm Set.");
+    } else {
+      const warningText = warnings.length ? ` Warnings: ${warnings.join(" | ")}` : "";
+      if (els.settingsStatus) els.settingsStatus.textContent = `Analyzer metadata synced. Confirm Set is safe.${warningText}`;
+      setAlert("Analyzer metadata synced. Confirm Set is ready.");
+    }
+  } catch (error) {
+    if (els.settingsStatus) els.settingsStatus.textContent = `Analyzer sync failed: ${error.message}`;
+    setAlert(`Analyzer sync failed: ${error.message}`);
+  } finally {
+    els.syncAnalyzerMetadata.disabled = false;
+    els.syncAnalyzerMetadata.textContent = "Sync Analyzer Metadata";
+  }
 }
 
 async function reloadAppData() {
@@ -933,9 +975,11 @@ async function runSystemCheck() {
       : warnings.length
         ? `Warnings: ${warnings.join(" | ")}`
         : "No errors";
+    return result;
   } catch (error) {
     els.systemCheckResult.classList.add("failed");
     els.systemCheckResult.querySelector("strong").textContent = error.message;
+    return { ok: false, errors: [error.message], warnings: [] };
   }
 }
 
@@ -5464,8 +5508,9 @@ async function auditMetadataCache() {
   }
 }
 
-async function rehydrateMetadataCache() {
-  if (els.settingsStatus) els.settingsStatus.textContent = "Rehydrating cue/region cache from analyzer files...";
+async function rehydrateMetadataCache(options = {}) {
+  const silent = options.silent === true;
+  if (!silent && els.settingsStatus) els.settingsStatus.textContent = "Rehydrating cue/region cache from analyzer files...";
   try {
     const result = await api("/api/set-metadata/current/rehydrate", {
       method: "POST",
@@ -5476,7 +5521,7 @@ async function rehydrateMetadataCache() {
     state.waveformLoadInFlight.clear();
     await loadSetMetadata();
     renderMetadataAuditReport(result.audit || result);
-    if (els.settingsStatus) {
+    if (!silent && els.settingsStatus) {
       const issues = (result.cacheIssues || []).map((issue) => `Slot ${issue.slot}: ${issue.message}`).join(" ");
       els.settingsStatus.textContent = result.ok === false || result.cacheReady === false
         ? `Rehydrate blocked. ${issues || "Cache is not ready."}`
@@ -5485,7 +5530,7 @@ async function rehydrateMetadataCache() {
     return result;
   } catch (error) {
     renderMetadataAuditReport({ ok: false, error: error.message });
-    if (els.settingsStatus) els.settingsStatus.textContent = `Rehydrate failed: ${error.message}`;
+    if (!silent && els.settingsStatus) els.settingsStatus.textContent = `Rehydrate failed: ${error.message}`;
     return null;
   }
 }
