@@ -91,6 +91,7 @@ const els = {
   engineStatus: document.querySelector("#engineStatus"),
   refresh: document.querySelector("#refreshButton"),
   syncAnalyzerMetadata: document.querySelector("#syncAnalyzerMetadataButton"),
+  previewInternalAnalyzer: document.querySelector("#previewInternalAnalyzerButton"),
   tabs: [...document.querySelectorAll(".tab")],
   search: document.querySelector("#songSearch"),
   select: document.querySelector("#songSelect"),
@@ -344,6 +345,7 @@ function wireEvents() {
   }
   els.refresh.addEventListener("click", refreshLibrary);
   els.syncAnalyzerMetadata?.addEventListener("click", syncAnalyzerMetadata);
+  els.previewInternalAnalyzer?.addEventListener("click", previewInternalAnalyzer);
   els.reloadData.addEventListener("click", reloadAppData);
   els.helpBack?.addEventListener("click", () => showView("setlistView"));
   els.helpSearch?.addEventListener("input", filterHelpTopics);
@@ -633,6 +635,46 @@ async function syncAnalyzerMetadata() {
   } finally {
     els.syncAnalyzerMetadata.disabled = false;
     els.syncAnalyzerMetadata.textContent = "Sync Analyzer Metadata";
+  }
+}
+
+async function previewInternalAnalyzer() {
+  if (!els.previewInternalAnalyzer) return;
+  els.previewInternalAnalyzer.disabled = true;
+  els.previewInternalAnalyzer.textContent = "Previewing...";
+  if (els.settingsStatus) els.settingsStatus.textContent = "Previewing internal analyzer results for the current set...";
+  try {
+    await flushPendingAppSaves();
+    const preview = await api("/api/analyzer/preview-current-set", { method: "POST" });
+    const rows = (preview.slots || []).map((slot) => {
+      const song = slot.analyzer || {};
+      const firstCue = Array.isArray(song.cueMarkers) ? song.cueMarkers.find((cue) => cue.label && cue.label !== "Intro") || song.cueMarkers[0] : null;
+      const firstRegion = Array.isArray(song.regions) ? song.regions.find((region) => region.name && region.name !== "Intro") || song.regions[0] : null;
+      return [
+        `Slot ${slot.slot}: ${slot.setlistTitle}`,
+        `  analyzer: ${song.status || "missing"} | ${song.bpm || "--"} BPM | ${song.timeSignature || "--"} | key ${song.key || "--"}`,
+        `  cue: ${firstCue ? `${firstCue.label} @ ${firstCue.snappedMeasure}.${firstCue.snappedBeatInMeasure} count ${firstCue.cueCountPattern || "--"} lead ${firstCue.cueLeadMeasures || "--"}` : "--"}`,
+        `  region: ${firstRegion ? `${firstRegion.name} @ ${firstRegion.startMeasure}.${firstRegion.startBeat}` : "--"}`,
+        ""
+      ].join("\n");
+    });
+    const report = [
+      `Internal analyzer preview: ${preview.checked || 0} song(s)`,
+      `Ready ${preview.ready || 0}, Review ${preview.review || 0}, Partial ${preview.partial || 0}, Failed ${preview.failed || 0}`,
+      "",
+      ...rows
+    ].join("\n");
+    if (els.metadataAuditReport) {
+      els.metadataAuditReport.textContent = report;
+      els.metadataAuditReport.classList.remove("hidden");
+    }
+    if (els.settingsStatus) els.settingsStatus.textContent = "Internal analyzer preview complete. No metadata was written.";
+  } catch (error) {
+    if (els.settingsStatus) els.settingsStatus.textContent = `Analyzer preview failed: ${error.message}`;
+    setAlert(`Analyzer preview failed: ${error.message}`);
+  } finally {
+    els.previewInternalAnalyzer.disabled = false;
+    els.previewInternalAnalyzer.textContent = "Preview Current Set Analyzer";
   }
 }
 
