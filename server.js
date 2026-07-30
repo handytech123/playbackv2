@@ -3850,7 +3850,7 @@ function gridBeatSecondsForPlayback(bpm, numerator, denominator) {
   const quarterSeconds = 60 / bpm;
   const compoundEighthMeter = denominator === 8 && [6, 9, 12].includes(numerator);
   if (compoundEighthMeter) {
-    return bpm < 100 ? quarterSeconds / 3 : quarterSeconds * (4 / denominator);
+    return bpm < 100 ? quarterSeconds / 2 : quarterSeconds * (4 / denominator);
   }
   return quarterSeconds * (4 / denominator);
 }
@@ -4167,27 +4167,53 @@ function countCueMarkersForSectionCue(cue, tempoMap) {
   const signature = stringValue(tempoMap?.timeSignature || "4/4");
   const isSixEight = signature.startsWith("6/8");
   const instruction = sectionCueInstruction(cue.name);
-  const explicitCounts = Array.isArray(instruction.counts) ? instruction.counts : null;
+  const metadataCounts = countPatternDigits(cue.countPatternHeard || cue.cueCountPattern);
+  const explicitCounts = metadataCounts.length ? metadataCounts : Array.isArray(instruction.counts) ? instruction.counts : null;
+  const sixEightLeadMeasures = isSixEight ? dynamicCueLeadMeasuresForSixEight(tempoMap) : 1;
+  const sixEightCountMeasureOffset = isSixEight ? Math.max(0, sixEightLeadMeasures - 1) : 0;
   const counts = explicitCounts
     ? explicitCounts.map((beat) => ({ beat, name: cueNumberNameForSignature(beat, signature) }))
     : isSixEight
-    ? [
-        { beat: 4, name: "Four 6/8" },
-        { beat: 5, name: "Five 6/8" },
-        { beat: 6, name: "Six 6/8" }
-      ]
+    ? defaultSixEightCountCues(sixEightLeadMeasures)
     : [
         { beat: 2, name: "Two" },
         { beat: 3, name: "Three" },
         { beat: 4, name: "Four" }
       ];
-  const useSequentialOffsets = !explicitCounts && counts.some((count) => count.beat < (positiveNumber(cue.beat) || 1));
+  const useSequentialOffsets = !isSixEight && !explicitCounts && counts.some((count) => count.beat < (positiveNumber(cue.beat) || 1));
 
   return counts.map((count, index) => ({
     id: `${cue.id}-count-${count.beat}`,
     name: count.name,
-    ...countCueGridPosition(cue, tempoMap, countCueOffsetFromCue(cue, count.beat, index, useSequentialOffsets))
+    ...countCueGridPosition(cue, tempoMap, countCueOffsetFromCue(cue, count.beat, index, useSequentialOffsets) + (sixEightCountMeasureOffset * 6))
   }));
+}
+
+function countPatternDigits(value) {
+  return [...stringValue(value)]
+    .map((char) => Number(char))
+    .filter((number, index, values) => number >= 1 && number <= 8 && values.indexOf(number) === index);
+}
+
+function defaultSixEightCountCues(leadMeasures) {
+  return Number(leadMeasures || 1) >= 2
+    ? [
+        { beat: 2, name: "Two 6/8" },
+        { beat: 3, name: "Three 6/8" },
+        { beat: 4, name: "Four 6/8" },
+        { beat: 5, name: "Five 6/8" },
+        { beat: 6, name: "Six 6/8" }
+      ]
+    : [
+        { beat: 4, name: "Four 6/8" },
+        { beat: 5, name: "Five 6/8" },
+        { beat: 6, name: "Six 6/8" }
+      ];
+}
+
+function dynamicCueLeadMeasuresForSixEight(tempoMap) {
+  const bpm = positiveNumber(tempoMap?.bpm || tempoMap?.displayBpm || tempoMap?.normalizedBpm);
+  return bpm >= 100 ? 2 : 1;
 }
 
 function countCueOffsetFromCue(cue, countBeat, countIndex = 0, useSequentialOffsets = false) {
@@ -6904,7 +6930,15 @@ function normalizeCueMarkers(cueMarkers) {
     id: stringValue(cue.id || `cue-${index + 1}`),
     name: stringValue(cue.name || cue.label || `Cue ${index + 1}`),
     bar: positiveNumber(cue.bar) || 1,
-    beat: positiveNumber(cue.beat) || 1
+    beat: positiveNumber(cue.beat) || 1,
+    countPatternHeard: stringValue(cue.countPatternHeard || cue.cueCountPattern),
+    cueCountPattern: stringValue(cue.cueCountPattern || cue.countPatternHeard),
+    cueCountSource: stringValue(cue.cueCountSource),
+    cueCountConfidence: positiveNumber(cue.cueCountConfidence),
+    cueLeadMeasures: positiveNumber(cue.cueLeadMeasures),
+    cueLeadSource: stringValue(cue.cueLeadSource),
+    cueLeadConfidence: positiveNumber(cue.cueLeadConfidence),
+    predictedRegionStart: cue.predictedRegionStart || null
   }));
 }
 
@@ -7351,6 +7385,14 @@ async function cueReportFromSourceCueIntelligence(folderPath, slot) {
       targetBeat: positiveNumber(marker.targetBeatInMeasure || marker.targetBeat || marker.snappedBeatInMeasure),
       snappedMeasure: positiveNumber(marker.snappedMeasure || marker.targetMeasure),
       snappedBeat: positiveNumber(marker.snappedBeatInMeasure || marker.snappedBeat || marker.targetBeatInMeasure),
+      countPatternHeard: stringValue(marker.countPatternHeard || marker.cueCountPattern),
+      cueCountPattern: stringValue(marker.cueCountPattern || marker.countPatternHeard),
+      cueCountSource: stringValue(marker.cueCountSource),
+      cueCountConfidence: positiveNumber(marker.cueCountConfidence),
+      cueLeadMeasures: positiveNumber(marker.cueLeadMeasures),
+      cueLeadSource: stringValue(marker.cueLeadSource),
+      cueLeadConfidence: positiveNumber(marker.cueLeadConfidence),
+      predictedRegionStart: marker.predictedRegionStart || null,
       gridStatus: stringValue(marker.alignmentStatus || marker.status),
       rejectionReasons: Array.isArray(marker.phraseRecognition?.rejectionReasons) ? marker.phraseRecognition.rejectionReasons.map(stringValue).filter(Boolean) : [],
       words: []
@@ -7749,6 +7791,14 @@ function cueMarkerFromAnalysisCandidate(candidate, report, index) {
     name: cueMarkerName(candidate, index),
     bar: position.bar,
     beat: position.beat,
+    countPatternHeard: stringValue(candidate.countPatternHeard || candidate.cueCountPattern),
+    cueCountPattern: stringValue(candidate.cueCountPattern || candidate.countPatternHeard),
+    cueCountSource: stringValue(candidate.cueCountSource),
+    cueCountConfidence: positiveNumber(candidate.cueCountConfidence),
+    cueLeadMeasures: positiveNumber(candidate.cueLeadMeasures),
+    cueLeadSource: stringValue(candidate.cueLeadSource),
+    cueLeadConfidence: positiveNumber(candidate.cueLeadConfidence),
+    predictedRegionStart: candidate.predictedRegionStart || null,
     status,
     approvalStatus: status,
     source: status === "review" ? "analyzer-review-cue-suggestion" : "analyzer-cue-intelligence"
@@ -8435,6 +8485,12 @@ function defaultTransitionDurationForMode(mode) {
   if (mode === "crossfade") return 5;
   if (mode === "stay") return 0;
   return 0.25;
+}
+
+function transitionDurationKey(mode) {
+  if (mode === "crossfade") return "crossfade";
+  if (mode === "stay") return "stay";
+  return "cueNext";
 }
 
 function transitionDurationForMode(transition = {}, mode = "") {
